@@ -3,6 +3,7 @@
 ## [0.5.0] - 2026-09-08
 
 ### Added
+- Docker-aware sizing: a sized `--check` asks the daemon (`docker system df`, `docker volume ls -f dangling=true`) and prints images, containers, build cache and volumes with what each prune command would return, plus the dangling volumes, sized when their mountpoint is on this host. Dangling volumes are refused, never pruned. `policy.docker` (unset: when `docker` is on the PATH), `policy.docker_timeout_seconds` (default 120; the daemon took ten minutes to answer on a host with a hundred containers). JSON output carries a `docker` section, or its error. `--quick` never asks.
 - Fleet: `deploy/deploy.sh` dry-run now builds the linux/amd64 binary and probes every host read-only (kernel, free space, installed version, config, timer, `docker`/`logger` present); an unreachable host stops the run before anything ships. First real Linux run: dry-run against apps.afterdarksys.com.
 - Linux notify falls back to `logger -t oos -p user.warning` when `notify-send` is absent, so a headless server's alerts land in syslog instead of an error on every tick.
 

@@ -120,6 +120,7 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `size_cache_file`, `size_cache_hours` | per-directory sizes keyed by mtime, reused within the TTL (default 6h); empty file disables |
 | `reference_open_files` | open file descriptors count as process references (one `lsof -n -P` on macOS, `/proc/*/fd` on Linux) |
 | `alert_drop_gb` | the tick notifies when free space fell by this much since the previous tick (default 10) |
+| `docker`, `docker_timeout_seconds` | ask the daemon during a sized check: unset means when `docker` is on the PATH, `false` never, `true` always and report a silent daemon; the deadline defaults to 120 s |
 
 ## rm-stale-children
 
@@ -173,6 +174,24 @@ mtime, so the TTL is the backstop for logs, databases and disk images;
 directories over 4 MB are stored, because a hit on a parent covers its
 children. On a 700 GB home directory a full audit went from 362 s cold to
 about 11 s warm.
+
+## Docker
+
+The daemon's data root is one opaque directory to a file walk, and on
+macOS it is inside a VM disk image, so a sized `--check` asks the daemon
+instead: `docker system df` for images, containers, build cache and
+volumes with what each prune command would return, and
+`docker volume ls -f dangling=true` for the volumes nothing references.
+Dangling volumes are listed, sized when their mountpoint is on this host,
+and refused: on this fleet an "unused" volume has been live data one
+character away from the name a container mounts, and
+`docker volume prune` would have been data loss. `oos` never runs it.
+The section is on when a `docker` binary is on the PATH; `policy.docker`
+forces it on or off, and `docker_timeout_seconds` bounds the wait, because
+the daemon sizes every container and volume to answer (ten minutes on a
+host with a hundred containers). A daemon that does not answer is reported
+and skipped; the rest of the check does not depend on it, and `--quick`
+never asks.
 
 ## Use cases
 

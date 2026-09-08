@@ -78,6 +78,15 @@ type Policy struct {
 	// alert when free space drops by more than AlertDropGB between ticks.
 	AgentPurgeExpired bool    `json:"agent_purge_expired"`
 	AlertDropGB       float64 `json:"alert_drop_gb,omitempty"`
+
+	// Docker: ask the daemon what it holds (images, containers, build cache,
+	// volumes) during a sized --check and list dangling volumes, refused.
+	// Unset means "when a docker binary is on the PATH"; false disables; true
+	// forces it and reports a daemon that does not answer. The daemon sizes
+	// every container and volume to answer, which takes minutes on a busy
+	// host, so a deadline bounds it (default 120 s).
+	Docker               *bool `json:"docker,omitempty"`
+	DockerTimeoutSeconds int   `json:"docker_timeout_seconds,omitempty"`
 }
 
 // Entry is one known large directory or file.
@@ -245,6 +254,9 @@ func (c *Config) validate() error {
 	}
 	if p.SizeCacheHours < 0 {
 		add("policy.size_cache_hours must be >= 0")
+	}
+	if p.DockerTimeoutSeconds < 0 {
+		add("policy.docker_timeout_seconds must be >= 0")
 	}
 	for _, nt := range p.NeverTouch {
 		if !filepath.IsAbs(nt) {

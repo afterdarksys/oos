@@ -417,8 +417,18 @@ func doCheck(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 	}
 	label, code := status(cfg.Policy, du)
 	var items []PlanItem
+	var dk *DockerUsage
+	var dkErr error
+	dkRan := false
 	if !o.quick {
 		items = buildPlan(cfg, env, splitTypes(o.types), now)
+		if want, forced := dockerWanted(cfg.Policy); want {
+			dkRan = true
+			dk, dkErr = collectDocker(dockerTimeout(cfg.Policy))
+			if dkErr != nil && forced {
+				fmt.Fprintf(errw, "oos: docker: %v\n", dkErr)
+			}
+		}
 	}
 	st, _ := loadState(cfg.Policy.StateFile)
 	st.Volume = cfg.Volume
@@ -442,10 +452,14 @@ func doCheck(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 		qBytes = quarantineBytes(cfg.Policy.QuarantineDir)
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{
+		j := map[string]any{
 			"volume": cfg.Volume, "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
 			"status": label, "quarantine_bytes": qBytes, "known": planJSON(items), "by_use_case": checkUseCases(cfg, items),
-		})
+		}
+		if dkRan {
+			j["docker"] = dockerJSON(dk, dkErr)
+		}
+		_ = json.NewEncoder(out).Encode(j)
 		return code
 	}
 	fmt.Fprintf(out, "oos %s  %s\n", strings.ToLower(label), cfg.Volume)
@@ -478,6 +492,13 @@ func doCheck(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 		}
 	}
 	fmt.Fprintf(out, "  * reclaimable by --cleanup --yes now: %s   c = via command\n", human(reclaimable))
+	if dkRan {
+		if dkErr != nil {
+			fmt.Fprintf(out, "docker: skipped (%v)\n", dkErr)
+		} else {
+			dockerReport(out, dk, o.verbose)
+		}
+	}
 	paths := make([]string, len(items))
 	sizes := make([]int64, len(items))
 	for i, it := range items {

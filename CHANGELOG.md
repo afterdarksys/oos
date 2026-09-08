@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] - 2026-09-08
+
+### Added
+- Hierarchical size cache keyed by directory mtime with a TTL (`size_cache_file`, `size_cache_hours`, `--fresh`). Only directories over 4 MB are stored, since a hit on a parent covers its children. Measured on a 700 GB home directory: 362 s cold, about 11 s warm.
+- Open file descriptors count as process references (`reference_open_files`).
+- Deep attribution: unlabelled audit rows are opened up to two levels and reported as `mixed: ...`, with totals spread across components.
+- `--permanent`: one cleanup run that deletes instead of quarantining.
+- `--history N`: free-space readings and GB/day trend; history is kept sorted by time.
+- End-to-end test that spawns real processes referencing archive children by argv, cwd and open file, then runs the real listers and executor.
+
+### Fixed
+- macOS `ps` clipped long command lines, so a path deep in an argument list could be missed as a reference; now `ps -ww`.
+- `lsof` runs with `-n -P`, cutting the open-file listing from 16 s to 2 s.
+- The tool no longer counts its own process as a reference.
+- Owner globs support `**` across directories.
+
+
 ## [0.3.0] - 2026-09-08
 
 ### Added

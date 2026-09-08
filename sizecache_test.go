@@ -13,6 +13,7 @@ func TestSizeCacheHitsInvalidatesAndExpires(t *testing.T) {
 	write(t, filepath.Join(dir, "sub", "a"), 65536)
 	write(t, filepath.Join(dir, "b"), 65536)
 	c := openSizeCache(filepath.Join(home, "sizes.json"), time.Hour)
+	c.minBytes = 0 // test trees are tiny
 	now := time.Now()
 	fi, _ := os.Lstat(dir)
 	dev, have := deviceOf(fi)
@@ -52,6 +53,7 @@ func TestSizeCacheHitsInvalidatesAndExpires(t *testing.T) {
 		t.Fatal(err)
 	}
 	c2 := openSizeCache(filepath.Join(home, "sizes.json"), time.Hour)
+	c2.minBytes = 0
 	if b, ok := c2.get(dir, mustLstat(t, dir).ModTime(), now.Add(4*time.Minute)); !ok || b != n3 {
 		t.Errorf("reloaded cache should serve the root: ok=%v b=%d want %d", ok, b, n3)
 	}
@@ -82,6 +84,7 @@ func TestPathSizeCachedMatchesWalk(t *testing.T) {
 	walk, _ := pathSizeWalk(dir)
 	old := cache
 	cache = openSizeCache(filepath.Join(home, "sizes.json"), time.Hour)
+	cache.minBytes = 0
 	defer func() { cache = old }()
 	cached, _ := pathSize(dir)
 	if cached != walk {
@@ -90,5 +93,25 @@ func TestPathSizeCachedMatchesWalk(t *testing.T) {
 	again, _ := pathSize(dir)
 	if again != walk {
 		t.Errorf("second cached read %d != walk %d", again, walk)
+	}
+}
+
+func TestSizeCacheFloorSkipsSmallDirs(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "d")
+	write(t, filepath.Join(dir, "small", "f"), 1024)
+	write(t, filepath.Join(dir, "big", "f"), 8<<20)
+	c := openSizeCache(filepath.Join(home, "sizes.json"), time.Hour)
+	fi, _ := os.Lstat(dir)
+	dev, have := deviceOf(fi)
+	c.sizeDir(dir, dev, have, time.Now())
+	if _, ok := c.entries[filepath.Join(dir, "small")]; ok {
+		t.Error("directories under the floor must not be stored")
+	}
+	if _, ok := c.entries[filepath.Join(dir, "big")]; !ok {
+		t.Error("directories over the floor must be stored")
+	}
+	if _, ok := c.entries[dir]; !ok {
+		t.Error("the root over the floor must be stored")
 	}
 }

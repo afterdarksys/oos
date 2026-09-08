@@ -26,21 +26,26 @@ type cacheEnt struct {
 }
 
 type sizeCache struct {
-	mu      sync.Mutex
-	path    string
-	ttl     time.Duration
-	entries map[string]cacheEnt
-	dirty   bool
-	hits    int
-	misses  int
-	enabled bool
+	mu       sync.Mutex
+	path     string
+	ttl      time.Duration
+	entries  map[string]cacheEnt
+	dirty    bool
+	hits     int
+	misses   int
+	enabled  bool
+	minBytes int64 // directories smaller than this are not stored; their parent covers them
 }
+
+// cacheMinBytes keeps the cache file small: a hit on a large directory skips
+// its whole subtree, so the small directories inside it never need entries.
+const cacheMinBytes = 4 << 20
 
 var cache = &sizeCache{}
 
 // openSizeCache loads the cache file; a missing or corrupt file starts empty.
 func openSizeCache(path string, ttl time.Duration) *sizeCache {
-	c := &sizeCache{path: path, ttl: ttl, entries: map[string]cacheEnt{}, enabled: path != ""}
+	c := &sizeCache{path: path, ttl: ttl, entries: map[string]cacheEnt{}, enabled: path != "", minBytes: cacheMinBytes}
 	if !c.enabled {
 		return c
 	}
@@ -48,6 +53,12 @@ func openSizeCache(path string, ttl time.Duration) *sizeCache {
 		_ = json.Unmarshal(b, &c.entries)
 		if c.entries == nil {
 			c.entries = map[string]cacheEnt{}
+		}
+		for k, e := range c.entries { // shrink a file written before the floor existed
+			if e.Bytes < c.minBytes {
+				delete(c.entries, k)
+				c.dirty = true
+			}
 		}
 	}
 	return c
@@ -98,6 +109,9 @@ func (c *sizeCache) get(dir string, mtime time.Time, now time.Time) (int64, bool
 
 func (c *sizeCache) put(dir string, mtime time.Time, bytes int64, now time.Time) {
 	if !c.enabled {
+		return
+	}
+	if bytes < c.minBytes {
 		return
 	}
 	c.mu.Lock()

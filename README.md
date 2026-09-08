@@ -36,6 +36,9 @@ oos -i                    # write the platform default config to ~/.config/oos/o
 oos -A                    # audit ~ one level deep: size, age, use case, known/unknown, hints
 oos --audit ~/Library -v  # audit somewhere else, show every hint
 oos --who ~/.cache/uv     # what is this for, which repo, which processes, newest file
+oos --history 24          # free-space readings and the GB/day trend
+oos -C -y --permanent     # cleanup that frees space now instead of quarantining
+oos -c --fresh            # bypass the size cache for one run
 ```
 
 ## In scripts and for agents
@@ -114,6 +117,8 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `quarantine`, `quarantine_dir`, `quarantine_days` | move instead of delete; expiry for `--purge` |
 | `owners` | list of `{match, use_case, note}`; `match` is a path (covers everything under it) or a glob tried against a path and each ancestor |
 | `agent_purge_expired` | the hourly tick releases quarantine batches older than `quarantine_days` |
+| `size_cache_file`, `size_cache_hours` | per-directory sizes keyed by mtime, reused within the TTL (default 6h); empty file disables |
+| `reference_open_files` | open file descriptors count as process references (one `lsof -n -P` on macOS, `/proc/*/fd` on Linux) |
 | `alert_drop_gb` | the tick notifies when free space fell by this much since the previous tick (default 10) |
 
 ## rm-stale-children
@@ -123,8 +128,10 @@ every `uvx` server keeps its Python environment. Refusing the whole
 directory while anything runs means it never gets cleaned. Instead, each
 direct child is judged on its own:
 
-- kept if any running process references it, by command line or by working
-  directory (`lsof -d cwd` on macOS, `/proc/*/cwd` on Linux)
+- kept if any running process references it, by command line (`ps -ww`, so
+  long argument lists are not clipped), by working directory (`lsof -d cwd`
+  on macOS, `/proc/*/cwd` on Linux), or by an open file descriptor
+  (`lsof -n -P`, `/proc/*/fd`)
 - kept if modified inside the `stale_after_hours` floor
 - kept if it is a symlink or a lock file
 - otherwise a delete candidate
@@ -154,6 +161,19 @@ repository that belongs in `never_touch`, nothing modified in six months, a
 hidden directory over 1 GB. It is a report for the person editing
 `oos.json`; it never acts. Results land in `bigfile.json`.
 
+## Size cache
+
+Every directory's size is remembered with its mtime and the time it was
+measured. A later walk stops at any directory whose mtime is unchanged and
+whose entry is younger than `size_cache_hours`, so churny caches
+invalidate exactly where entries were added or removed and untouched
+subtrees cost one stat. A file growing in place does not bump a directory
+mtime, so the TTL is the backstop for logs, databases and disk images;
+`--fresh` bypasses the cache and `-v` reports hits and misses. Only
+directories over 4 MB are stored, because a hit on a parent covers its
+children. On a 700 GB home directory a full audit went from 362 s cold to
+about 11 s warm.
+
 ## Use cases
 
 Paths say where bytes sit; use cases say what they are for. Three sources,
@@ -162,7 +182,10 @@ policy, then automatic attribution from what is on disk: a `Cargo.toml`
 beside a `target` dir, a `package.json` beside `node_modules`, a
 `pyvenv.cfg`, `DerivedData`, `.terraform`, a `.git`, and the enclosing git
 repository's name. `--check`, `--audit` and their JSON forms group totals by
-use case, with `unattributed` shown rather than hidden. `--who PATH` prints
+use case, with `unattributed` shown rather than hidden. An audit row that
+has no label at the top level, such as `~/.cache` or `~/Library`, is opened
+up to two levels and reported as `mixed: 61% uv, 30% Homebrew`, and the
+totals spread it across those components. `--who PATH` prints
 the attribution plus every running process whose command line or working
 directory references the path and the newest file under it: the answer to
 "who is filling this up right now".

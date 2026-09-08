@@ -18,7 +18,7 @@ type ChildPlan struct {
 }
 
 // references gathers every string a running process exposes that could name
-// a path: full command lines and working directories. Any failure is an
+// a path: full command lines, working directories and open files. Any failure is an
 // error rather than a shorter list, so callers fail closed.
 func (e Env) references() ([]string, error) {
 	if e.Procs == nil {
@@ -35,6 +35,13 @@ func (e Env) references() ([]string, error) {
 			return nil, fmt.Errorf("list process working directories: %w", err)
 		}
 		refs = append(refs, cwds...)
+	}
+	if e.Open != nil {
+		open, err := e.Open()
+		if err != nil {
+			return nil, fmt.Errorf("list open files: %w", err)
+		}
+		refs = append(refs, open...)
 	}
 	return refs, nil
 }

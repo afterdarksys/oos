@@ -15,14 +15,15 @@ import (
 
 // AuditRow is one entry directly under the audited root.
 type AuditRow struct {
-	Path       string    `json:"path"`
-	Bytes      int64     `json:"bytes"`
-	ModTime    time.Time `json:"mtime"` // newest mtime found in the subtree, bounded by the walk
-	Hidden     bool      `json:"hidden"`
-	IsDir      bool      `json:"dir"`
-	Status     string    `json:"status"` // known | protected | unknown | system
-	UseCase    string    `json:"use_case,omitempty"`
-	Suggestion string    `json:"suggestion"` // human hint, empty when there is nothing to say
+	Path       string         `json:"path"`
+	Bytes      int64          `json:"bytes"`
+	ModTime    time.Time      `json:"mtime"` // newest mtime found in the subtree, bounded by the walk
+	Hidden     bool           `json:"hidden"`
+	IsDir      bool           `json:"dir"`
+	Status     string         `json:"status"` // known | protected | unknown | system
+	UseCase    string         `json:"use_case,omitempty"`
+	Breakdown  []useCaseTotal `json:"breakdown,omitempty"` // for unattributed directories: what is inside
+	Suggestion string         `json:"suggestion"`          // human hint, empty when there is nothing to say
 }
 
 var cacheName = regexp.MustCompile(`(?i)(^|[._-])(cache|caches|tmp|temp|target|node_modules|deriveddata|\.gradle|\.m2|_cacache|build)($|[._-])`)
@@ -80,6 +81,10 @@ func auditOne(cfg *Config, p string, now time.Time) AuditRow {
 	}
 	r.Status, r.Suggestion = classify(cfg, p, r, now)
 	r.UseCase, _ = cfg.useCaseFor(p)
+	if r.UseCase == "" && r.IsDir && r.Status != "symlink" {
+		r.Breakdown = attributeDeep(cfg, p, 2, now)
+		r.UseCase = mixedLabel(r.Breakdown)
+	}
 	return r
 }
 
@@ -166,12 +171,7 @@ func doAudit(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 		_ = saveState(cfg.Policy.StateFile, st)
 	}
 	if o.jsonOut {
-		paths := make([]string, len(rows))
-		sizes := make([]int64, len(rows))
-		for i, r := range rows {
-			paths[i], sizes[i] = r.Path, r.Bytes
-		}
-		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "rows": rows, "by_use_case": groupByUseCase(cfg, paths, sizes)})
+		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "rows": rows, "by_use_case": groupByUseCaseDeep(cfg, rows)})
 		return exitOK
 	}
 	var total, unknown int64
@@ -187,20 +187,15 @@ func doAudit(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 	for _, r := range rows {
 		age := int(now.Sub(r.ModTime).Hours() / 24)
 		uc := r.UseCase
-		if rs := []rune(uc); len(rs) > 26 {
-			uc = string(rs[:25]) + "…"
+		if rs := []rune(uc); len(rs) > 40 {
+			uc = string(rs[:39]) + "…"
 		}
-		fmt.Fprintf(out, "  %9s  %4dd  %-9s %-26s %s\n", human(r.Bytes), age, r.Status, uc, r.Path)
+		fmt.Fprintf(out, "  %9s  %4dd  %-9s %-40s %s\n", human(r.Bytes), age, r.Status, uc, r.Path)
 		if r.Suggestion != "" && (o.verbose || r.Status == "unknown" || r.Status == "system") {
 			fmt.Fprintf(out, "                    %s\n", r.Suggestion)
 		}
 	}
 	fmt.Fprintf(out, "  %d unknown entries hold %s; each is either a candidate for oos.json or something to leave alone on purpose\n", nUnknown, human(unknown))
-	paths := make([]string, len(rows))
-	sizes := make([]int64, len(rows))
-	for i, r := range rows {
-		paths[i], sizes[i] = r.Path, r.Bytes
-	}
-	printUseCaseTotals(out, groupByUseCase(cfg, paths, sizes))
+	printUseCaseTotals(out, groupByUseCaseDeep(cfg, rows))
 	return exitOK
 }

@@ -32,11 +32,11 @@ type opts struct {
 	minMB                                                               int64
 
 	// script-facing
-	quiet, free, auditHome, agentTick, system, fresh bool
-	ensure, warnGB, critGB                           float64
-	why, add, forget, addType, addAction             string
-	addCommand, addNote, addUseCase, who             string
-	addStale, logTail                                int
+	quiet, free, auditHome, agentTick, system, fresh, permanent bool
+	ensure, warnGB, critGB                                      float64
+	why, add, forget, addType, addAction                        string
+	addCommand, addNote, addUseCase, who                        string
+	addStale, logTail, history                                  int
 }
 
 type cmdRunner func(name string, args ...string) error
@@ -116,6 +116,8 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.BoolVar(&o.agentTick, "agent-tick", false, "one scheduled tick: quick check, growth alert, expired-quarantine purge, notification")
 	fs.BoolVar(&o.system, "system", false, "with --install-agent/--uninstall-agent on Linux: system-wide units in /etc/systemd/system (root)")
 	fs.BoolVar(&o.fresh, "fresh", false, "bypass the size cache for this run")
+	fs.BoolVar(&o.permanent, "permanent", false, "with --cleanup --yes: delete outright instead of quarantining (space returns immediately, no undo)")
+	fs.IntVar(&o.history, "history", 0, "print the last N free-space readings from the state file")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -138,7 +140,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.ver} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver} {
 		if m {
 			modes++
 		}
@@ -238,6 +240,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.logTail > 0 {
 		worst(doLogTail(cfg, o, stdout, stderr))
+	}
+	if o.history > 0 {
+		worst(doHistory(cfg, o, stdout))
 	}
 	if o.check || o.known {
 		worst(doCheck(cfg, env, o, now, stdout, stderr))
@@ -557,7 +562,7 @@ func doCleanup(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer
 	if live {
 		mode = "LIVE"
 	}
-	if cfg.Policy.Quarantine {
+	if cfg.Policy.Quarantine && !o.permanent {
 		mode += ", quarantine"
 	} else {
 		mode += ", permanent delete"
@@ -610,7 +615,7 @@ func doCleanup(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer
 	defer logf.Close()
 	before, _ := diskUsage(cfg.Volume)
 	x := &Executor{Policy: cfg.Policy, Log: logf, Out: out, Now: time.Now, Run: shellRun, Move: os.Rename, Refs: env.references}
-	if cfg.Policy.Quarantine {
+	if cfg.Policy.Quarantine && !o.permanent {
 		q, err := openQuarantine(cfg.Policy.QuarantineDir, now, os.Rename)
 		if err != nil {
 			fmt.Fprintf(errw, "oos: cannot open quarantine %s: %v; refusing to act\n", cfg.Policy.QuarantineDir, err)

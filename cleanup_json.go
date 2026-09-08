@@ -18,7 +18,7 @@ func doCleanupJSON(cfg *Config, env Env, o *opts, items []PlanItem, live bool, n
 		}
 	}
 	doc := map[string]any{
-		"live": live, "quarantine": cfg.Policy.Quarantine, "plan": planJSON(items),
+		"live": live, "quarantine": cfg.Policy.Quarantine && !o.permanent, "plan": planJSON(items),
 		"planned_bytes": planned, "budget_gb": cfg.Policy.MaxDeleteGBPerRun,
 	}
 	if !live {
@@ -33,7 +33,7 @@ func doCleanupJSON(cfg *Config, env Env, o *opts, items []PlanItem, live bool, n
 	defer logf.Close()
 	before, _ := diskUsage(cfg.Volume)
 	x := &Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: shellRun, Move: os.Rename, Refs: env.references}
-	if cfg.Policy.Quarantine {
+	if cfg.Policy.Quarantine && !o.permanent {
 		q, err := openQuarantine(cfg.Policy.QuarantineDir, now, os.Rename)
 		if err != nil {
 			fmt.Fprintf(errw, "oos: cannot open quarantine: %v\n", err)

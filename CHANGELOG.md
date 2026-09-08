@@ -2,6 +2,10 @@
 
 ## [0.6.0] - unreleased
 
+### Changed
+- Repository layout: one `package main` of forty files became `cmd/oos` plus `internal/{cli,config,size,guard,plan,state,audit,docker,repos,agent,status,testutil}`, each owning one concern. No behaviour change; the suite moved with the code and runs per package.
+- `build.sh`: `build`, `install`, `test` (gofmt + vet + full suite, exit code gated), `linux`, `clean`, `all`. Pins the asdf Go version so builds work from any directory.
+
 ### Added
 - Filters shared by `--scan`, `--audit` and `--by-type`: `--older-than` / `--newer-than AGE` (`36h`, `90d`, `2w`, `6mo`, `1y`, bare days), `--ext LIST` (compound extensions and rotated logs understood), `--sort size|oldest|newest|name`, `--top N`.
 - `--by-type DIR`: every regular file bucketed by category with the largest files in each; extension first, magic bytes for anything over 1 MB without one.

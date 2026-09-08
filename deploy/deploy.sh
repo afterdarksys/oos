@@ -29,14 +29,14 @@ done
 [ -f "$CONFIG" ] || { echo "deploy.sh: config $CONFIG not found" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$(sed -n 's/^const version = "\(.*\)"/\1/p' "$ROOT/main.go")"
+VERSION="$(sed -n 's/^const Version = "\(.*\)"/\1/p' "$ROOT/internal/cli/main.go")"
 BIN="$ROOT/dist/oos-linux-amd64"
 mkdir -p "$ROOT/dist"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
 
 echo "oos $VERSION -> ${HOSTS[*]} (user $USER_, config $CONFIG)"
 echo "building $BIN"
-( cd "$ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$BIN" . )
+( cd "$ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/oos )
 
 # probe: read-only look at each host. Runs in both modes; a host that cannot
 # be reached stops the run before anything is shipped anywhere.

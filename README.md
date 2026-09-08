@@ -288,6 +288,32 @@ On a headless Linux host there is no desktop to notify: when `notify-send`
 is absent the tick writes the alert to syslog through `logger -t oos`, where
 the journal and any log shipper pick it up.
 
+## Layout and building
+
+```
+cmd/oos/            the binary: three lines that call cli.Run
+internal/cli/       flags, every command, all human-facing output
+internal/config/    oos.json shape, policy, entries, owners, attribution, validation
+internal/size/      statfs, allocated sizes, the size cache, filters, file types
+internal/guard/     the refusal rules and process/cwd/open-file references
+internal/plan/      plan building, the executor, quarantine
+internal/state/     bigfile.json: sizes, scans, audits, free-space history
+internal/audit/     directory audits, tags, use-case breakdowns
+internal/docker/    docker system df and dangling volumes
+internal/repos/     build output inside git repositories
+internal/agent/     the hourly tick, launchd/systemd units, notifications
+internal/status/    OK/WARN/CRITICAL and the exit codes
+internal/testutil/  shared test helpers
+deploy/             fleet deploy script and the server config
+```
+
+`./build.sh` builds `./oos`; `./build.sh install` puts it in `/usr/local/bin`
+(`GOBIN` overrides); `./build.sh test` runs gofmt, vet and the full suite
+with the exit code gated; `./build.sh linux` cross-builds for the fleet;
+`./build.sh clean` removes the outputs. The script pins the asdf Go
+version, which is why `go install` by hand fails from any directory
+without a `.tool-versions`.
+
 ## Guards, in order
 
 For every destructive entry: not `never`; absolute; not `/`; deep enough;

@@ -7,11 +7,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
 //go:embed oos.json
-var defaultConfig []byte
+var defaultConfigDarwin []byte
+
+//go:embed oos.linux.json
+var defaultConfigLinux []byte
+
+// defaultConfigFor picks the embedded default for a platform. macOS is the
+// fallback because that is where oos was born.
+func defaultConfigFor(goos string) []byte {
+	if goos == "linux" {
+		return defaultConfigLinux
+	}
+	return defaultConfigDarwin
+}
+
+var defaultConfig = defaultConfigFor(runtime.GOOS)
 
 // Config is the on-disk oos.json shape.
 type Config struct {
@@ -20,6 +35,8 @@ type Config struct {
 	Policy     Policy  `json:"policy"`
 	KnownDirs  []Entry `json:"known_dirs"`
 	KnownFiles []Entry `json:"known_files"`
+
+	home string
 }
 
 // Policy holds the cover-your-ass controls. Every field is a limit, never a permission grant.
@@ -36,6 +53,13 @@ type Policy struct {
 	StateFile         string   `json:"state_file"`
 	BigFileMinMB      int64    `json:"big_file_min_mb"`
 	ScanTopN          int      `json:"scan_top_n"`
+
+	// Quarantine: when true, rm actions move into QuarantineDir/<batch>/ instead
+	// of deleting. Space comes back on --purge (batches older than
+	// QuarantineDays) or --purge-now.
+	Quarantine     bool   `json:"quarantine"`
+	QuarantineDir  string `json:"quarantine_dir"`
+	QuarantineDays int    `json:"quarantine_days"`
 }
 
 // Entry is one known large directory or file.
@@ -47,19 +71,28 @@ type Entry struct {
 	GuardProcesses []string `json:"guard_processes,omitempty"`
 	Note           string   `json:"note,omitempty"`
 
+	// StaleAfterHours applies to rm-stale-children: a child modified more
+	// recently than this is kept regardless of references.
+	StaleAfterHours int `json:"stale_after_hours,omitempty"`
+
 	// IsFile is set by the loader: true for known_files entries.
 	IsFile bool `json:"-"`
 }
 
 const (
-	ActionNever      = "never"
-	ActionRmContents = "rm-contents"
-	ActionRm         = "rm"
-	ActionCommand    = "command"
+	ActionNever         = "never"
+	ActionRmContents    = "rm-contents"
+	ActionRm            = "rm"
+	ActionCommand       = "command"
+	ActionRmStaleChilds = "rm-stale-children"
 )
 
 var validActions = map[string]bool{
-	ActionNever: true, ActionRmContents: true, ActionRm: true, ActionCommand: true,
+	ActionNever: true, ActionRmContents: true, ActionRm: true, ActionCommand: true, ActionRmStaleChilds: true,
+}
+
+func isDestructive(action string) bool {
+	return action == ActionRm || action == ActionRmContents || action == ActionRmStaleChilds
 }
 
 // expandHome replaces a leading "~" with home and cleans the path.
@@ -116,6 +149,7 @@ func parseConfig(b []byte, home string) (*Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	cfg.home = filepath.Clean(home)
 	cfg.expand(home)
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -127,6 +161,9 @@ func (c *Config) expand(home string) {
 	c.Volume = expandHome(c.Volume, home)
 	c.Policy.LogFile = expandHome(c.Policy.LogFile, home)
 	c.Policy.StateFile = expandHome(c.Policy.StateFile, home)
+	if c.Policy.QuarantineDir != "" {
+		c.Policy.QuarantineDir = expandHome(c.Policy.QuarantineDir, home)
+	}
 	for i := range c.Policy.NeverTouch {
 		c.Policy.NeverTouch[i] = expandHome(c.Policy.NeverTouch[i], home)
 	}
@@ -180,8 +217,22 @@ func (c *Config) validate() error {
 			add("policy.never_touch entry %q must be absolute after ~ expansion", nt)
 		}
 	}
+	if p.Quarantine {
+		switch {
+		case p.QuarantineDir == "":
+			add("policy.quarantine is true but quarantine_dir is empty")
+		case !filepath.IsAbs(p.QuarantineDir):
+			add("policy.quarantine_dir must be absolute after ~ expansion")
+		case !p.AllowOutsideHome && !isUnder(p.QuarantineDir, c.home):
+			add("policy.quarantine_dir %s must be under %s unless allow_outside_home is true", p.QuarantineDir, c.home)
+		}
+		if p.QuarantineDays <= 0 {
+			add("policy.quarantine_days must be > 0 when quarantine is enabled")
+		}
+	}
 
 	seen := map[string]bool{}
+	all := c.entries(nil)
 	check := func(e Entry, kind string) {
 		if e.Path == "" {
 			add("%s entry with empty path", kind)
@@ -198,7 +249,7 @@ func (c *Config) validate() error {
 			add("%s %q has no type", kind, e.Path)
 		}
 		if !validActions[e.Action] {
-			add("%s %q has invalid action %q (never|rm-contents|rm|command)", kind, e.Path, e.Action)
+			add("%s %q has invalid action %q (never|rm-contents|rm|rm-stale-children|command)", kind, e.Path, e.Action)
 		}
 		if e.Action == ActionCommand && strings.TrimSpace(e.Command) == "" {
 			add("%s %q has action command but no command", kind, e.Path)
@@ -206,11 +257,31 @@ func (c *Config) validate() error {
 		if e.Action != ActionCommand && e.Command != "" {
 			add("%s %q has a command but action is %q", kind, e.Path, e.Action)
 		}
-		if e.IsFile && e.Action == ActionRmContents {
-			add("known_files %q cannot use rm-contents", e.Path)
+		if e.IsFile && (e.Action == ActionRmContents || e.Action == ActionRmStaleChilds) {
+			add("known_files %q cannot use %s", e.Path, e.Action)
 		}
 		if !e.IsFile && e.Action == ActionRm {
 			add("known_dirs %q cannot use rm; use rm-contents", e.Path)
+		}
+		if e.Action == ActionRmStaleChilds && e.StaleAfterHours <= 0 {
+			add("%s %q uses rm-stale-children and needs stale_after_hours > 0", kind, e.Path)
+		}
+		if e.Action != ActionRmStaleChilds && e.StaleAfterHours != 0 {
+			add("%s %q sets stale_after_hours but action is %q", kind, e.Path, e.Action)
+		}
+		if isDestructive(e.Action) {
+			for _, f := range []struct{ name, path string }{
+				{"log_file", p.LogFile}, {"state_file", p.StateFile}, {"quarantine_dir", p.QuarantineDir},
+			} {
+				if f.path != "" && (isUnder(f.path, e.Path) || isUnder(e.Path, f.path)) {
+					add("%s %q overlaps policy.%s %s; oos must not delete its own records", kind, e.Path, f.name, f.path)
+				}
+			}
+			for _, o := range all {
+				if o.Path != e.Path && isDestructive(o.Action) && isUnder(o.Path, e.Path) {
+					add("%s %q contains destructive entry %q; nested destructive entries are ambiguous", kind, e.Path, o.Path)
+				}
+			}
 		}
 	}
 	for _, e := range c.KnownDirs {

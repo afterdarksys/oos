@@ -236,7 +236,7 @@ func TestExecuteRefusesOverBudgetBeforeTouchingAnything(t *testing.T) {
 	p := policyFor(home)
 	p.MaxDeleteGBPerRun = 0.000001 // ~1 KB
 	x := &Executor{Policy: p, Now: time.Now}
-	items := []PlanItem{{Entry: Entry{Path: dir, Action: ActionRmContents}, Bytes: 5 * 1024}}
+	items := []PlanItem{{Entry: Entry{Path: dir, Action: ActionRmContents}, Bytes: 5 * 1024, Deletable: 5 * 1024}}
 	if _, err := x.Execute(items); err == nil || !strings.HasPrefix(err.Error(), "budget:") {
 		t.Fatalf("expected budget refusal, got %v", err)
 	}

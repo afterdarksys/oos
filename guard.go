@@ -12,6 +12,7 @@ import (
 type Env struct {
 	Home  string
 	Procs func() ([]string, error) // running process command lines
+	Cwds  func() ([]string, error) // running process working directories
 }
 
 func realEnv() (Env, error) {
@@ -19,7 +20,7 @@ func realEnv() (Env, error) {
 	if err != nil {
 		return Env{}, err
 	}
-	return Env{Home: filepath.Clean(home), Procs: listProcesses}, nil
+	return Env{Home: filepath.Clean(home), Procs: listProcesses, Cwds: listProcessCwds}, nil
 }
 
 func listProcesses() ([]string, error) {
@@ -102,9 +103,9 @@ func (e Env) checkDeletable(p Policy, ent Entry) error {
 		return refuse("symlink", "%s is a symlink; oos does not follow links", path)
 	}
 	switch ent.Action {
-	case ActionRmContents:
+	case ActionRmContents, ActionRmStaleChilds:
 		if !info.IsDir() {
-			return refuse("kind", "%s is not a directory but action is rm-contents", path)
+			return refuse("kind", "%s is not a directory but action is %s", path, ent.Action)
 		}
 	case ActionRm:
 		if !info.Mode().IsRegular() {

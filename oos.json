@@ -29,15 +29,18 @@
     "log_file": "~/.local/state/oos/oos.log",
     "state_file": "~/.local/state/oos/bigfile.json",
     "big_file_min_mb": 500,
-    "scan_top_n": 50
+    "scan_top_n": 50,
+    "quarantine": true,
+    "quarantine_dir": "~/.local/state/oos/quarantine",
+    "quarantine_days": 7
   },
   "known_dirs": [
     {
       "path": "~/.cache/uv/archive-v0",
       "type": "cache",
-      "action": "rm-contents",
-      "guard_processes": ["uvx", "uv tool", "code-review-graph", "blender-mcp"],
-      "note": "uv ephemeral tool environments. This is the leak (155 GB on 2026-09-07). Live MCP servers run from here; refuse while any are up."
+      "action": "rm-stale-children",
+      "stale_after_hours": 6,
+      "note": "uv ephemeral tool environments; the leak (155 GB on 2026-09-07). Live MCP servers run from here. Children referenced by any running process's command line or cwd are kept, as are children touched in the last 6 hours; the rest go to quarantine."
     },
     {
       "path": "~/.cache/uv/sdists-v9",
@@ -98,6 +101,18 @@
       "note": "Xcode build products, regenerates"
     },
     {
+      "path": "~/development/gomeow.media/desktop/src-tauri/target",
+      "type": "build",
+      "action": "never",
+      "note": "Rust debug target, 28 GB on 2026-09-08. Under ~/development so never automated; cargo clean by hand when the other session is idle."
+    },
+    {
+      "path": "~/development/afteredit/src-tauri/target",
+      "type": "build",
+      "action": "never",
+      "note": "Rust debug target. Same rule as above."
+    },
+    {
       "path": "/Library/Developer/CoreSimulator",
       "type": "sim",
       "action": "command",
@@ -110,6 +125,12 @@
       "action": "command",
       "command": "docker builder prune -f && docker image prune -f",
       "note": "Docker VM disk. Never rm; ask the daemon to prune. Shrink Docker.raw via Docker Desktop settings."
+    },
+    {
+      "path": "~/.codex",
+      "type": "data",
+      "action": "never",
+      "note": "Codex session logs and sqlite; near 1 GB and growing. Review by hand."
     },
     {
       "path": "~/tmp",

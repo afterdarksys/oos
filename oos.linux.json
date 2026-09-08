@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "volume": "~",
+  "policy": {
+    "min_free_gb": 10,
+    "warn_free_gb": 25,
+    "require_yes": true,
+    "max_delete_gb_per_run": 100,
+    "allow_outside_home": false,
+    "allow_commands": true,
+    "never_touch": [
+      "/",
+      "/etc",
+      "/usr",
+      "/var",
+      "/opt",
+      "/boot",
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.claude",
+      "~/development",
+      "~/Documents",
+      "~/Pictures",
+      "~/Videos",
+      "~/Music"
+    ],
+    "min_path_depth": 3,
+    "log_file": "~/.local/state/oos/oos.log",
+    "state_file": "~/.local/state/oos/bigfile.json",
+    "big_file_min_mb": 500,
+    "scan_top_n": 50,
+    "quarantine": true,
+    "quarantine_dir": "~/.local/state/oos/quarantine",
+    "quarantine_days": 7
+  },
+  "known_dirs": [
+    {
+      "path": "~/.cache/uv/archive-v0",
+      "type": "cache",
+      "action": "rm-stale-children",
+      "stale_after_hours": 6,
+      "note": "uv ephemeral tool environments. Children referenced by a running process (cmdline or /proc/*/cwd) or touched in the last 6 hours are kept."
+    },
+    {
+      "path": "~/.cache/pip",
+      "type": "cache",
+      "action": "rm-contents",
+      "note": "pip download cache"
+    },
+    {
+      "path": "~/.cache/go-build",
+      "type": "cache",
+      "action": "command",
+      "command": "go clean -cache",
+      "note": "Go build cache"
+    },
+    {
+      "path": "~/go/pkg/mod",
+      "type": "cache",
+      "action": "command",
+      "command": "go clean -modcache",
+      "note": "Go module cache, read-only files"
+    },
+    {
+      "path": "~/.npm/_cacache",
+      "type": "cache",
+      "action": "command",
+      "command": "npm cache clean --force",
+      "note": "npm content cache"
+    },
+    {
+      "path": "~/.cache/yarn",
+      "type": "cache",
+      "action": "rm-contents",
+      "note": "yarn cache"
+    },
+    {
+      "path": "~/.cargo/registry",
+      "type": "cache",
+      "action": "never",
+      "note": "cargo registry; use cargo cache tooling by hand"
+    },
+    {
+      "path": "/var/lib/docker",
+      "type": "vm",
+      "action": "command",
+      "command": "docker builder prune -f && docker image prune -f",
+      "note": "Docker data root. Never rm; ask the daemon. Needs docker group or sudo."
+    },
+    {
+      "path": "~/.local/share/Trash",
+      "type": "data",
+      "action": "never",
+      "note": "Desktop trash; empty from the desktop"
+    },
+    {
+      "path": "~/Downloads",
+      "type": "data",
+      "action": "never",
+      "note": "User data, review by hand"
+    },
+    {
+      "path": "~/development",
+      "type": "data",
+      "action": "never",
+      "note": "Source trees, never automated"
+    }
+  ],
+  "known_files": []
+}

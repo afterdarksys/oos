@@ -21,6 +21,9 @@ type State struct {
 	BigFiles  []BigFile        `json:"big_files"`
 	ScanRoot  string           `json:"scan_root,omitempty"`
 	ScannedAt time.Time        `json:"scanned_at,omitempty"`
+	Audit     []AuditRow       `json:"audit,omitempty"`
+	AuditRoot string           `json:"audit_root,omitempty"`
+	AuditedAt time.Time        `json:"audited_at,omitempty"`
 	History   []HistoryPoint   `json:"history"`
 }
 

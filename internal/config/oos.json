@@ -308,6 +308,47 @@
       "type": "data",
       "action": "never",
       "note": "Source trees, never automated"
+    },
+    {
+      "path": "~/Library/Developer/CoreSimulator/Devices",
+      "type": "sim",
+      "action": "command",
+      "command": "xcrun simctl delete unavailable",
+      "use_case": "Xcode simulators",
+      "tags": [
+        "xcode"
+      ],
+      "note": "simulator devices; the command removes only devices whose runtime is gone"
+    },
+    {
+      "path": "~/Library/Developer/Xcode/iOS DeviceSupport",
+      "type": "cache",
+      "action": "rm-contents",
+      "use_case": "Xcode build output",
+      "tags": [
+        "xcode"
+      ],
+      "note": "per-device symbol files, re-downloaded from the device on the next connect"
+    },
+    {
+      "path": "~/Library/Developer/Xcode/Archives",
+      "type": "data",
+      "action": "never",
+      "use_case": "Xcode build output",
+      "tags": [
+        "xcode"
+      ],
+      "note": "App Store and ad hoc archives; delete from the Organizer by hand"
+    },
+    {
+      "path": "~/Library/Application Support/MobileSync/Backup",
+      "type": "data",
+      "action": "never",
+      "use_case": "iOS device backups",
+      "tags": [
+        "backups"
+      ],
+      "note": "iPhone and iPad backups; Finder > device > Manage Backups"
     }
   ],
   "known_files": [

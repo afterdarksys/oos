@@ -327,6 +327,23 @@ snapshots, the space no file walk can see, and prints the count, dates
 and the exact `tmutil thinlocalsnapshots` command that releases them.
 `policy.snapshots` forces it on or off. oos never runs that command.
 
+## App leftovers
+
+`--app-leftovers` reads the ~/Library areas applications write into
+(Application Support, Caches, Containers, Group Containers, Saved
+Application State, Logs, WebKit, HTTPStorages, LaunchAgents, Preferences)
+and pairs every entry over `--min-mb` (default 10) with an installed app:
+by bundle identifier, including helpers such as `com.vendor.app.ShipIt`,
+then by name, loosely. An identifier no installed app owns is an `orphan`
+and comes out as an `--add` line tagged `leftover`; a plain name nothing
+matches is `unmatched`, which on a developer machine is usually a tool
+cache (Cypress, pnpm, aws) rather than a leftover; anything under
+`com.apple` is never judged. `--tag orphan` narrows, `-v` also lists what
+is installed, which is the per-app size of ~/Library/Caches. The macOS
+default config also knows Xcode simulators (`xcrun simctl delete
+unavailable`), iOS DeviceSupport, Archives and MobileSync backups, the
+last two as `never` so they show up and stay.
+
 ## Forecast
 
 Every tick and every check records free space, and the history is fitted

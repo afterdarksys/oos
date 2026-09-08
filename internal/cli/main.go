@@ -28,7 +28,7 @@ import (
 	"github.com/afterdarksys/oos/internal/state"
 )
 
-const Version = "0.6.0"
+const Version = "0.6.1"
 
 type opts struct {
 	check, known, cleanup, show, diff, quick, yes, no, jsonOut, verbose bool
@@ -60,6 +60,9 @@ type opts struct {
 
 	// daemon
 	daemonRun, statusQ, installDaemon, uninstallDaemon bool
+
+	// --app-leftovers
+	leftovers bool
 }
 
 func parseFlags(args []string, stderr io.Writer) (*opts, error) {
@@ -144,6 +147,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.BoolVar(&o.statusQ, "status", false, "ask the running daemon for its status (falls back to the state file)")
 	fs.BoolVar(&o.installDaemon, "install-daemon", false, "install and start the daemon (launchd or systemd, --system for root units); removes the hourly agent")
 	fs.BoolVar(&o.uninstallDaemon, "uninstall-daemon", false, "stop and remove the daemon")
+	fs.BoolVar(&o.leftovers, "app-leftovers", false, "pair every ~/Library entry (Application Support, Caches, Containers, ...) with an installed app; orphans first with --add lines (--min-mb floor, default 10)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -166,7 +170,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != "", o.daemonRun, o.statusQ, o.installDaemon, o.uninstallDaemon} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != "", o.daemonRun, o.statusQ, o.installDaemon, o.uninstallDaemon, o.leftovers} {
 		if m {
 			modes++
 		}
@@ -302,6 +306,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.downloads != "" {
 		worst(doDownloads(cfg, env, o, now, stdout, stderr))
+	}
+	if o.leftovers {
+		worst(doLeftovers(cfg, env, o, now, stdout, stderr))
 	}
 	if o.restore != "" {
 		worst(doRestore(cfg, o, stdout, stderr))

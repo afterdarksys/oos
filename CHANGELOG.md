@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.1] - 2026-09-08
+
+### Added
+- `--app-leftovers`: every entry in the ~/Library areas apps write into, paired with an installed app by bundle id (helpers included) or name. Orphans first with `--add` lines tagged `leftover`; unmatched names softened as probable tool caches; `com.apple` never judged; `-v` lists installed entries, which is per-app cache sizing. On this Mac: 2.2 GB of orphans, 294 apps seen, 8 s.
+- macOS default config: Xcode simulators (`xcrun simctl delete unavailable`, command), iOS DeviceSupport (rm-contents), Xcode Archives and MobileSync backups (`never`, so they are shown and kept).
+
 ## [0.6.0] - 2026-09-08
 
 ### Added

@@ -14,9 +14,10 @@ import (
 // Docker is off: tests never talk to a daemon, and a wedged Docker Desktop
 // once cost 120 s per check.
 func PolicyFor(home string) config.Policy {
-	dockerOff := false
+	off := false // no daemon, no tmutil: tests stay hermetic and fast
 	return config.Policy{
-		Docker:    &dockerOff,
+		Docker:    &off,
+		Snapshots: &off,
 		MinFreeGB: 1, WarnFreeGB: 2, RequireYes: true, MaxDeleteGBPerRun: 1,
 		AllowOutsideHome: false, AllowCommands: false,
 		NeverTouch:   []string{filepath.Join(home, "keep")},

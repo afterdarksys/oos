@@ -90,6 +90,11 @@ type Policy struct {
 	Docker               *bool `json:"docker,omitempty"`
 	DockerTimeoutSeconds int   `json:"docker_timeout_seconds,omitempty"`
 
+	// Snapshots: ask tmutil for Time Machine local snapshots during a sized
+	// check (macOS). Unset means "when tmutil exists"; false disables; true
+	// forces it and reports a tmutil that does not answer.
+	Snapshots *bool `json:"snapshots,omitempty"`
+
 	// Forecast: the tick fits a rate to the readings inside
 	// ForecastWindowHours (default 6) and alerts when that rate reaches the
 	// critical line within AlertHoursToCritical hours (default 24; 0 keeps

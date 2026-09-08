@@ -272,6 +272,27 @@ is one `statfs` and one state write: it notifies (`osascript` or
 `alert_drop_gb` since the previous tick within three hours, and with
 `agent_purge_expired` it releases quarantine batches past their expiry.
 
+## Duplicates, Downloads and snapshots
+
+`--dupes DIR` lists identical files: size first, then a head-and-tail
+hash, then a full SHA-256 only for what still matches, so a 50 GB folder
+costs one read of the candidates. Hardlinks are one file. Groups come
+most wasted first with the newest copy marked; `--min-mb` sets the floor
+(default 10) and the age and extension windows apply. Nothing is removed.
+
+`--downloads` (or `--downloads DIR`) judges a downloads folder the way a
+person would: `installed` (a dmg or pkg whose app sits in /Applications),
+`installer`, `extracted` (an archive with its folder beside it), `copy`
+(a "(2)" with the original still there, same size), `copy-differs`,
+`partial`, `app-in-downloads`, `stale` (180 days), `big` (1 GB). Rows
+with a verdict come first, bytes are totalled per verdict, and the labels
+are the whole output.
+
+On macOS a sized `--check` also asks `tmutil` for local Time Machine
+snapshots, the space no file walk can see, and prints the count, dates
+and the exact `tmutil thinlocalsnapshots` command that releases them.
+`policy.snapshots` forces it on or off. oos never runs that command.
+
 ## Forecast
 
 Every tick and every check records free space, and the history is fitted

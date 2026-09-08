@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/afterdarksys/oos/internal/snapshots"
 	"github.com/afterdarksys/oos/internal/status"
 
 	"github.com/afterdarksys/oos/internal/agent"
@@ -53,6 +54,9 @@ type opts struct {
 	// --fleet
 	fleet bool
 	hosts string
+
+	// --dupes DIR, --downloads [DIR]
+	dupes, downloads string
 }
 
 func parseFlags(args []string, stderr io.Writer) (*opts, error) {
@@ -131,6 +135,8 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.IntVar(&o.depth, "depth", 0, "with --scan-builds: how many levels down to look for repos (default 4)")
 	fs.BoolVar(&o.fleet, "fleet", false, "ask every host in policy.fleet (or --hosts) for its quick check over ssh and print one table")
 	fs.StringVar(&o.hosts, "hosts", "", "with --fleet: comma-separated ssh targets instead of policy.fleet")
+	fs.StringVar(&o.dupes, "dupes", "", "list identical files under DIR (size, then head/tail hash, then SHA-256); --min-mb floor, default 10")
+	fs.StringVar(&o.downloads, "downloads", "", "judge a downloads folder (DIR, or 'default' for ~/Downloads): installed installers, extracted archives, copies, partials, apps, stale")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -153,7 +159,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != ""} {
 		if m {
 			modes++
 		}
@@ -274,6 +280,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.fleet {
 		worst(doFleet(cfg, o, stdout, stderr))
+	}
+	if o.dupes != "" {
+		worst(doDupes(cfg, env, o, now, stdout, stderr))
+	}
+	if o.downloads != "" {
+		worst(doDownloads(cfg, env, o, now, stdout, stderr))
 	}
 	if o.restore != "" {
 		worst(doRestore(cfg, o, stdout, stderr))
@@ -436,6 +448,9 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	var dk *docker.Usage
 	var dkErr error
 	dkRan := false
+	var snap *snapshots.Report
+	var snapErr error
+	snapRan := false
 	if !o.quick {
 		items = plan.BuildTagged(cfg, env, splitTypes(o.types), o.tag, now)
 		if want, forced := docker.Wanted(cfg.Policy); want {
@@ -443,6 +458,13 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 			dk, dkErr = docker.Collect(docker.Timeout(cfg.Policy))
 			if dkErr != nil && forced {
 				fmt.Fprintf(errw, "oos: docker: %v\n", dkErr)
+			}
+		}
+		if want, forced := snapshotsWanted(cfg.Policy); want {
+			snapRan = true
+			snap, snapErr = snapshots.Collect(cfg.Volume)
+			if snapErr != nil && forced {
+				fmt.Fprintf(errw, "oos: snapshots: %v\n", snapErr)
 			}
 		}
 	}
@@ -473,6 +495,13 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 			"volume": cfg.Volume, "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
 			"status": label, "quarantine_bytes": qBytes, "known": planJSON(items), "by_use_case": checkUseCases(cfg, items),
 			"version": Version, "forecast": fc,
+		}
+		if snapRan {
+			if snapErr != nil {
+				j["snapshots"] = map[string]any{"error": snapErr.Error()}
+			} else {
+				j["snapshots"] = snap
+			}
 		}
 		if dkRan {
 			j["docker"] = docker.JSON(dk, dkErr)
@@ -518,6 +547,13 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 			fmt.Fprintf(out, "docker: skipped (%v)\n", dkErr)
 		} else {
 			docker.Report(out, dk, o.verbose)
+		}
+	}
+	if snapRan {
+		if snapErr != nil {
+			fmt.Fprintf(out, "local snapshots: skipped (%v)\n", snapErr)
+		} else {
+			snapshots.Print(out, snap, o.verbose)
 		}
 	}
 	paths := make([]string, len(items))
@@ -768,6 +804,16 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 	}
 	fmt.Fprintf(out, "purged %d batches, %s freed\n", len(names), size.Human(freed))
 	return status.ExitOK
+}
+
+// snapshotsWanted mirrors docker.Wanted: policy.snapshots true forces the
+// tmutil question and reports a failure, false disables it, unset means
+// "on macOS when tmutil exists".
+func snapshotsWanted(p config.Policy) (want, forced bool) {
+	if p.Snapshots != nil {
+		return *p.Snapshots, *p.Snapshots
+	}
+	return snapshots.Supported(), false
 }
 
 func splitTypes(s string) []string {

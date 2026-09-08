@@ -212,10 +212,17 @@ is one `statfs` and one state write: it notifies (`osascript` or
 seeds `~/.config/oos/oos.json` from `deploy/oos.server.json` only when the
 host has none (a differing config is left beside it as `oos.json.new`),
 installs the system timer and runs a quick check. Dry-run without `--yes`,
-and `--force` does not exist. The server config never touches `/opt`,
-`/var/lib/docker/volumes`, database directories or `/var/log`; Docker is
-limited to `docker builder prune`. `.vpscfgfarm.map` routes the repo to
-that script.
+and `--force` does not exist. The dry-run still builds and probes every
+host read-only (kernel, free space, installed version, config, timer,
+whether `docker` and `logger` exist), and a host that cannot be probed stops
+the run before anything is shipped anywhere. The server config never
+touches `/opt`, `/var/lib/docker/volumes`, database directories or
+`/var/log`; Docker is limited to `docker builder prune`. `.vpscfgfarm.map`
+routes the repo to that script.
+
+On a headless Linux host there is no desktop to notify: when `notify-send`
+is absent the tick writes the alert to syslog through `logger -t oos`, where
+the journal and any log shipper pick it up.
 
 ## Guards, in order
 

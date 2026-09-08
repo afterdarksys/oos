@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0] - 2026-09-08
+
+### Added
+- Fleet: `deploy/deploy.sh` dry-run now builds the linux/amd64 binary and probes every host read-only (kernel, free space, installed version, config, timer, `docker`/`logger` present); an unreachable host stops the run before anything ships. First real Linux run: dry-run against apps.afterdarksys.com.
+- Linux notify falls back to `logger -t oos -p user.warning` when `notify-send` is absent, so a headless server's alerts land in syslog instead of an error on every tick.
+
+### Fixed
+- `deploy.sh` ended each host with `oos -F`, whose exit code is the disk status; under `set -e` a host in warn or critical made a successful deploy report failure. Status lines no longer abort the script.
+- The probe's last `command -v` returned nonzero when `notify-send` was absent, which made the whole probe fail.
+
 ## [0.4.1] - 2026-09-08
 
 ### Fixed

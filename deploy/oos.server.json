@@ -33,15 +33,36 @@
     "quarantine_dir": "/root/.local/state/oos/quarantine",
     "quarantine_days": 3,
     "owners": [
-      {"match": "/var/lib/docker", "use_case": "Docker"},
-      {"match": "/var/lib/docker/volumes", "use_case": "Docker volumes (data)"},
-      {"match": "/var/log", "use_case": "logs"},
-      {"match": "/opt", "use_case": "service deployments"},
-      {"match": "/var/cache/apt", "use_case": "apt cache"},
-      {"match": "/root/.cache", "use_case": "root caches"}
+      {
+        "match": "/var/lib/docker",
+        "use_case": "Docker"
+      },
+      {
+        "match": "/var/lib/docker/volumes",
+        "use_case": "Docker volumes (data)"
+      },
+      {
+        "match": "/var/log",
+        "use_case": "logs"
+      },
+      {
+        "match": "/opt",
+        "use_case": "service deployments"
+      },
+      {
+        "match": "/var/cache/apt",
+        "use_case": "apt cache"
+      },
+      {
+        "match": "/root/.cache",
+        "use_case": "root caches"
+      }
     ],
     "agent_purge_expired": true,
-    "alert_drop_gb": 5
+    "alert_drop_gb": 5,
+    "size_cache_file": "/root/.local/state/oos/sizes.json",
+    "size_cache_hours": 6,
+    "reference_open_files": true
   },
   "known_dirs": [
     {

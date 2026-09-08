@@ -71,7 +71,10 @@
       }
     ],
     "agent_purge_expired": true,
-    "alert_drop_gb": 5
+    "alert_drop_gb": 5,
+    "size_cache_file": "~/.local/state/oos/sizes.json",
+    "size_cache_hours": 6,
+    "reference_open_files": true
   },
   "known_dirs": [
     {

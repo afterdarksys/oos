@@ -54,6 +54,16 @@ type Policy struct {
 	BigFileMinMB      int64    `json:"big_file_min_mb"`
 	ScanTopN          int      `json:"scan_top_n"`
 
+	// Size cache: per-directory sizes keyed by mtime, reused within SizeCacheHours.
+	// Empty file disables it; --fresh bypasses it for one run.
+	SizeCacheFile  string  `json:"size_cache_file,omitempty"`
+	SizeCacheHours float64 `json:"size_cache_hours,omitempty"`
+
+	// ReferenceOpenFiles adds every open file descriptor of every process to
+	// the references that keep a stale child alive. Costs one lsof (macOS) or a
+	// /proc walk (Linux) per plan.
+	ReferenceOpenFiles bool `json:"reference_open_files"`
+
 	// Quarantine: when true, rm actions move into QuarantineDir/<batch>/ instead
 	// of deleting. Space comes back on --purge (batches older than
 	// QuarantineDays) or --purge-now.
@@ -176,6 +186,9 @@ func (c *Config) expand(home string) {
 	if c.Policy.QuarantineDir != "" {
 		c.Policy.QuarantineDir = expandHome(c.Policy.QuarantineDir, home)
 	}
+	if c.Policy.SizeCacheFile != "" {
+		c.Policy.SizeCacheFile = expandHome(c.Policy.SizeCacheFile, home)
+	}
 	for i := range c.Policy.NeverTouch {
 		c.Policy.NeverTouch[i] = expandHome(c.Policy.NeverTouch[i], home)
 	}
@@ -226,6 +239,12 @@ func (c *Config) validate() error {
 	}
 	if p.ScanTopN <= 0 {
 		add("policy.scan_top_n must be > 0")
+	}
+	if p.SizeCacheFile != "" && !filepath.IsAbs(p.SizeCacheFile) {
+		add("policy.size_cache_file must be absolute after ~ expansion")
+	}
+	if p.SizeCacheHours < 0 {
+		add("policy.size_cache_hours must be >= 0")
 	}
 	for _, nt := range p.NeverTouch {
 		if !filepath.IsAbs(nt) {

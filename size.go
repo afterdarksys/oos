@@ -52,11 +52,12 @@ func deviceOf(info fs.FileInfo) (uint64, bool) {
 	return 0, false
 }
 
-// pathSize returns allocated bytes under root. It never follows symlinks and
-// never crosses onto another device, so a mounted volume or a link out of the
-// tree is not counted as part of it. Permission errors on subtrees are skipped,
-// not fatal, because caches routinely contain unreadable corners.
-func pathSize(root string) (int64, error) {
+// pathSizeWalk returns allocated bytes under root without the cache. It never
+// follows symlinks and never crosses onto another device, so a mounted volume
+// or a link out of the tree is not counted as part of it. Permission errors on
+// subtrees are skipped, not fatal, because caches routinely contain unreadable
+// corners.
+func pathSizeWalk(root string) (int64, error) {
 	info, err := os.Lstat(root)
 	if err != nil {
 		return 0, err

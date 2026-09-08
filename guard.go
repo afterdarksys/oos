@@ -14,6 +14,7 @@ type Env struct {
 	Home  string
 	Procs func() ([]string, error) // running process command lines
 	Cwds  func() ([]string, error) // running process working directories
+	Open  func() ([]string, error) // every open file of every process; nil disables
 }
 
 func realEnv() (Env, error) {
@@ -21,7 +22,7 @@ func realEnv() (Env, error) {
 	if err != nil {
 		return Env{}, err
 	}
-	return Env{Home: filepath.Clean(home), Procs: listProcesses, Cwds: listProcessCwds}, nil
+	return Env{Home: filepath.Clean(home), Procs: listProcesses, Cwds: listProcessCwds, Open: listOpenFiles}, nil
 }
 
 // listProcesses returns every other process's command line. Our own is dropped:

@@ -32,11 +32,11 @@ type opts struct {
 	minMB                                                               int64
 
 	// script-facing
-	quiet, free, auditHome, agentTick, system bool
-	ensure, warnGB, critGB                    float64
-	why, add, forget, addType, addAction      string
-	addCommand, addNote, addUseCase, who      string
-	addStale, logTail                         int
+	quiet, free, auditHome, agentTick, system, fresh bool
+	ensure, warnGB, critGB                           float64
+	why, add, forget, addType, addAction             string
+	addCommand, addNote, addUseCase, who             string
+	addStale, logTail                                int
 }
 
 type cmdRunner func(name string, args ...string) error
@@ -115,6 +115,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.StringVar(&o.addUseCase, "use-case", "", "use_case label for --add")
 	fs.BoolVar(&o.agentTick, "agent-tick", false, "one scheduled tick: quick check, growth alert, expired-quarantine purge, notification")
 	fs.BoolVar(&o.system, "system", false, "with --install-agent/--uninstall-agent on Linux: system-wide units in /etc/systemd/system (root)")
+	fs.BoolVar(&o.fresh, "fresh", false, "bypass the size cache for this run")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -193,6 +194,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.quiet {
 		stdout = io.Discard
+	}
+	if !o.fresh && cfg.Policy.SizeCacheFile != "" {
+		ttl := time.Duration(cfg.Policy.SizeCacheHours * float64(time.Hour))
+		if ttl <= 0 {
+			ttl = 6 * time.Hour
+		}
+		cache = openSizeCache(cfg.Policy.SizeCacheFile, ttl)
+		defer func() {
+			if err := cache.save(); err != nil {
+				fmt.Fprintf(stderr, "oos: save size cache: %v\n", err)
+			}
+			if o.verbose {
+				h, m := cache.stats()
+				fmt.Fprintf(stderr, "size cache: %d hits, %d misses\n", h, m)
+			}
+		}()
+	}
+	if !cfg.Policy.ReferenceOpenFiles {
+		env.Open = nil
 	}
 	now := time.Now()
 	code := exitOK

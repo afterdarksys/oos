@@ -25,11 +25,13 @@ func realEnv() (Env, error) {
 	return Env{Home: filepath.Clean(home), Procs: listProcesses, Cwds: listProcessCwds, Open: listOpenFiles}, nil
 }
 
-// listProcesses returns every other process's command line. Our own is dropped:
+// listProcesses returns every other process's command line, untruncated (-ww:
+// without it macOS ps clips long lines and a path deep in an argument list is
+// silently missed). Our own is dropped:
 // an oos invocation names the paths it is judging, and must never count as
 // a process that uses them.
 func listProcesses() ([]string, error) {
-	out, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	out, err := exec.Command("ps", "-axww", "-o", "pid=,command=").Output()
 	if err != nil {
 		return nil, err
 	}

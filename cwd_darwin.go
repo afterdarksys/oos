@@ -10,7 +10,7 @@ import (
 // listProcessCwds asks lsof for every process's working directory. The -F n
 // form prints one "n<path>" line per cwd.
 func listProcessCwds() ([]string, error) {
-	out, err := exec.Command("lsof", "-a", "-d", "cwd", "-F", "n").Output()
+	out, err := exec.Command("lsof", "-a", "-d", "cwd", "-F", "n", "-w", "-n", "-P").Output()
 	if err != nil {
 		// lsof exits 1 when some processes could not be inspected but still
 		// prints the rest; treat output as the answer when there is any.

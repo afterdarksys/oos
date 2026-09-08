@@ -11,7 +11,7 @@ import (
 // can see. lsof exits non-zero when some processes are off limits but still
 // prints the rest, so non-empty output is the answer.
 func listOpenFiles() ([]string, error) {
-	out, err := exec.Command("lsof", "-F", "n", "-w").Output()
+	out, err := exec.Command("lsof", "-F", "n", "-w", "-n", "-P").Output()
 	if err != nil && len(out) == 0 {
 		return nil, err
 	}

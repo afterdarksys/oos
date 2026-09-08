@@ -12,7 +12,8 @@ import (
 	"github.com/afterdarksys/oos/internal/size"
 )
 
-const historyCap = 200
+// historyCap keeps about three and a half days of five-minute daemon ticks.
+const historyCap = 1000
 
 // State is bigfile.json: what oos last saw. It is a cache of observations,
 // never an input to any decision about deleting.

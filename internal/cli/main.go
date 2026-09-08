@@ -28,7 +28,7 @@ import (
 	"github.com/afterdarksys/oos/internal/state"
 )
 
-const Version = "0.5.0"
+const Version = "0.6.0"
 
 type opts struct {
 	check, known, cleanup, show, diff, quick, yes, no, jsonOut, verbose bool
@@ -57,6 +57,9 @@ type opts struct {
 
 	// --dupes DIR, --downloads [DIR]
 	dupes, downloads string
+
+	// daemon
+	daemonRun, statusQ, installDaemon, uninstallDaemon bool
 }
 
 func parseFlags(args []string, stderr io.Writer) (*opts, error) {
@@ -137,6 +140,10 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.StringVar(&o.hosts, "hosts", "", "with --fleet: comma-separated ssh targets instead of policy.fleet")
 	fs.StringVar(&o.dupes, "dupes", "", "list identical files under DIR (size, then head/tail hash, then SHA-256); --min-mb floor, default 10")
 	fs.StringVar(&o.downloads, "downloads", "", "judge a downloads folder (DIR, or 'default' for ~/Downloads): installed installers, extracted archives, copies, partials, apps, stale")
+	fs.BoolVar(&o.daemonRun, "daemon", false, "run the resident watcher in the foreground: a tick every policy.daemon.interval_minutes, status socket, writer sampling, rate-limited alerts, auto-act only if policy says so")
+	fs.BoolVar(&o.statusQ, "status", false, "ask the running daemon for its status (falls back to the state file)")
+	fs.BoolVar(&o.installDaemon, "install-daemon", false, "install and start the daemon (launchd or systemd, --system for root units); removes the hourly agent")
+	fs.BoolVar(&o.uninstallDaemon, "uninstall-daemon", false, "stop and remove the daemon")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -159,7 +166,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != ""} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != "", o.daemonRun, o.statusQ, o.installDaemon, o.uninstallDaemon} {
 		if m {
 			modes++
 		}
@@ -193,6 +200,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.installAgent || o.uninstallAgent {
 		return doAgent(env, o, stdout, stderr)
+	}
+	if o.installDaemon || o.uninstallDaemon {
+		return doInstallDaemon(env, o, stdout, stderr)
 	}
 	if o.add != "" {
 		return doAdd(env, o, stdout, stderr)
@@ -244,6 +254,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.agentTick {
 		return agent.Tick(cfg, o.jsonOut, now, stdout, stderr)
+	}
+	if o.daemonRun {
+		return doDaemon(cfg, src, env, o, stdout, stderr)
+	}
+	if o.statusQ {
+		worst(doStatus(cfg, env, o, stdout, stderr))
 	}
 	if o.free {
 		worst(doFree(cfg, o, stdout, stderr))

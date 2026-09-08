@@ -128,6 +128,8 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `docker`, `docker_timeout_seconds` | ask the daemon during a sized check: unset means when `docker` is on the PATH, `false` never, `true` always and report a silent daemon; the deadline defaults to 120 s |
 | `forecast_window_hours`, `alert_hours_to_critical` | window the rate is fitted over (default 6) and how far ahead a projected critical crossing alerts (default 24; negative disables) |
 | `fleet`, `fleet_timeout_seconds` | ssh targets `--fleet` asks (`root@host`, or an ssh alias) and the per-host deadline (default 20) |
+| `snapshots` | ask `tmutil` for local snapshots during a sized check: unset means on macOS when it exists, `false` never, `true` always |
+| `daemon` | `interval_minutes` (5), `socket` (path or `off`), `sized_every_hours` (6, negative never), `alert_repeat_minutes` (60), `find_writer` (true), `writer_top_n` (5), `auto_act` (false), `auto_act_target_gb` (warn line), `auto_act_cooldown_minutes` (60) |
 
 ## rm-stale-children
 
@@ -271,6 +273,32 @@ is one `statfs` and one state write: it notifies (`osascript` or
 `notify-send`) when free space is under the warn line or fell by more than
 `alert_drop_gb` since the previous tick within three hours, and with
 `agent_purge_expired` it releases quarantine batches past their expiry.
+
+## Daemon
+
+`oos --daemon` is the resident watcher; `--install-daemon` keeps it running
+under launchd or systemd (`--system` for root units) and removes the hourly
+agent, which it replaces. Every `interval_minutes` (default 5) it records
+free space, fits the forecast, samples every open file and names what
+grew since the last tick, and alerts: on a status change, once per
+`alert_repeat_minutes` while a condition holds, on a drop of
+`alert_drop_gb` between ticks (with the writers), on a projected critical
+crossing inside `alert_hours_to_critical`, and on recovery. Every
+`sized_every_hours` (default 6) it sizes the known entries and asks
+Docker, so `--status` always has a recent reclaimable figure.
+
+`oos --status` asks it over the unix socket (`policy.daemon.socket`,
+default `~/.local/state/oos/oos.sock`) and answers even while a long walk
+is running, showing what the daemon is busy with; without a daemon it
+reads the state file and says so. Exit code is the disk status.
+
+Acting is off unless `policy.daemon.auto_act` is true. Then, under
+critical and no more often than `auto_act_cooldown_minutes` (default 60),
+it runs the same path as `--ensure` toward `auto_act_target_gb` (default
+`warn_free_gb`): expired quarantine first, then entries largest first,
+inside the per-run budget, every guard re-checked, everything logged and
+announced. Each knob has a default, so an empty `daemon` block is a
+daemon that only watches. SIGHUP reloads the config; SIGTERM stops it.
 
 ## Duplicates, Downloads and snapshots
 

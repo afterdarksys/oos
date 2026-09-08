@@ -106,6 +106,84 @@ type Policy struct {
 	// line, and how long to wait for each.
 	Fleet               []string `json:"fleet,omitempty"`
 	FleetTimeoutSeconds int      `json:"fleet_timeout_seconds,omitempty"`
+
+	// Daemon: the resident watcher started by --daemon. Every knob has a
+	// default, so an empty block is a working daemon that only watches.
+	Daemon DaemonPolicy `json:"daemon,omitempty"`
+}
+
+// DaemonPolicy tunes the resident process. Watching is always on; the
+// status socket, the writer sampler and the periodic sized check can be
+// turned off; acting is off unless auto_act is true.
+type DaemonPolicy struct {
+	IntervalMinutes        float64 `json:"interval_minutes,omitempty"`          // between ticks (default 5, minimum 1)
+	Socket                 string  `json:"socket,omitempty"`                    // unix socket --status asks (default ~/.local/state/oos/oos.sock; "off" disables)
+	SizedEveryHours        float64 `json:"sized_every_hours,omitempty"`         // refresh known-entry sizes this often (default 6; negative never)
+	AlertRepeatMinutes     float64 `json:"alert_repeat_minutes,omitempty"`      // an unchanged condition re-alerts no sooner than this (default 60)
+	FindWriter             *bool   `json:"find_writer,omitempty"`               // sample open files every tick and name what grew (default true)
+	WriterTopN             int     `json:"writer_top_n,omitempty"`              // growers kept in status and alerts (default 5)
+	AutoAct                bool    `json:"auto_act"`                            // under critical, run the ensure path (default false)
+	AutoActTargetGB        float64 `json:"auto_act_target_gb,omitempty"`        // free space to reach (default warn_free_gb)
+	AutoActCooldownMinutes float64 `json:"auto_act_cooldown_minutes,omitempty"` // between automatic actions (default 60)
+}
+
+func (d DaemonPolicy) Interval() time.Duration {
+	if d.IntervalMinutes >= 1 {
+		return time.Duration(d.IntervalMinutes * float64(time.Minute))
+	}
+	return 5 * time.Minute
+}
+
+// SocketPath is where the daemon listens; "" means no socket.
+func (d DaemonPolicy) SocketPath(home string) string {
+	switch d.Socket {
+	case "":
+		return filepath.Join(home, ".local", "state", "oos", "oos.sock")
+	case "off", "none":
+		return ""
+	}
+	return d.Socket
+}
+
+func (d DaemonPolicy) SizedEvery() time.Duration {
+	switch {
+	case d.SizedEveryHours < 0:
+		return 0
+	case d.SizedEveryHours == 0:
+		return 6 * time.Hour
+	}
+	return time.Duration(d.SizedEveryHours * float64(time.Hour))
+}
+
+func (d DaemonPolicy) AlertRepeat() time.Duration {
+	if d.AlertRepeatMinutes > 0 {
+		return time.Duration(d.AlertRepeatMinutes * float64(time.Minute))
+	}
+	return time.Hour
+}
+
+func (d DaemonPolicy) WantWriter() bool { return d.FindWriter == nil || *d.FindWriter }
+
+func (d DaemonPolicy) TopN() int {
+	if d.WriterTopN > 0 {
+		return d.WriterTopN
+	}
+	return 5
+}
+
+func (d DaemonPolicy) Cooldown() time.Duration {
+	if d.AutoActCooldownMinutes > 0 {
+		return time.Duration(d.AutoActCooldownMinutes * float64(time.Minute))
+	}
+	return time.Hour
+}
+
+// Target is the free space auto-act aims for.
+func (d DaemonPolicy) Target(p Policy) float64 {
+	if d.AutoActTargetGB > 0 {
+		return d.AutoActTargetGB
+	}
+	return p.WarnFreeGB
 }
 
 // ForecastWindow is the fitted window as a duration.
@@ -240,6 +318,9 @@ func (c *Config) expand(home string) {
 	if c.Policy.SizeCacheFile != "" {
 		c.Policy.SizeCacheFile = ExpandHome(c.Policy.SizeCacheFile, home)
 	}
+	if s := c.Policy.Daemon.Socket; s != "" && s != "off" && s != "none" {
+		c.Policy.Daemon.Socket = ExpandHome(s, home)
+	}
 	for i := range c.Policy.NeverTouch {
 		c.Policy.NeverTouch[i] = ExpandHome(c.Policy.NeverTouch[i], home)
 	}
@@ -305,6 +386,18 @@ func (c *Config) validate() error {
 	}
 	if p.FleetTimeoutSeconds < 0 {
 		add("policy.fleet_timeout_seconds must be >= 0")
+	}
+	if d := p.Daemon; d.IntervalMinutes < 0 || (d.IntervalMinutes > 0 && d.IntervalMinutes < 1) {
+		add("policy.daemon.interval_minutes must be 0 (default 5) or >= 1")
+	}
+	if d := p.Daemon; d.AlertRepeatMinutes < 0 || d.WriterTopN < 0 || d.AutoActTargetGB < 0 || d.AutoActCooldownMinutes < 0 {
+		add("policy.daemon: alert_repeat_minutes, writer_top_n, auto_act_target_gb and auto_act_cooldown_minutes must be >= 0")
+	}
+	if d := p.Daemon; d.AutoAct && d.AutoActTargetGB > 0 && d.AutoActTargetGB < p.MinFreeGB {
+		add("policy.daemon.auto_act_target_gb (%.0f) is below min_free_gb (%.0f); acting would never leave critical", d.AutoActTargetGB, p.MinFreeGB)
+	}
+	if s := p.Daemon.Socket; s != "" && s != "off" && s != "none" && !filepath.IsAbs(s) {
+		add("policy.daemon.socket must be absolute after ~ expansion, or \"off\"")
 	}
 	for i, h := range p.Fleet {
 		if strings.TrimSpace(h) == "" || strings.ContainsAny(h, " \t\n;|&") {

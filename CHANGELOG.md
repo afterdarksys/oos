@@ -1,6 +1,11 @@
 # Changelog
 
-## [0.6.0] - unreleased
+## [0.6.0] - 2026-09-08
+
+### Added
+- Daemon: `--daemon` runs the resident watcher, `--install-daemon` / `--uninstall-daemon` keep it under launchd or systemd (`--system`), replacing the hourly agent. Every `interval_minutes` (5) it records free space, fits the forecast, samples open files and names what grew, and alerts on status change, drop (with writers), projected critical crossing and recovery, rate-limited to `alert_repeat_minutes`. Every `sized_every_hours` (6) it sizes known entries and asks Docker. `--status` asks it over a unix socket and answers during long walks; without a daemon it reads the state file. Acting is off unless `policy.daemon.auto_act` is true, then under critical it runs the `--ensure` path toward `auto_act_target_gb` no more often than the cooldown, every guard re-checked and everything logged. SIGHUP reloads, SIGTERM stops.
+- `--ensure` now runs through `plan.Ensure`, the same code the daemon uses.
+- The state history keeps 1000 readings (about three and a half days of five-minute ticks).
 
 ### Changed
 - Repository layout: one `package main` of forty files became `cmd/oos` plus `internal/{cli,config,size,guard,plan,state,audit,docker,repos,agent,status,testutil}`, each owning one concern. No behaviour change; the suite moved with the code and runs per package.

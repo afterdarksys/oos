@@ -21,7 +21,6 @@ import (
 	"github.com/afterdarksys/oos/internal/guard"
 	"github.com/afterdarksys/oos/internal/plan"
 	"github.com/afterdarksys/oos/internal/size"
-	"github.com/afterdarksys/oos/internal/state"
 )
 
 // applyOverrides lets a script tighten or loosen the thresholds for one run.
@@ -166,136 +165,34 @@ func doWhy(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) int 
 // caller asked for space it can use right now; the audit log still records
 // every path.
 func doEnsure(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, errw io.Writer) int {
-	target := o.ensure
-	du, err := size.Disk(cfg.Volume)
-	if err != nil {
-		fmt.Fprintf(errw, "oos: statfs %s: %v\n", cfg.Volume, err)
-		return status.ExitUsage
-	}
 	live := o.yes && !o.no
-	report := func(final size.DiskUsage, steps []string, reached bool) int {
-		if o.jsonOut {
-			_ = json.NewEncoder(out).Encode(map[string]any{
-				"target_gb": target, "start_free_gb": du.FreeGB(), "free_gb": final.FreeGB(),
-				"reached": reached, "live": live, "steps": steps,
-			})
-		} else {
-			for _, s := range steps {
-				fmt.Fprintln(out, "  "+s)
-			}
-			verb := "would reach"
-			if live {
-				verb = "reached"
-			}
-			if !reached {
-				verb = "cannot reach"
-				if live {
-					verb = "did not reach"
-				}
-			}
-			fmt.Fprintf(out, "ensure %.0f GB: %s; free %.1f GB -> %.1f GB\n", target, verb, du.FreeGB(), final.FreeGB())
-		}
-		if reached {
-			return status.ExitOK
-		}
+	res, err := plan.Ensure(cfg, env, o.ensure, splitTypes(o.types), live, now)
+	if err != nil {
+		fmt.Fprintln(errw, "oos:", err)
 		return status.ExitCritical
 	}
-	if du.FreeGB() >= target {
-		return report(du, []string{fmt.Sprintf("already %.1f GB free", du.FreeGB())}, true)
-	}
-	need := int64((target - du.FreeGB()) * size.GB)
-	var steps []string
-	var projected int64
-
-	// 1. expired quarantine
-	if cfg.Policy.Quarantine {
-		olderThan := time.Duration(cfg.Policy.QuarantineDays) * 24 * time.Hour
-		bs, _ := plan.ListBatches(cfg.Policy.QuarantineDir)
-		var expired int64
-		for _, b := range bs {
-			if b.Count >= 0 && now.Sub(b.Created) >= olderThan {
-				expired += b.Bytes
-			}
+	if o.jsonOut {
+		_ = json.NewEncoder(out).Encode(res)
+	} else {
+		for _, s := range res.Steps {
+			fmt.Fprintln(out, "  "+s)
 		}
-		if expired > 0 {
+		verb := "would reach"
+		if live {
+			verb = "reached"
+		}
+		if !res.Reached {
+			verb = "cannot reach"
 			if live {
-				freed, names, err := plan.PurgeBatches(cfg.Policy.QuarantineDir, olderThan, now, false)
-				steps = append(steps, fmt.Sprintf("purged %d expired quarantine batches, %s (err=%v)", len(names), size.Human(freed), err))
-				projected += freed
-			} else {
-				steps = append(steps, fmt.Sprintf("purge %d expired quarantine batches, %s", len(bs), size.Human(expired)))
-				projected += expired
+				verb = "did not reach"
 			}
 		}
+		fmt.Fprintf(out, "ensure %.0f GB: %s; free %.1f GB -> %.1f GB\n", res.TargetGB, verb, res.StartFreeGB, res.FreeGB)
 	}
-
-	// 2. plan, largest destructive first, then commands
-	items := plan.Build(cfg, env, splitTypes(o.types), now)
-	var rm, cmds []plan.Item
-	for _, it := range items {
-		if it.Refused != nil {
-			continue
-		}
-		if config.IsDestructive(it.Action) && it.Deletable > 0 {
-			rm = append(rm, it)
-		} else if it.Action == config.ActionCommand {
-			cmds = append(cmds, it)
-		}
+	if res.Reached {
+		return status.ExitOK
 	}
-	ordered := append(rm, cmds...)
-
-	var logf *os.File
-	if live {
-		logf, err = state.OpenLog(cfg.Policy.LogFile)
-		if err != nil {
-			fmt.Fprintf(errw, "oos: cannot open log %s: %v; refusing to act without an audit log\n", cfg.Policy.LogFile, err)
-			return status.ExitCritical
-		}
-		defer logf.Close()
-	}
-	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References}
-	var spent int64
-	maxBytes := int64(cfg.Policy.MaxDeleteGBPerRun * size.GB)
-	final := du
-	for _, it := range ordered {
-		if projected >= need {
-			break
-		}
-		if config.IsDestructive(it.Action) && spent+it.Deletable > maxBytes {
-			steps = append(steps, fmt.Sprintf("skip %s: would exceed the %.0f GB per-run budget", it.Path, cfg.Policy.MaxDeleteGBPerRun))
-			continue
-		}
-		if !live {
-			steps = append(steps, fmt.Sprintf("%s %s (%s)", it.Action, it.Path, size.Human(it.Deletable)))
-			projected += it.Deletable
-			spent += it.Deletable
-			continue
-		}
-		before, _ := size.Disk(cfg.Volume)
-		if _, err := x.Execute([]plan.Item{it}); err != nil {
-			steps = append(steps, fmt.Sprintf("%s %s: %v", it.Action, it.Path, err))
-			continue
-		}
-		after, _ := size.Disk(cfg.Volume)
-		got := int64(after.Free) - int64(before.Free)
-		spent += it.Deletable
-		projected += got
-		final = after
-		steps = append(steps, fmt.Sprintf("%s %s: %s freed", it.Action, it.Path, size.Human(got)))
-	}
-	if live {
-		final, _ = size.Disk(cfg.Volume)
-		if st, err := state.Load(cfg.Policy.StateFile); err == nil {
-			st.Record("ensure", final, now)
-			_ = state.Save(cfg.Policy.StateFile, st)
-		}
-		return report(final, steps, final.FreeGB() >= target)
-	}
-	proj := size.DiskUsage{Free: du.Free + uint64(projected), Total: du.Total}
-	if projected < need {
-		steps = append(steps, fmt.Sprintf("short by %s even after every allowed action", size.Human(need-projected)))
-	}
-	return report(proj, steps, projected >= need)
+	return status.ExitCritical
 }
 
 // configFileForEdit returns the config path --add/--forget should modify,

@@ -7,7 +7,9 @@ package main
 // at their parent, which bumps the parent's mtime, so churny caches (uv
 // archives, package caches) invalidate exactly where they changed. A file
 // growing in place does not bump any directory mtime, so the TTL is the
-// backstop for logs, databases and disk images; --fresh skips the cache.
+// backstop for logs, databases and disk images; --fresh ignores every stored
+// entry for one run and rewrites them from the measurements it makes, so the
+// next run is warm again with honest numbers.
 
 import (
 	"encoding/json"
@@ -34,6 +36,7 @@ type sizeCache struct {
 	hits     int
 	misses   int
 	enabled  bool
+	refresh  bool  // --fresh: never serve a stored entry, but store what is measured
 	minBytes int64 // directories smaller than this are not stored; their parent covers them
 }
 
@@ -104,7 +107,7 @@ func (c *sizeCache) get(dir string, mtime time.Time, now time.Time) (int64, bool
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[dir]
-	if !ok || e.Mtime != mtime.UnixNano() || now.Sub(e.At) > c.ttl {
+	if c.refresh || !ok || e.Mtime != mtime.UnixNano() || now.Sub(e.At) > c.ttl {
 		c.misses++
 		return 0, false
 	}

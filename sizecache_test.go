@@ -62,6 +62,51 @@ func TestSizeCacheHitsInvalidatesAndExpires(t *testing.T) {
 	}
 }
 
+// TestFreshRefreshesInsteadOfDisabling: a --fresh run must not serve a
+// stored size, and must leave the cache holding what it measured, so the
+// run after it is warm with honest numbers. Before 0.5.0 --fresh skipped
+// the cache entirely and the stale entry survived it.
+func TestFreshRefreshesInsteadOfDisabling(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "d")
+	write(t, filepath.Join(dir, "sub", "a"), 65536)
+	file := filepath.Join(home, "sizes.json")
+	now := time.Now()
+	fi := mustLstat(t, dir)
+	dev, have := deviceOf(fi)
+
+	// a lie in the cache: right mtime, fresh timestamp, wrong size
+	c := openSizeCacheWith(file, time.Hour, 0)
+	c.put(dir, fi.ModTime(), 1, now)
+	if err := c.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	warm := openSizeCacheWith(file, time.Hour, 0)
+	if n := warm.sizeDir(dir, dev, have, now.Add(time.Minute)); n != 1 {
+		t.Fatalf("a normal run serves the stored size: got %d", n)
+	}
+
+	fresh := openSizeCacheWith(file, time.Hour, 0)
+	fresh.refresh = true
+	n := fresh.sizeDir(dir, dev, have, now.Add(2*time.Minute))
+	if n < 65536 {
+		t.Fatalf("--fresh must measure, got %d", n)
+	}
+	if h, _ := fresh.stats(); h != 0 {
+		t.Errorf("--fresh must never hit, got %d hits", h)
+	}
+	if err := fresh.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	after := openSizeCacheWith(file, time.Hour, 0)
+	got, ok := after.get(dir, fi.ModTime(), now.Add(3*time.Minute))
+	if !ok || got != n {
+		t.Errorf("the run after --fresh must be warm with the measured size: ok=%v got=%d want=%d", ok, got, n)
+	}
+}
+
 func mustLstat(t *testing.T, p string) os.FileInfo {
 	t.Helper()
 	fi, err := os.Lstat(p)

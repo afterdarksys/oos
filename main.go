@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.4.1"
+const version = "0.5.0"
 
 const (
 	exitOK       = 0
@@ -115,7 +115,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.StringVar(&o.addUseCase, "use-case", "", "use_case label for --add")
 	fs.BoolVar(&o.agentTick, "agent-tick", false, "one scheduled tick: quick check, growth alert, expired-quarantine purge, notification")
 	fs.BoolVar(&o.system, "system", false, "with --install-agent/--uninstall-agent on Linux: system-wide units in /etc/systemd/system (root)")
-	fs.BoolVar(&o.fresh, "fresh", false, "bypass the size cache for this run")
+	fs.BoolVar(&o.fresh, "fresh", false, "ignore stored sizes for this run and refresh the size cache from what is measured")
 	fs.BoolVar(&o.permanent, "permanent", false, "with --cleanup --yes: delete outright instead of quarantining (space returns immediately, no undo)")
 	fs.IntVar(&o.history, "history", 0, "print the last N free-space readings from the state file")
 	fs.Usage = func() {
@@ -197,12 +197,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if o.quiet {
 		stdout = io.Discard
 	}
-	if !o.fresh && cfg.Policy.SizeCacheFile != "" {
+	if cfg.Policy.SizeCacheFile != "" {
 		ttl := time.Duration(cfg.Policy.SizeCacheHours * float64(time.Hour))
 		if ttl <= 0 {
 			ttl = 6 * time.Hour
 		}
 		cache = openSizeCache(cfg.Policy.SizeCacheFile, ttl)
+		cache.refresh = o.fresh // measure everything, then store it: the next run is warm and honest
 		defer func() {
 			if err := cache.save(); err != nil {
 				fmt.Fprintf(stderr, "oos: save size cache: %v\n", err)

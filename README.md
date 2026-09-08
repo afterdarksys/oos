@@ -38,7 +38,7 @@ oos --audit ~/Library -v  # audit somewhere else, show every hint
 oos --who ~/.cache/uv     # what is this for, which repo, which processes, newest file
 oos --history 24          # free-space readings and the GB/day trend
 oos -C -y --permanent     # cleanup that frees space now instead of quarantining
-oos -c --fresh            # bypass the size cache for one run
+oos -c --fresh            # remeasure everything and refresh the size cache
 ```
 
 ## In scripts and for agents
@@ -170,7 +170,9 @@ whose entry is younger than `size_cache_hours`, so churny caches
 invalidate exactly where entries were added or removed and untouched
 subtrees cost one stat. A file growing in place does not bump a directory
 mtime, so the TTL is the backstop for logs, databases and disk images;
-`--fresh` bypasses the cache and `-v` reports hits and misses. Only
+`--fresh` ignores every stored size for one run and rewrites the cache from
+what it measures, so the run after it is warm again with honest numbers;
+`-v` reports hits and misses. Only
 directories over 4 MB are stored, because a hit on a parent covers its
 children. On a 700 GB home directory a full audit went from 362 s cold to
 about 11 s warm.

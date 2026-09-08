@@ -55,7 +55,8 @@ type Policy struct {
 	ScanTopN          int      `json:"scan_top_n"`
 
 	// Size cache: per-directory sizes keyed by mtime, reused within SizeCacheHours.
-	// Empty file disables it; --fresh bypasses it for one run.
+	// Empty file disables it; --fresh ignores stored entries for one run and
+	// rewrites them from that run's measurements.
 	SizeCacheFile  string  `json:"size_cache_file,omitempty"`
 	SizeCacheHours float64 `json:"size_cache_hours,omitempty"`
 

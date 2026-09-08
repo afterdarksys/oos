@@ -36,9 +36,18 @@ func doHistory(cfg *Config, o *opts, out io.Writer) int {
 		prev = &h[i]
 	}
 	first, last := h[0], h[len(h)-1]
-	if len(h) > 1 && last.At.After(first.At) {
-		perDay := (last.FreeGB - first.FreeGB) / (last.At.Sub(first.At).Hours() / 24)
-		fmt.Fprintf(out, "  trend: %+.1f GB/day over %s\n", perDay, last.At.Sub(first.At).Round(time.Hour))
+	span := last.At.Sub(first.At)
+	switch {
+	case len(h) < 2:
+	case span < minTrendSpan:
+		// two readings a minute apart extrapolate to hundreds of GB/day of noise
+		fmt.Fprintf(out, "  trend: needs %s of readings, have %s\n", minTrendSpan, span.Round(time.Minute))
+	default:
+		perDay := (last.FreeGB - first.FreeGB) / (span.Hours() / 24)
+		fmt.Fprintf(out, "  trend: %+.1f GB/day over %s\n", perDay, span.Round(time.Hour))
 	}
 	return exitOK
 }
+
+// minTrendSpan is the shortest window a GB/day figure is printed for.
+const minTrendSpan = time.Hour

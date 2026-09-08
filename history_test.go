@@ -34,6 +34,21 @@ func TestHistoryTrend(t *testing.T) {
 	if !strings.Contains(out.String(), "no readings") {
 		t.Error("missing state should say so")
 	}
+
+	// first deploy on apps: a check and a tick seconds apart printed
+	// "-239.2 GB/day over 0s". A window under an hour gets no rate.
+	st.History = []HistoryPoint{
+		{At: now.Add(-20 * time.Second), FreeGB: 268.7, Event: "check"},
+		{At: now, FreeGB: 268.6, Event: "agent"},
+	}
+	if err := saveState(p.StateFile, st); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	doHistory(cfg, &opts{history: 2}, &out)
+	if strings.Contains(out.String(), "GB/day") || !strings.Contains(out.String(), "trend: needs 1h0m0s of readings") {
+		t.Errorf("sub-hour span must not extrapolate:\n%s", out.String())
+	}
 }
 
 func TestCleanupPermanentBypassesQuarantine(t *testing.T) {

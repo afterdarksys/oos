@@ -142,7 +142,7 @@ func scanBig(root string, minBytes int64, topN int) ([]BigFile, error) {
 		return nil, err
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i].Bytes > hits[j].Bytes })
-	if len(hits) > topN {
+	if topN > 0 && len(hits) > topN {
 		hits = hits[:topN]
 	}
 	return hits, nil

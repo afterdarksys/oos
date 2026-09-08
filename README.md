@@ -39,6 +39,11 @@ oos --who ~/.cache/uv     # what is this for, which repo, which processes, newes
 oos --history 24          # free-space readings and the GB/day trend
 oos -C -y --permanent     # cleanup that frees space now instead of quarantining
 oos -c --fresh            # remeasure everything and refresh the size cache
+oos --by-type ~/Downloads                          # disk images 29.7 GB, archives 13.4 GB, ...
+oos -S ~/Downloads --ext dmg,iso --older-than 90d --sort oldest --top 10
+oos -A --tag stale-1y                             # only entries untouched for a year
+oos --add ~/x --type cache --action rm-contents --tags build-output,review
+oos -C -t cache --tag build-output                # cleanup plan narrowed by tag
 ```
 
 ## In scripts and for agents
@@ -176,6 +181,27 @@ what it measures, so the run after it is warm again with honest numbers;
 directories over 4 MB are stored, because a hit on a parent covers its
 children. On a 700 GB home directory a full audit went from 362 s cold to
 about 11 s warm.
+
+## Filters, sorting and tags
+
+`--scan`, `--audit` and `--by-type` share one set of windows: `--older-than`
+and `--newer-than` take an age (`36h`, `90d`, `2w`, `6mo`, `1y`, or a bare
+number of days) and compare it with the file's mtime, or for an audit row
+the newest mtime found in the subtree; `--ext dmg,iso,tar.gz` keeps only
+those extensions (rotated `app.log.2.gz` still counts as a log, and `gz`
+matches every compound that ends in it); `--sort size|oldest|newest|name`
+and `--top N` order and cap the rows. `--by-type DIR` buckets every
+regular file by category (disk image, archive, package, video, audio,
+image, document, log, database, binary, model, source, font) from its
+extension, sniffing the first bytes of anything over 1 MB that has none.
+
+Tags are labels. An entry carries the ones you give it (`--add --tags`,
+or `tags` in the config), and `--check`, `--known` and `--cleanup` narrow
+to one with `--tag`. An audit row carries tags oos can prove from disk:
+`stale-30d/90d/180d/1y`, `big` (over 1 GB), `huge` (over 10 GB), `hidden`,
+`build-output`, `repo`, plus its status and any entry tags, and
+`--audit --tag stale-1y` is the one-line answer to "what have I not
+touched in a year".
 
 ## Docker
 

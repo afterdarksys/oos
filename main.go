@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -37,6 +38,10 @@ type opts struct {
 	why, add, forget, addType, addAction                        string
 	addCommand, addNote, addUseCase, who                        string
 	addStale, logTail, history                                  int
+
+	// filters shared by --scan, --audit, --by-type, --dupes
+	olderThan, newerThan, sortBy, ext, tag, addTags, byType string
+	top                                                     int
 }
 
 type cmdRunner func(name string, args ...string) error
@@ -118,6 +123,14 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.BoolVar(&o.fresh, "fresh", false, "ignore stored sizes for this run and refresh the size cache from what is measured")
 	fs.BoolVar(&o.permanent, "permanent", false, "with --cleanup --yes: delete outright instead of quarantining (space returns immediately, no undo)")
 	fs.IntVar(&o.history, "history", 0, "print the last N free-space readings from the state file")
+	fs.StringVar(&o.olderThan, "older-than", "", "with --scan/--audit/--by-type/--dupes: only entries not modified in AGE (90d, 2w, 36h, 6mo, 1y)")
+	fs.StringVar(&o.newerThan, "newer-than", "", "with --scan/--audit/--by-type/--dupes: only entries modified within AGE")
+	fs.StringVar(&o.sortBy, "sort", "", "with --scan/--audit: size (default), oldest, newest or name")
+	fs.IntVar(&o.top, "top", 0, "with --scan/--audit/--by-type: show at most N rows")
+	fs.StringVar(&o.ext, "ext", "", "with --scan/--by-type/--dupes: comma-separated extensions (dmg,iso,log,tar.gz)")
+	fs.StringVar(&o.byType, "by-type", "", "size every regular file under DIR by type (disk image, archive, video, log, ...)")
+	fs.StringVar(&o.tag, "tag", "", "only entries carrying TAG (--check/--known/--cleanup: entry tags; --audit: automatic tags like stale-1y, build-output, repo)")
+	fs.StringVar(&o.addTags, "tags", "", "comma-separated tags for --add")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -140,7 +153,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != ""} {
 		if m {
 			modes++
 		}
@@ -256,6 +269,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.audit != "" {
 		worst(doAudit(cfg, env, o, now, stdout, stderr))
+	}
+	if o.byType != "" {
+		worst(doByType(cfg, env, o, now, stdout, stderr))
 	}
 	if o.restore != "" {
 		worst(doRestore(cfg, o, stdout, stderr))
@@ -398,6 +414,9 @@ func printEntry(out io.Writer, e Entry) {
 	if e.StaleAfterHours > 0 {
 		extra += fmt.Sprintf("  stale_after=%dh", e.StaleAfterHours)
 	}
+	if len(e.Tags) > 0 {
+		extra += "  [" + strings.Join(e.Tags, " ") + "]"
+	}
 	fmt.Fprintf(out, "  %-8s %-18s %s%s\n", e.Type, e.Action, e.Path, extra)
 	if e.Note != "" {
 		fmt.Fprintf(out, "           %s\n", e.Note)
@@ -426,7 +445,7 @@ func doCheck(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 	var dkErr error
 	dkRan := false
 	if !o.quick {
-		items = buildPlan(cfg, env, splitTypes(o.types), now)
+		items = buildPlanTagged(cfg, env, splitTypes(o.types), o.tag, now)
 		if want, forced := dockerWanted(cfg.Policy); want {
 			dkRan = true
 			dk, dkErr = collectDocker(dockerTimeout(cfg.Policy))
@@ -534,11 +553,29 @@ func doScan(cfg *Config, o *opts, now time.Time, out, errw io.Writer) int {
 	if minMB <= 0 {
 		minMB = cfg.Policy.BigFileMinMB
 	}
-	hits, err := scanBig(root, minMB*1024*1024, cfg.Policy.ScanTopN)
+	f, err := filterFromOpts(o)
+	if err != nil {
+		fmt.Fprintln(errw, "oos:", err)
+		return exitUsage
+	}
+	// scan wide, then filter, sort and cap: the cap must apply after the window
+	hits, err := scanBig(root, minMB*1024*1024, 0)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: scan %s: %v\n", root, err)
 		return exitUsage
 	}
+	kept := hits[:0]
+	for _, h := range hits {
+		if f.keepTime(h.ModTime, now) && f.keepName(h.Path) {
+			kept = append(kept, h)
+		}
+	}
+	hits = kept
+	sort.SliceStable(hits, lessFor(f.sortBy,
+		func(i int) int64 { return hits[i].Bytes },
+		func(i int) time.Time { return hits[i].ModTime },
+		func(i int) string { return hits[i].Path }))
+	hits = hits[:capRows(len(hits), f.top, cfg.Policy.ScanTopN)]
 	st, _ := loadState(cfg.Policy.StateFile)
 	st.BigFiles = hits
 	st.ScanRoot = root
@@ -553,7 +590,7 @@ func doScan(cfg *Config, o *opts, now time.Time, out, errw io.Writer) int {
 		_ = json.NewEncoder(out).Encode(hits)
 		return exitOK
 	}
-	fmt.Fprintf(out, "big files under %s (>= %d MB, top %d):\n", root, minMB, cfg.Policy.ScanTopN)
+	fmt.Fprintf(out, "big files under %s (>= %d MB, %d shown%s):\n", root, minMB, len(hits), f.describe())
 	for _, h := range hits {
 		fmt.Fprintf(out, "  %9s  %s  %s\n", human(h.Bytes), h.ModTime.Format("2006-01-02"), h.Path)
 	}
@@ -566,7 +603,7 @@ func doCleanup(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer
 	if !cfg.Policy.RequireYes {
 		live = !o.no
 	}
-	items := buildPlan(cfg, env, splitTypes(o.types), now)
+	items := buildPlanTagged(cfg, env, splitTypes(o.types), o.tag, now)
 	// Sizes are expensive; keep them even on a dry-run so --show and --diff have something to say.
 	if st, err := loadState(cfg.Policy.StateFile); err == nil {
 		st.Volume = cfg.Volume

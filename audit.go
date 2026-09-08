@@ -24,6 +24,60 @@ type AuditRow struct {
 	UseCase    string         `json:"use_case,omitempty"`
 	Breakdown  []useCaseTotal `json:"breakdown,omitempty"` // for unattributed directories: what is inside
 	Suggestion string         `json:"suggestion"`          // human hint, empty when there is nothing to say
+	Tags       []string       `json:"tags,omitempty"`      // automatic (stale-90d, big, repo, ...) plus the entry's own
+}
+
+// autoTags are the labels oos can prove about a row from what is on disk.
+func autoTags(cfg *Config, r AuditRow, now time.Time) []string {
+	var tags []string
+	age := now.Sub(r.ModTime)
+	switch {
+	case age >= 365*24*time.Hour:
+		tags = append(tags, "stale-1y")
+	case age >= 180*24*time.Hour:
+		tags = append(tags, "stale-180d")
+	case age >= 90*24*time.Hour:
+		tags = append(tags, "stale-90d")
+	case age >= 30*24*time.Hour:
+		tags = append(tags, "stale-30d")
+	}
+	if r.Bytes >= 10*gb {
+		tags = append(tags, "huge")
+	} else if r.Bytes >= gb {
+		tags = append(tags, "big")
+	}
+	if r.Hidden {
+		tags = append(tags, "hidden")
+	}
+	if r.IsDir && cacheName.MatchString(filepath.Base(r.Path)) {
+		tags = append(tags, "build-output")
+	}
+	if r.IsDir && exists(filepath.Join(r.Path, ".git")) {
+		tags = append(tags, "repo")
+	}
+	if r.Status != "" {
+		tags = append(tags, r.Status)
+	}
+	for _, e := range cfg.entries(nil) {
+		if e.Path == r.Path {
+			for _, t := range e.Tags {
+				if !hasString(tags, t) {
+					tags = append(tags, t)
+				}
+			}
+		}
+	}
+	return tags
+}
+
+func hasString(list []string, s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, x := range list {
+		if strings.ToLower(x) == s {
+			return true
+		}
+	}
+	return false
 }
 
 var cacheName = regexp.MustCompile(`(?i)(^|[._-])(cache|caches|tmp|temp|target|node_modules|deriveddata|\.gradle|\.m2|_cacache|build)($|[._-])`)
@@ -85,7 +139,29 @@ func auditOne(cfg *Config, p string, now time.Time) AuditRow {
 		r.Breakdown = attributeDeep(cfg, p, 2, now)
 		r.UseCase = mixedLabel(r.Breakdown)
 	}
+	r.Tags = autoTags(cfg, r, now)
 	return r
+}
+
+// applyFilter narrows and orders audit rows: age window on the newest
+// mtime in the subtree, tag membership, sort key, then the row cap.
+func applyFilter(rows []AuditRow, f rowFilter, now time.Time, def int) []AuditRow {
+	kept := rows[:0]
+	for _, r := range rows {
+		if !f.keepTime(r.ModTime, now) {
+			continue
+		}
+		if f.tag != "" && !hasString(r.Tags, f.tag) {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	rows = kept
+	sort.SliceStable(rows, lessFor(f.sortBy,
+		func(i int) int64 { return rows[i].Bytes },
+		func(i int) time.Time { return rows[i].ModTime },
+		func(i int) string { return rows[i].Path }))
+	return rows[:capRows(len(rows), f.top, def)]
 }
 
 // newestMtime walks up to two levels below dir to find recent activity, so a
@@ -156,11 +232,17 @@ func doAudit(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 	if minMB <= 0 {
 		minMB = 100
 	}
+	f, err := filterFromOpts(o)
+	if err != nil {
+		fmt.Fprintln(errw, "oos:", err)
+		return exitUsage
+	}
 	rows, err := auditHome(cfg, root, minMB*1024*1024, now)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: audit %s: %v\n", root, err)
 		return exitUsage
 	}
+	rows = applyFilter(rows, f, now, 0)
 	if st, err := loadState(cfg.Policy.StateFile); err == nil {
 		st.Audit = rows
 		st.AuditRoot = root
@@ -183,14 +265,18 @@ func doAudit(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 			nUnknown++
 		}
 	}
-	fmt.Fprintf(out, "audit of %s (entries >= %d MB, %d shown, %s):\n", root, minMB, len(rows), human(total))
+	fmt.Fprintf(out, "audit of %s (entries >= %d MB, %d shown, %s%s):\n", root, minMB, len(rows), human(total), f.describe())
 	for _, r := range rows {
 		age := int(now.Sub(r.ModTime).Hours() / 24)
 		uc := r.UseCase
 		if rs := []rune(uc); len(rs) > 40 {
 			uc = string(rs[:39]) + "…"
 		}
-		fmt.Fprintf(out, "  %9s  %4dd  %-9s %-40s %s\n", human(r.Bytes), age, r.Status, uc, r.Path)
+		tags := ""
+		if len(r.Tags) > 0 {
+			tags = "  [" + strings.Join(r.Tags, " ") + "]"
+		}
+		fmt.Fprintf(out, "  %9s  %4dd  %-9s %-40s %s%s\n", human(r.Bytes), age, r.Status, uc, r.Path, tags)
 		if r.Suggestion != "" && (o.verbose || r.Status == "unknown" || r.Status == "system") {
 			fmt.Fprintf(out, "                    %s\n", r.Suggestion)
 		}

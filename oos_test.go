@@ -11,7 +11,9 @@ import (
 
 // policyFor returns a permissive-enough policy rooted at home for tests.
 func policyFor(home string) Policy {
+	dockerOff := false // tests never talk to a daemon; a wedged Docker Desktop cost 120 s per check
 	return Policy{
+		Docker:    &dockerOff,
 		MinFreeGB: 1, WarnFreeGB: 2, RequireYes: true, MaxDeleteGBPerRun: 1,
 		AllowOutsideHome: false, AllowCommands: false,
 		NeverTouch:   []string{filepath.Join(home, "keep")},

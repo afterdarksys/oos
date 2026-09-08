@@ -107,6 +107,9 @@ type Entry struct {
 	// recently than this is kept regardless of references.
 	StaleAfterHours int `json:"stale_after_hours,omitempty"`
 
+	// Tags are free labels for --tag filtering ("build-output", "review-2026-q4").
+	Tags []string `json:"tags,omitempty"`
+
 	// IsFile is set by the loader: true for known_files entries.
 	IsFile bool `json:"-"`
 }
@@ -367,6 +370,45 @@ func (c *Config) entries(types []string) []Entry {
 	for _, e := range append(append([]Entry{}, c.KnownDirs...), c.KnownFiles...) {
 		if len(want) == 0 || want[strings.ToLower(e.Type)] {
 			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// entriesTagged is entries narrowed to those carrying tag; "" means all.
+func (c *Config) entriesTagged(types []string, tag string) []Entry {
+	all := c.entries(types)
+	if strings.TrimSpace(tag) == "" {
+		return all
+	}
+	var out []Entry
+	for _, e := range all {
+		if e.hasTag(tag) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func (e Entry) hasTag(tag string) bool {
+	tag = strings.ToLower(strings.TrimSpace(tag))
+	for _, t := range e.Tags {
+		if strings.ToLower(strings.TrimSpace(t)) == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// splitTags reads a comma-separated tag list, trimmed, lowercase, deduplicated.
+func splitTags(s string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range strings.Split(s, ",") {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t != "" && !seen[t] {
+			seen[t] = true
+			out = append(out, t)
 		}
 	}
 	return out

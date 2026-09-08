@@ -24,7 +24,12 @@ type PlanItem struct {
 // buildPlan sizes every candidate entry in parallel and runs the guards.
 // Entries marked never are included so the report shows them, but refused.
 func buildPlan(cfg *Config, env Env, types []string, now time.Time) []PlanItem {
-	ents := cfg.entries(types)
+	return buildPlanTagged(cfg, env, types, "", now)
+}
+
+// buildPlanTagged is buildPlan narrowed to entries carrying tag ("" = all).
+func buildPlanTagged(cfg *Config, env Env, types []string, tag string, now time.Time) []PlanItem {
+	ents := cfg.entriesTagged(types, tag)
 	items := make([]PlanItem, len(ents))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)

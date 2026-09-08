@@ -375,6 +375,9 @@ func doAdd(env Env, o *opts, out, errw io.Writer) int {
 	if o.addUseCase != "" {
 		entry["use_case"] = o.addUseCase
 	}
+	if tags := splitTags(o.addTags); len(tags) > 0 {
+		entry["tags"] = tags
+	}
 	err = rewriteConfig(path, env.Home, func(doc map[string]any) error {
 		arr, _ := doc[list].([]any)
 		for _, x := range arr {

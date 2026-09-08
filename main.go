@@ -42,6 +42,10 @@ type opts struct {
 	// filters shared by --scan, --audit, --by-type, --dupes
 	olderThan, newerThan, sortBy, ext, tag, addTags, byType string
 	top                                                     int
+
+	// --scan-builds
+	scanBuilds string
+	depth      int
 }
 
 type cmdRunner func(name string, args ...string) error
@@ -131,6 +135,8 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.StringVar(&o.byType, "by-type", "", "size every regular file under DIR by type (disk image, archive, video, log, ...)")
 	fs.StringVar(&o.tag, "tag", "", "only entries carrying TAG (--check/--known/--cleanup: entry tags; --audit: automatic tags like stale-1y, build-output, repo)")
 	fs.StringVar(&o.addTags, "tags", "", "comma-separated tags for --add")
+	fs.StringVar(&o.scanBuilds, "scan-builds", "", "size every git repo under DIR as source, .git and build output; suggest --add lines for build dirs of clean repos idle --older-than (default 30d)")
+	fs.IntVar(&o.depth, "depth", 0, "with --scan-builds: how many levels down to look for repos (default 4)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -153,7 +159,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != ""} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != ""} {
 		if m {
 			modes++
 		}
@@ -272,6 +278,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.byType != "" {
 		worst(doByType(cfg, env, o, now, stdout, stderr))
+	}
+	if o.scanBuilds != "" {
+		worst(doScanBuilds(cfg, env, o, now, stdout, stderr))
 	}
 	if o.restore != "" {
 		worst(doRestore(cfg, o, stdout, stderr))

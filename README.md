@@ -203,6 +203,23 @@ to one with `--tag`. An audit row carries tags oos can prove from disk:
 `--audit --tag stale-1y` is the one-line answer to "what have I not
 touched in a year".
 
+## Build output inside repos
+
+`--scan-builds DIR` finds every git repository under DIR (to `--depth`,
+default 4) and sizes each as source, `.git` and build output: `target`
+beside a `Cargo.toml`, `node_modules` beside a `package.json`, `.next`,
+`dist`, `build`, a `.venv` with a `pyvenv.cfg` inside, `.terraform`,
+`.gradle`, Pods, `bin`/`obj` beside a `.csproj`, and the rest of the
+fingerprint list in `repos.go`. A directory only counts as build output
+when its fingerprint is there; a `target` with no `Cargo.toml` is source.
+Nested repositories are listed and scanned on their own, not folded into
+the parent. Each repo shows its last commit, newest source change and
+whether git calls it clean. For a clean repo idle for `--older-than`
+(default 30d, no commit and no source change) the build directories come
+out as ready-to-paste `--add ... --action rm-contents` lines, tagged
+`build-output` and `repo:<name>`; a dirty or active repo keeps its bytes
+and the line says why. Nothing is added or removed by the scan itself.
+
 ## Docker
 
 The daemon's data root is one opaque directory to a file walk, and on

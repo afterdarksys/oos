@@ -6,6 +6,7 @@
 - Filters shared by `--scan`, `--audit` and `--by-type`: `--older-than` / `--newer-than AGE` (`36h`, `90d`, `2w`, `6mo`, `1y`, bare days), `--ext LIST` (compound extensions and rotated logs understood), `--sort size|oldest|newest|name`, `--top N`.
 - `--by-type DIR`: every regular file bucketed by category with the largest files in each; extension first, magic bytes for anything over 1 MB without one.
 - Tags: `tags` on entries (`--add --tags`), `--tag` narrows `--check`, `--known`, `--cleanup` and `--audit`; audit rows carry automatic tags (`stale-30d/90d/180d/1y`, `big`, `huge`, `hidden`, `build-output`, `repo`) plus their status and entry tags.
+- `--scan-builds DIR`: every git repo under DIR sized as source, `.git` and build output by fingerprint (`target`+Cargo.toml, `node_modules`+package.json, `.next`, `dist`, venvs, `.terraform`, Gradle, Pods, .NET and more), with last commit, newest source change and git's clean/dirty word. Build dirs of clean repos idle for `--older-than` (default 30d) are emitted as `--add --action rm-contents` lines tagged `build-output,repo:<name>`; anything else says why it is kept. `--depth` bounds the search; nested repos are scanned on their own.
 
 ## [0.5.0] - 2026-09-08
 

@@ -44,6 +44,12 @@ oos -S ~/Downloads --ext dmg,iso --older-than 90d --sort oldest --top 10
 oos -A --tag stale-1y                             # only entries untouched for a year
 oos --add ~/x --type cache --action rm-contents --tags build-output,review
 oos -C -t cache --tag build-output                # cleanup plan narrowed by tag
+oos --scan-builds ~/development                   # build output per repo, guarded --add lines
+oos --dupes ~/Downloads -m 200                    # identical files over 200 MB, newest copy marked
+oos --downloads                                   # installed installers, extracted archives, copies, stale
+oos --history 12                                  # readings, trend and the forecast
+oos --fleet                                       # every host in policy.fleet in one table
+oos --install-daemon && oos --status              # resident watcher; ask it any time
 ```
 
 ## In scripts and for agents

@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1] - 2026-09-08
+
+### Fixed
+- 0.4.0 was tagged with a failing size-cache test: the load-time prune ran before the test lowered the floor. The floor is now a parameter of the cache constructor. No behaviour change for users.
+
 ## [0.4.0] - 2026-09-08
 
 ### Added

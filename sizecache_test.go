@@ -12,8 +12,7 @@ func TestSizeCacheHitsInvalidatesAndExpires(t *testing.T) {
 	dir := filepath.Join(home, "d")
 	write(t, filepath.Join(dir, "sub", "a"), 65536)
 	write(t, filepath.Join(dir, "b"), 65536)
-	c := openSizeCache(filepath.Join(home, "sizes.json"), time.Hour)
-	c.minBytes = 0 // test trees are tiny
+	c := openSizeCacheWith(filepath.Join(home, "sizes.json"), time.Hour, 0) // test trees are tiny
 	now := time.Now()
 	fi, _ := os.Lstat(dir)
 	dev, have := deviceOf(fi)
@@ -52,8 +51,7 @@ func TestSizeCacheHitsInvalidatesAndExpires(t *testing.T) {
 	if err := c.save(); err != nil {
 		t.Fatal(err)
 	}
-	c2 := openSizeCache(filepath.Join(home, "sizes.json"), time.Hour)
-	c2.minBytes = 0
+	c2 := openSizeCacheWith(filepath.Join(home, "sizes.json"), time.Hour, 0)
 	if b, ok := c2.get(dir, mustLstat(t, dir).ModTime(), now.Add(4*time.Minute)); !ok || b != n3 {
 		t.Errorf("reloaded cache should serve the root: ok=%v b=%d want %d", ok, b, n3)
 	}
@@ -83,8 +81,7 @@ func TestPathSizeCachedMatchesWalk(t *testing.T) {
 	}
 	walk, _ := pathSizeWalk(dir)
 	old := cache
-	cache = openSizeCache(filepath.Join(home, "sizes.json"), time.Hour)
-	cache.minBytes = 0
+	cache = openSizeCacheWith(filepath.Join(home, "sizes.json"), time.Hour, 0)
 	defer func() { cache = old }()
 	cached, _ := pathSize(dir)
 	if cached != walk {

@@ -45,7 +45,12 @@ var cache = &sizeCache{}
 
 // openSizeCache loads the cache file; a missing or corrupt file starts empty.
 func openSizeCache(path string, ttl time.Duration) *sizeCache {
-	c := &sizeCache{path: path, ttl: ttl, entries: map[string]cacheEnt{}, enabled: path != "", minBytes: cacheMinBytes}
+	return openSizeCacheWith(path, ttl, cacheMinBytes)
+}
+
+// openSizeCacheWith is openSizeCache with an explicit storage floor; tests use 0.
+func openSizeCacheWith(path string, ttl time.Duration, minBytes int64) *sizeCache {
+	c := &sizeCache{path: path, ttl: ttl, entries: map[string]cacheEnt{}, enabled: path != "", minBytes: minBytes}
 	if !c.enabled {
 		return c
 	}

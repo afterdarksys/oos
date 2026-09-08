@@ -12,6 +12,7 @@
 
 ### Fixed
 - `deploy.sh` ended each host with `oos -F`, whose exit code is the disk status; under `set -e` a host in warn or critical made a successful deploy report failure. Status lines no longer abort the script.
+- `--install-agent --system` printed the user-unit paths although it wrote the root units in `/etc/systemd/system`; seen on the first live deploy (relay-b).
 - The probe's last `command -v` returned nonzero when `notify-send` was absent, which made the whole probe fail.
 
 ## [0.4.1] - 2026-09-08

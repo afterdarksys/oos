@@ -11,6 +11,9 @@ import (
 
 const agentLabel = "com.afterdarksys.oos"
 
+// agentSystemFiles: --system is a Linux idea; launchd agents are per user.
+func agentSystemFiles(exe string) map[string]string { return nil }
+
 // agentFiles returns the launchd plist that runs an hourly agent tick.
 func agentFiles(home, exe string) map[string]string {
 	plist := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")

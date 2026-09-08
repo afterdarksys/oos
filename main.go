@@ -313,7 +313,11 @@ func doAgent(env Env, o *opts, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "oos:", err)
 		return exitUsage
 	}
-	for p := range agentFiles(env.Home, exe) {
+	files := agentFiles(env.Home, exe)
+	if o.system {
+		files = agentSystemFiles(exe)
+	}
+	for p := range files {
 		fmt.Fprintf(stdout, "wrote %s\n", p)
 	}
 	fmt.Fprintf(stdout, "hourly agent installed: %s --agent-tick\n", exe)

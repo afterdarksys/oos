@@ -13,6 +13,11 @@ func agentFiles(home, exe string) map[string]string {
 	return agentUnits(filepath.Join(home, ".config", "systemd", "user"), exe, false)
 }
 
+// agentSystemFiles returns the root units --install-agent --system writes.
+func agentSystemFiles(exe string) map[string]string {
+	return agentUnits("/etc/systemd/system", exe, true)
+}
+
 // agentUnits renders the service and timer into dir. System units run as
 // root and carry a hardening block; user units rely on the user's own scope.
 func agentUnits(dir, exe string, system bool) map[string]string {

@@ -1,0 +1,10 @@
+# vpscfgfarm per-directory map — routes this repo to its contract and
+# leashes what the doors will run from here. See vpscfgfarm/docs/MAPFILE.md.
+version: 1
+service: oos
+deploy:
+  entry: ./deploy/deploy.sh
+  host: apps.afterdarksys.com
+constraints:
+  forbid_flags: ["--force", "--break-glass"]
+  forbid_break_glass: true

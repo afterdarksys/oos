@@ -31,7 +31,47 @@
     "scan_top_n": 50,
     "quarantine": true,
     "quarantine_dir": "~/.local/state/oos/quarantine",
-    "quarantine_days": 7
+    "quarantine_days": 7,
+    "owners": [
+      {
+        "match": "~/development/**/target",
+        "use_case": "Rust build output"
+      },
+      {
+        "match": "~/development/**/node_modules",
+        "use_case": "npm dependencies"
+      },
+      {
+        "match": "~/development",
+        "use_case": "source trees"
+      },
+      {
+        "match": "~/.cache/uv",
+        "use_case": "uv / MCP servers"
+      },
+      {
+        "match": "/var/lib/docker",
+        "use_case": "Docker"
+      },
+      {
+        "match": "~/go",
+        "use_case": "Go modules and tools"
+      },
+      {
+        "match": "~/.npm",
+        "use_case": "npm cache"
+      },
+      {
+        "match": "~/.cargo",
+        "use_case": "Cargo registry"
+      },
+      {
+        "match": "~/Downloads",
+        "use_case": "downloads, unreviewed"
+      }
+    ],
+    "agent_purge_expired": true,
+    "alert_drop_gb": 5
   },
   "known_dirs": [
     {

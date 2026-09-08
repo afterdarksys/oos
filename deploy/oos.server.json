@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "volume": "/",
+  "policy": {
+    "min_free_gb": 5,
+    "warn_free_gb": 15,
+    "require_yes": true,
+    "max_delete_gb_per_run": 50,
+    "allow_outside_home": true,
+    "allow_commands": true,
+    "never_touch": [
+      "/",
+      "/etc",
+      "/usr",
+      "/boot",
+      "/opt",
+      "/home",
+      "/srv",
+      "/var/lib/docker/volumes",
+      "/var/lib/postgresql",
+      "/var/lib/mysql",
+      "/var/mail",
+      "/var/spool",
+      "/root/.ssh",
+      "/root/letsgoout"
+    ],
+    "min_path_depth": 3,
+    "log_file": "/root/.local/state/oos/oos.log",
+    "state_file": "/root/.local/state/oos/bigfile.json",
+    "big_file_min_mb": 200,
+    "scan_top_n": 50,
+    "quarantine": true,
+    "quarantine_dir": "/root/.local/state/oos/quarantine",
+    "quarantine_days": 3,
+    "owners": [
+      {"match": "/var/lib/docker", "use_case": "Docker"},
+      {"match": "/var/lib/docker/volumes", "use_case": "Docker volumes (data)"},
+      {"match": "/var/log", "use_case": "logs"},
+      {"match": "/opt", "use_case": "service deployments"},
+      {"match": "/var/cache/apt", "use_case": "apt cache"},
+      {"match": "/root/.cache", "use_case": "root caches"}
+    ],
+    "agent_purge_expired": true,
+    "alert_drop_gb": 5
+  },
+  "known_dirs": [
+    {
+      "path": "/var/lib/docker",
+      "type": "vm",
+      "action": "command",
+      "command": "docker builder prune -f",
+      "use_case": "Docker",
+      "note": "Build cache only. NEVER docker system prune or volume prune here: on apps.afterdarksys.com 36 'unused' volumes are live data with one-character name differences."
+    },
+    {
+      "path": "/var/log/journal",
+      "type": "log",
+      "action": "command",
+      "command": "journalctl --vacuum-size=500M",
+      "use_case": "logs",
+      "note": "systemd journal; vacuum keeps the newest 500 MB"
+    },
+    {
+      "path": "/var/cache/apt",
+      "type": "cache",
+      "action": "command",
+      "command": "apt-get clean",
+      "use_case": "apt cache",
+      "note": "package archives, re-downloadable"
+    },
+    {
+      "path": "/root/.cache/pip",
+      "type": "cache",
+      "action": "rm-contents",
+      "use_case": "root caches",
+      "note": "pip download cache"
+    },
+    {
+      "path": "/root/.npm/_cacache",
+      "type": "cache",
+      "action": "command",
+      "command": "npm cache clean --force",
+      "use_case": "root caches",
+      "note": "npm content cache"
+    },
+    {
+      "path": "/var/log",
+      "type": "log",
+      "action": "never",
+      "use_case": "logs",
+      "note": "logrotate's job; review by hand"
+    },
+    {
+      "path": "/tmp",
+      "type": "scratch",
+      "action": "never",
+      "note": "tmpfs or systemd-tmpfiles handles it"
+    },
+    {
+      "path": "/var/tmp",
+      "type": "scratch",
+      "action": "never",
+      "note": "review by hand"
+    },
+    {
+      "path": "/opt",
+      "type": "data",
+      "action": "never",
+      "use_case": "service deployments",
+      "note": "every service's deployment directory; never automated"
+    }
+  ],
+  "known_files": []
+}

@@ -372,6 +372,9 @@ func doAdd(env Env, o *opts, out, errw io.Writer) int {
 	if o.addStale > 0 {
 		entry["stale_after_hours"] = o.addStale
 	}
+	if o.addUseCase != "" {
+		entry["use_case"] = o.addUseCase
+	}
 	err = rewriteConfig(path, env.Home, func(doc map[string]any) error {
 		arr, _ := doc[list].([]any)
 		for _, x := range arr {

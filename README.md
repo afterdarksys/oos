@@ -33,8 +33,9 @@ oos --purge -y            # permanently delete batches older than quarantine_day
 oos --purge-now -y        # permanently delete every batch (the emergency lever)
 oos --install-agent       # hourly quick check with a desktop notification under warn
 oos -i                    # write the platform default config to ~/.config/oos/oos.json
-oos -A                    # audit ~ one level deep: size, age, known/unknown, hints
-oos -A ~/Library -v       # audit somewhere else, show every hint
+oos -A                    # audit ~ one level deep: size, age, use case, known/unknown, hints
+oos --audit ~/Library -v  # audit somewhere else, show every hint
+oos --who ~/.cache/uv     # what is this for, which repo, which processes, newest file
 ```
 
 ## In scripts and for agents
@@ -52,6 +53,8 @@ oos --forget ~/.cache/foo
 oos -C -j | jq '.plan[] | select(.refused == null) | .path'
 oos --log-tail 20                      # what did the last run actually do
 oos -d -j | jq '.rows[0]'              # biggest grower since last time
+oos --who ~/x -j | jq .use_case        # attribution for a path
+oos -A -j | jq '.by_use_case'          # home directory grouped by what the bytes are for
 ```
 
 `--ensure GB` is the pre-flight lever: it purges expired quarantine batches,
@@ -70,7 +73,7 @@ Long forms: `--check --known --cleanup --diff --show --scan DIR --audit DIR
 --min-mb N --version --purge --purge-now --restore BATCH --install-agent
 --uninstall-agent --quiet --free --ensure GB --why PATH --warn GB --critical GB
 --add PATH --type T --action A --command C --note N --stale-hours H
---forget PATH --log-tail N`.
+--use-case U --forget PATH --log-tail N --who PATH --agent-tick --system`.
 
 Exit codes: 0 ok, 1 free space below warn, 2 below critical or a refusal, 3
 usage or config error.
@@ -90,6 +93,7 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `action` | `never`, `rm-contents` (dirs, keeps the dir), `rm-stale-children` (dirs, see below), `rm` (files), `command` |
 | `command` | shell command for `action: command` |
 | `stale_after_hours` | for `rm-stale-children`: children modified more recently are kept |
+| `use_case` | what the bytes are for; grouped in `--check`, `--audit` and shown by `--who` |
 | `guard_processes` | substrings; if any running process matches, the whole entry is refused |
 | `note` | why it is here and what to know |
 
@@ -108,6 +112,9 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `state_file` | `bigfile.json` |
 | `big_file_min_mb`, `scan_top_n` | `--scan` defaults |
 | `quarantine`, `quarantine_dir`, `quarantine_days` | move instead of delete; expiry for `--purge` |
+| `owners` | list of `{match, use_case, note}`; `match` is a path (covers everything under it) or a glob tried against a path and each ancestor |
+| `agent_purge_expired` | the hourly tick releases quarantine batches older than `quarantine_days` |
+| `alert_drop_gb` | the tick notifies when free space fell by this much since the previous tick (default 10) |
 
 ## rm-stale-children
 
@@ -147,6 +154,19 @@ repository that belongs in `never_touch`, nothing modified in six months, a
 hidden directory over 1 GB. It is a report for the person editing
 `oos.json`; it never acts. Results land in `bigfile.json`.
 
+## Use cases
+
+Paths say where bytes sit; use cases say what they are for. Three sources,
+first match wins: the entry's own `use_case`, an `owners` pattern from the
+policy, then automatic attribution from what is on disk: a `Cargo.toml`
+beside a `target` dir, a `package.json` beside `node_modules`, a
+`pyvenv.cfg`, `DerivedData`, `.terraform`, a `.git`, and the enclosing git
+repository's name. `--check`, `--audit` and their JSON forms group totals by
+use case, with `unattributed` shown rather than hidden. `--who PATH` prints
+the attribution plus every running process whose command line or working
+directory references the path and the newest file under it: the answer to
+"who is filling this up right now".
+
 ## Diff and agent
 
 `--diff` sizes the known entries and prints growth against the sizes
@@ -156,8 +176,23 @@ the cue to `--scan` a suspect root.
 
 `--install-agent` writes a launchd agent (macOS, `~/Library/LaunchAgents`) or
 a systemd user timer (Linux, `~/.config/systemd/user`) that runs
-`oos --check --quick --notify` hourly. Under warn it posts a desktop
-notification through `osascript` or `notify-send`.
+`oos --agent-tick` hourly. `--install-agent --system` on Linux writes root
+units into `/etc/systemd/system` with a `ProtectSystem=strict` block. A tick
+is one `statfs` and one state write: it notifies (`osascript` or
+`notify-send`) when free space is under the warn line or fell by more than
+`alert_drop_gb` since the previous tick within three hours, and with
+`agent_purge_expired` it releases quarantine batches past their expiry.
+
+## Fleet
+
+`deploy/deploy.sh [--yes] host...` builds linux/amd64, ships the binary,
+seeds `~/.config/oos/oos.json` from `deploy/oos.server.json` only when the
+host has none (a differing config is left beside it as `oos.json.new`),
+installs the system timer and runs a quick check. Dry-run without `--yes`,
+and `--force` does not exist. The server config never touches `/opt`,
+`/var/lib/docker/volumes`, database directories or `/var/log`; Docker is
+limited to `docker builder prune`. `.vpscfgfarm.map` routes the repo to
+that script.
 
 ## Guards, in order
 

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +11,7 @@ import (
 
 const agentLabel = "com.afterdarksys.oos"
 
-// agentFiles returns the launchd plist that runs an hourly quick check.
+// agentFiles returns the launchd plist that runs an hourly agent tick.
 func agentFiles(home, exe string) map[string]string {
 	plist := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
 	logDir := filepath.Join(home, ".local", "state", "oos")
@@ -22,9 +23,7 @@ func agentFiles(home, exe string) map[string]string {
   <key>ProgramArguments</key>
   <array>
     <string>%s</string>
-    <string>--check</string>
-    <string>--quick</string>
-    <string>--notify</string>
+    <string>--agent-tick</string>
   </array>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
@@ -36,7 +35,10 @@ func agentFiles(home, exe string) map[string]string {
 	return map[string]string{plist: content}
 }
 
-func agentInstall(home, exe string, run cmdRunner) error {
+func agentInstall(home, exe string, system bool, run cmdRunner) error {
+	if system {
+		return errors.New("--system is for Linux servers; on macOS the per-user LaunchAgent is the supported form")
+	}
 	files := agentFiles(home, exe)
 	if err := os.MkdirAll(filepath.Join(home, ".local", "state", "oos"), 0o755); err != nil {
 		return err
@@ -56,7 +58,7 @@ func agentInstall(home, exe string, run cmdRunner) error {
 	return run("launchctl", "bootstrap", domain, plist)
 }
 
-func agentUninstall(home string, run cmdRunner) error {
+func agentUninstall(home string, system bool, run cmdRunner) error {
 	plist := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
 	_ = run("launchctl", "bootout", domain, plist)

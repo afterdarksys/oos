@@ -8,16 +8,30 @@ import (
 	"path/filepath"
 )
 
-// agentFiles returns a systemd user service and timer for an hourly quick check.
+// agentFiles returns a systemd user service and timer for an hourly tick.
 func agentFiles(home, exe string) map[string]string {
-	dir := filepath.Join(home, ".config", "systemd", "user")
+	return agentUnits(filepath.Join(home, ".config", "systemd", "user"), exe, false)
+}
+
+// agentUnits renders the service and timer into dir. System units run as
+// root and carry a hardening block; user units rely on the user's own scope.
+func agentUnits(dir, exe string, system bool) map[string]string {
+	hardening := ""
+	if system {
+		hardening = `User=root
+ProtectSystem=strict
+ReadWritePaths=/root /var /tmp /home
+PrivateTmp=no
+NoNewPrivileges=yes
+`
+	}
 	service := fmt.Sprintf(`[Unit]
 Description=oos disk headroom check
 
 [Service]
 Type=oneshot
-ExecStart=%s --check --quick --notify
-`, exe)
+ExecStart=%s --agent-tick
+%s`, exe, hardening)
 	timer := `[Unit]
 Description=oos hourly disk headroom check
 
@@ -35,8 +49,19 @@ WantedBy=timers.target
 	}
 }
 
-func agentInstall(home, exe string, run cmdRunner) error {
-	for p, c := range agentFiles(home, exe) {
+func systemctlArgs(system bool, args ...string) []string {
+	if system {
+		return args
+	}
+	return append([]string{"--user"}, args...)
+}
+
+func agentInstall(home, exe string, system bool, run cmdRunner) error {
+	dir := filepath.Join(home, ".config", "systemd", "user")
+	if system {
+		dir = "/etc/systemd/system"
+	}
+	for p, c := range agentUnits(dir, exe, system) {
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return err
 		}
@@ -44,18 +69,22 @@ func agentInstall(home, exe string, run cmdRunner) error {
 			return err
 		}
 	}
-	if err := run("systemctl", "--user", "daemon-reload"); err != nil {
+	if err := run("systemctl", systemctlArgs(system, "daemon-reload")...); err != nil {
 		return err
 	}
-	return run("systemctl", "--user", "enable", "--now", "oos.timer")
+	return run("systemctl", systemctlArgs(system, "enable", "--now", "oos.timer")...)
 }
 
-func agentUninstall(home string, run cmdRunner) error {
-	_ = run("systemctl", "--user", "disable", "--now", "oos.timer")
-	for p := range agentFiles(home, "oos") {
+func agentUninstall(home string, system bool, run cmdRunner) error {
+	dir := filepath.Join(home, ".config", "systemd", "user")
+	if system {
+		dir = "/etc/systemd/system"
+	}
+	_ = run("systemctl", systemctlArgs(system, "disable", "--now", "oos.timer")...)
+	for p := range agentUnits(dir, "oos", system) {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
-	return run("systemctl", "--user", "daemon-reload")
+	return run("systemctl", systemctlArgs(system, "daemon-reload")...)
 }

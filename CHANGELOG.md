@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.0] - 2026-09-08
+
+### Added
+- Use-case attribution: `use_case` on entries, `policy.owners` path and glob patterns, and automatic attribution from on-disk fingerprints (Cargo.toml, package.json, pyvenv.cfg, DerivedData, .terraform, .git, enclosing repo). `--check` and `--audit` group totals by use case; `--add --use-case`.
+- `--who PATH`: attribution, referencing processes (command line and cwd), and the newest file under the path.
+- `--agent-tick`: the hourly job is now one cheap tick that notifies under warn or on a free-space drop of `alert_drop_gb` since the previous tick, and purges expired quarantine batches when `agent_purge_expired` is set. Agent files call it.
+- `--install-agent --system` on Linux: root units in `/etc/systemd/system` with a hardening block.
+- Fleet: `deploy/deploy.sh` (dry-run by default, no `--force`), `deploy/oos.server.json` for Linux servers, `.vpscfgfarm.map`.
+
+
 ## [0.2.0] - 2026-09-08
 
 ### Added

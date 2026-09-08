@@ -60,6 +60,14 @@ type Policy struct {
 	Quarantine     bool   `json:"quarantine"`
 	QuarantineDir  string `json:"quarantine_dir"`
 	QuarantineDays int    `json:"quarantine_days"`
+
+	// Owners map path patterns to use-case labels for reports and --who.
+	Owners []Owner `json:"owners,omitempty"`
+
+	// Agent behaviour: purge expired quarantine batches on each tick, and
+	// alert when free space drops by more than AlertDropGB between ticks.
+	AgentPurgeExpired bool    `json:"agent_purge_expired"`
+	AlertDropGB       float64 `json:"alert_drop_gb,omitempty"`
 }
 
 // Entry is one known large directory or file.
@@ -70,6 +78,10 @@ type Entry struct {
 	Command        string   `json:"command,omitempty"`
 	GuardProcesses []string `json:"guard_processes,omitempty"`
 	Note           string   `json:"note,omitempty"`
+
+	// UseCase says what the bytes are for; shown in reports and grouped in
+	// summaries. Falls back to policy.owners and automatic attribution.
+	UseCase string `json:"use_case,omitempty"`
 
 	// StaleAfterHours applies to rm-stale-children: a child modified more
 	// recently than this is kept regardless of references.
@@ -167,6 +179,9 @@ func (c *Config) expand(home string) {
 	for i := range c.Policy.NeverTouch {
 		c.Policy.NeverTouch[i] = expandHome(c.Policy.NeverTouch[i], home)
 	}
+	for i := range c.Policy.Owners {
+		c.Policy.Owners[i].Match = expandHome(c.Policy.Owners[i].Match, home)
+	}
 	for i := range c.KnownDirs {
 		c.KnownDirs[i].Path = expandHome(c.KnownDirs[i].Path, home)
 		c.KnownDirs[i].IsFile = false
@@ -215,6 +230,17 @@ func (c *Config) validate() error {
 	for _, nt := range p.NeverTouch {
 		if !filepath.IsAbs(nt) {
 			add("policy.never_touch entry %q must be absolute after ~ expansion", nt)
+		}
+	}
+	for i, o := range p.Owners {
+		if !filepath.IsAbs(o.Match) {
+			add("policy.owners[%d].match %q must be absolute after ~ expansion", i, o.Match)
+		}
+		if _, err := globRegexp(o.Match); err != nil {
+			add("policy.owners[%d].match %q is not a valid pattern: %v", i, o.Match, err)
+		}
+		if strings.TrimSpace(o.UseCase) == "" {
+			add("policy.owners[%d] (%s) has no use_case", i, o.Match)
 		}
 	}
 	if p.Quarantine {

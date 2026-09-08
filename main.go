@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 const (
 	exitOK       = 0
@@ -32,11 +32,11 @@ type opts struct {
 	minMB                                                               int64
 
 	// script-facing
-	quiet, free, auditHome               bool
-	ensure, warnGB, critGB               float64
-	why, add, forget, addType, addAction string
-	addCommand, addNote                  string
-	addStale, logTail                    int
+	quiet, free, auditHome, agentTick, system bool
+	ensure, warnGB, critGB                    float64
+	why, add, forget, addType, addAction      string
+	addCommand, addNote, addUseCase, who      string
+	addStale, logTail                         int
 }
 
 type cmdRunner func(name string, args ...string) error
@@ -111,13 +111,18 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.IntVar(&o.addStale, "stale-hours", 0, "stale_after_hours for --add --action rm-stale-children")
 	fs.StringVar(&o.forget, "forget", "", "remove PATH from the config file")
 	fs.IntVar(&o.logTail, "log-tail", 0, "print the last N audit log lines")
+	fs.StringVar(&o.who, "who", "", "what PATH is for and who is using it: use case, repo, fingerprint, referencing processes, newest file")
+	fs.StringVar(&o.addUseCase, "use-case", "", "use_case label for --add")
+	fs.BoolVar(&o.agentTick, "agent-tick", false, "one scheduled tick: quick check, growth alert, expired-quarantine purge, notification")
+	fs.BoolVar(&o.system, "system", false, "with --install-agent/--uninstall-agent on Linux: system-wide units in /etc/systemd/system (root)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
 		fmt.Fprintln(stderr, "           [-j|--json] [-v|--verbose] [-i|--init] [-m|--min-mb N] [-V|--version]")
 		fmt.Fprintln(stderr, "           [--purge] [--purge-now] [--restore BATCH] [--install-agent] [--uninstall-agent]")
 		fmt.Fprintln(stderr, "           [-Q|--quiet] [-F|--free] [-E|--ensure GB] [-W|--why PATH] [--warn GB] [--critical GB]")
-		fmt.Fprintln(stderr, "           [--add PATH --type T --action A [--command C] [--note N] [--stale-hours H]] [--forget PATH] [--log-tail N]")
+		fmt.Fprintln(stderr, "           [--add PATH --type T --action A [--command C] [--note N] [--stale-hours H] [--use-case U]] [--forget PATH] [--log-tail N]")
+		fmt.Fprintln(stderr, "           [--who PATH] [--agent-tick] [--install-agent [--system]]")
 		fmt.Fprintln(stderr)
 		fs.PrintDefaults()
 	}
@@ -132,7 +137,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.ver} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.ver} {
 		if m {
 			modes++
 		}
@@ -199,8 +204,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if o.show {
 		worst(doShow(cfg, src, o, stdout))
 	}
+	if o.agentTick {
+		return doAgentTick(cfg, o, now, stdout, stderr)
+	}
 	if o.free {
 		worst(doFree(cfg, o, stdout, stderr))
+	}
+	if o.who != "" {
+		worst(doWho(cfg, env, o, now, stdout, stderr))
 	}
 	if o.why != "" {
 		worst(doWhy(cfg, env, o, stdout, stderr))
@@ -255,7 +266,7 @@ func doInit(env Env, stdout, stderr io.Writer) int {
 
 func doAgent(env Env, o *opts, stdout, stderr io.Writer) int {
 	if o.uninstallAgent {
-		if err := agentUninstall(env.Home, agentRun); err != nil {
+		if err := agentUninstall(env.Home, o.system, agentRun); err != nil {
 			fmt.Fprintln(stderr, "oos:", err)
 			return exitUsage
 		}
@@ -272,14 +283,14 @@ func doAgent(env Env, o *opts, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "oos: cannot resolve own path:", err)
 		return exitUsage
 	}
-	if err := agentInstall(env.Home, exe, agentRun); err != nil {
+	if err := agentInstall(env.Home, exe, o.system, agentRun); err != nil {
 		fmt.Fprintln(stderr, "oos:", err)
 		return exitUsage
 	}
 	for p := range agentFiles(env.Home, exe) {
 		fmt.Fprintf(stdout, "wrote %s\n", p)
 	}
-	fmt.Fprintf(stdout, "hourly check installed: %s --check --quick --notify\n", exe)
+	fmt.Fprintf(stdout, "hourly agent installed: %s --agent-tick\n", exe)
 	return exitOK
 }
 
@@ -408,7 +419,7 @@ func doCheck(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 	if o.jsonOut {
 		_ = json.NewEncoder(out).Encode(map[string]any{
 			"volume": cfg.Volume, "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
-			"status": label, "quarantine_bytes": qBytes, "known": planJSON(items),
+			"status": label, "quarantine_bytes": qBytes, "known": planJSON(items), "by_use_case": checkUseCases(cfg, items),
 		})
 		return code
 	}
@@ -442,6 +453,12 @@ func doCheck(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 		}
 	}
 	fmt.Fprintf(out, "  * reclaimable by --cleanup --yes now: %s   c = via command\n", human(reclaimable))
+	paths := make([]string, len(items))
+	sizes := make([]int64, len(items))
+	for i, it := range items {
+		paths[i], sizes[i] = it.Path, it.Bytes
+	}
+	printUseCaseTotals(out, groupByUseCase(cfg, paths, sizes))
 	return code
 }
 
@@ -673,4 +690,13 @@ func splitTypes(s string) []string {
 		return nil
 	}
 	return strings.Split(s, ",")
+}
+
+func checkUseCases(cfg *Config, items []PlanItem) []useCaseTotal {
+	paths := make([]string, len(items))
+	sizes := make([]int64, len(items))
+	for i, it := range items {
+		paths[i], sizes[i] = it.Path, it.Bytes
+	}
+	return groupByUseCase(cfg, paths, sizes)
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -23,12 +24,28 @@ func realEnv() (Env, error) {
 	return Env{Home: filepath.Clean(home), Procs: listProcesses, Cwds: listProcessCwds}, nil
 }
 
+// listProcesses returns every other process's command line. Our own is dropped:
+// an oos invocation names the paths it is judging, and must never count as
+// a process that uses them.
 func listProcesses() ([]string, error) {
-	out, err := exec.Command("ps", "-axo", "command=").Output()
+	out, err := exec.Command("ps", "-axo", "pid=,command=").Output()
 	if err != nil {
 		return nil, err
 	}
-	return strings.Split(strings.TrimSpace(string(out)), "\n"), nil
+	self := strconv.Itoa(os.Getpid())
+	var procs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		pid, cmd, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		if pid == self {
+			continue
+		}
+		procs = append(procs, strings.TrimSpace(cmd))
+	}
+	return procs, nil
 }
 
 // isUnder reports whether p equals base or lives inside it. A base of "/"

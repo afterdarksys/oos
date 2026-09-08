@@ -32,7 +32,145 @@
     "scan_top_n": 50,
     "quarantine": true,
     "quarantine_dir": "~/.local/state/oos/quarantine",
-    "quarantine_days": 7
+    "quarantine_days": 7,
+    "owners": [
+      {
+        "match": "~/development/**/src-tauri/target",
+        "use_case": "Rust build output",
+        "note": "Tauri desktop apps; cargo clean by hand"
+      },
+      {
+        "match": "~/development/**/target",
+        "use_case": "Rust build output"
+      },
+      {
+        "match": "~/development/**/node_modules",
+        "use_case": "npm dependencies"
+      },
+      {
+        "match": "~/development/**/.next",
+        "use_case": "Next.js build output"
+      },
+      {
+        "match": "~/development",
+        "use_case": "source trees"
+      },
+      {
+        "match": "~/.cache/uv",
+        "use_case": "uv / MCP servers for Claude sessions",
+        "note": "code-review-graph, blender-mcp; regrows ~1 GB/h while sessions run"
+      },
+      {
+        "match": "~/Library/Containers/com.docker.docker",
+        "use_case": "Docker Desktop"
+      },
+      {
+        "match": "/Library/Developer/CoreSimulator",
+        "use_case": "Xcode simulators"
+      },
+      {
+        "match": "~/Library/Developer/Xcode",
+        "use_case": "Xcode build output"
+      },
+      {
+        "match": "~/Virtual Machines.localized",
+        "use_case": "VM images"
+      },
+      {
+        "match": "~/.codex",
+        "use_case": "Codex sessions"
+      },
+      {
+        "match": "~/.claude",
+        "use_case": "Claude Code"
+      },
+      {
+        "match": "~/tmp",
+        "use_case": "Claude Code scratchpads"
+      },
+      {
+        "match": "~/go",
+        "use_case": "Go modules and tools"
+      },
+      {
+        "match": "~/.npm",
+        "use_case": "npm cache"
+      },
+      {
+        "match": "~/Library/Caches/Homebrew",
+        "use_case": "Homebrew cache"
+      },
+      {
+        "match": "~/Downloads",
+        "use_case": "downloads, unreviewed"
+      },
+      {
+        "match": "~/.colima",
+        "use_case": "Colima VM (old Docker alternative)"
+      },
+      {
+        "match": "~/.minikube",
+        "use_case": "minikube VM"
+      },
+      {
+        "match": "~/.rustup",
+        "use_case": "Rust toolchains"
+      },
+      {
+        "match": "~/.cargo",
+        "use_case": "Cargo registry"
+      },
+      {
+        "match": "~/.nvm",
+        "use_case": "Node versions (nvm)"
+      },
+      {
+        "match": "~/.bun",
+        "use_case": "Bun runtime"
+      },
+      {
+        "match": "~/.pub-cache",
+        "use_case": "Dart/Flutter packages"
+      },
+      {
+        "match": "~/.terraform.d",
+        "use_case": "Terraform plugins"
+      },
+      {
+        "match": "~/.vscode",
+        "use_case": "VS Code extensions"
+      },
+      {
+        "match": "~/.cursor",
+        "use_case": "Cursor editor"
+      },
+      {
+        "match": "~/.windsurf",
+        "use_case": "Windsurf editor"
+      },
+      {
+        "match": "~/.antigravity",
+        "use_case": "Antigravity IDE"
+      },
+      {
+        "match": "~/.antigravity-ide",
+        "use_case": "Antigravity IDE"
+      },
+      {
+        "match": "~/.gemini",
+        "use_case": "Gemini CLI"
+      },
+      {
+        "match": "~/.agents",
+        "use_case": "agent skills"
+      },
+      {
+        "match": "~/kaggle-data",
+        "use_case": "Kaggle datasets"
+      }
+    ],
+    "agent_purge_expired": true,
+    "alert_drop_gb": 10
   },
   "known_dirs": [
     {
@@ -97,7 +235,10 @@
       "path": "~/Library/Developer/Xcode/DerivedData",
       "type": "build",
       "action": "rm-contents",
-      "guard_processes": ["Xcode.app/Contents/MacOS/Xcode", "xcodebuild"],
+      "guard_processes": [
+        "Xcode.app/Contents/MacOS/Xcode",
+        "xcodebuild"
+      ],
       "note": "Xcode build products, regenerates"
     },
     {

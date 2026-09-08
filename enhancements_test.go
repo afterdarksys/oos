@@ -340,7 +340,7 @@ func TestAgentFilesAndInstall(t *testing.T) {
 		ran = append(ran, append([]string{name}, args...))
 		return nil
 	}
-	if err := agentInstall(home, "/usr/local/bin/oos", run); err != nil {
+	if err := agentInstall(home, "/usr/local/bin/oos", false, run); err != nil {
 		t.Fatal(err)
 	}
 	for p, want := range files {
@@ -358,7 +358,7 @@ func TestAgentFilesAndInstall(t *testing.T) {
 	if len(ran) == 0 {
 		t.Error("install should invoke the service manager")
 	}
-	if err := agentUninstall(home, run); err != nil {
+	if err := agentUninstall(home, false, run); err != nil {
 		t.Fatal(err)
 	}
 	for p := range files {

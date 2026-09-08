@@ -20,7 +20,8 @@ type AuditRow struct {
 	ModTime    time.Time `json:"mtime"` // newest mtime found in the subtree, bounded by the walk
 	Hidden     bool      `json:"hidden"`
 	IsDir      bool      `json:"dir"`
-	Status     string    `json:"status"`     // known | protected | unknown | system
+	Status     string    `json:"status"` // known | protected | unknown | system
+	UseCase    string    `json:"use_case,omitempty"`
 	Suggestion string    `json:"suggestion"` // human hint, empty when there is nothing to say
 }
 
@@ -78,6 +79,7 @@ func auditOne(cfg *Config, p string, now time.Time) AuditRow {
 		r.ModTime = newestMtime(p, fi.ModTime())
 	}
 	r.Status, r.Suggestion = classify(cfg, p, r, now)
+	r.UseCase, _ = cfg.useCaseFor(p)
 	return r
 }
 
@@ -164,7 +166,12 @@ func doAudit(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 		_ = saveState(cfg.Policy.StateFile, st)
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "rows": rows})
+		paths := make([]string, len(rows))
+		sizes := make([]int64, len(rows))
+		for i, r := range rows {
+			paths[i], sizes[i] = r.Path, r.Bytes
+		}
+		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "rows": rows, "by_use_case": groupByUseCase(cfg, paths, sizes)})
 		return exitOK
 	}
 	var total, unknown int64
@@ -179,11 +186,21 @@ func doAudit(cfg *Config, env Env, o *opts, now time.Time, out, errw io.Writer) 
 	fmt.Fprintf(out, "audit of %s (entries >= %d MB, %d shown, %s):\n", root, minMB, len(rows), human(total))
 	for _, r := range rows {
 		age := int(now.Sub(r.ModTime).Hours() / 24)
-		fmt.Fprintf(out, "  %9s  %4dd  %-9s %s\n", human(r.Bytes), age, r.Status, r.Path)
+		uc := r.UseCase
+		if rs := []rune(uc); len(rs) > 26 {
+			uc = string(rs[:25]) + "…"
+		}
+		fmt.Fprintf(out, "  %9s  %4dd  %-9s %-26s %s\n", human(r.Bytes), age, r.Status, uc, r.Path)
 		if r.Suggestion != "" && (o.verbose || r.Status == "unknown" || r.Status == "system") {
 			fmt.Fprintf(out, "                    %s\n", r.Suggestion)
 		}
 	}
 	fmt.Fprintf(out, "  %d unknown entries hold %s; each is either a candidate for oos.json or something to leave alone on purpose\n", nUnknown, human(unknown))
+	paths := make([]string, len(rows))
+	sizes := make([]int64, len(rows))
+	for i, r := range rows {
+		paths[i], sizes[i] = r.Path, r.Bytes
+	}
+	printUseCaseTotals(out, groupByUseCase(cfg, paths, sizes))
 	return exitOK
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -58,6 +59,7 @@ func saveState(path string, s *State) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	sort.SliceStable(s.History, func(i, j int) bool { return s.History[i].At.Before(s.History[j].At) })
 	if len(s.History) > historyCap {
 		s.History = s.History[len(s.History)-historyCap:]
 	}

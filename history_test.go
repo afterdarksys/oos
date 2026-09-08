@@ -16,8 +16,8 @@ func TestHistoryTrend(t *testing.T) {
 	now := time.Now()
 	st.History = []HistoryPoint{
 		{At: now.Add(-48 * time.Hour), FreeGB: 100, Event: "agent"},
+		{At: now, FreeGB: 80, Event: "check"}, // out of order on purpose: a long run records its start time when it ends
 		{At: now.Add(-24 * time.Hour), FreeGB: 90, Event: "agent"},
-		{At: now, FreeGB: 80, Event: "check"},
 	}
 	if err := saveState(p.StateFile, st); err != nil {
 		t.Fatal(err)

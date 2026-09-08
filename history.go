@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 )
 
@@ -16,6 +17,7 @@ func doHistory(cfg *Config, o *opts, out io.Writer) int {
 		return exitOK
 	}
 	h := st.History
+	sort.SliceStable(h, func(i, j int) bool { return h[i].At.Before(h[j].At) })
 	if len(h) > o.history {
 		h = h[len(h)-o.history:]
 	}

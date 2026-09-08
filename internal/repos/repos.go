@@ -156,7 +156,7 @@ func BuildDirKind(parent, name string) (kind, fingerprint string) {
 	return "", ""
 }
 
-// findRepos lists every git repository under root up to depth levels down,
+// Find lists every git repository under root up to depth levels down,
 // skipping build output and other repos' insides only after recording them.
 func Find(root string, depth int) ([]string, error) {
 	info, err := os.Lstat(root)
@@ -207,7 +207,7 @@ func Find(root string, depth int) ([]string, error) {
 	return repos, err
 }
 
-// scanRepo sizes one repository. Nested repositories and build directories
+// Scan sizes one repository. Nested repositories and build directories
 // are not descended: the former are listed and scanned on their own, the
 // latter sized through the cache.
 func Scan(path string) Row {
@@ -279,7 +279,7 @@ func Scan(path string) Row {
 	return r
 }
 
-// judgeBuilds decides which build directories to suggest: the repo must be
+// Judge decides which build directories to suggest: the repo must be
 // clean by git's word and idle (no source change and no commit) for at least
 // idle. Anything else keeps its bytes and says why.
 func Judge(r *Row, idle time.Duration, floor int64, now time.Time) {

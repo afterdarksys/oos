@@ -25,13 +25,13 @@ type Item struct {
 	Refused   error             // non-nil means oos will not act on this entry
 }
 
-// buildPlan sizes every candidate entry in parallel and runs the guards.
+// Build sizes every candidate entry in parallel and runs the guards.
 // Entries marked never are included so the report shows them, but refused.
 func Build(cfg *config.Config, env guard.Env, types []string, now time.Time) []Item {
 	return BuildTagged(cfg, env, types, "", now)
 }
 
-// buildPlanTagged is buildPlan narrowed to entries carrying tag ("" = all).
+// BuildTagged is buildPlan narrowed to entries carrying tag ("" = all).
 func BuildTagged(cfg *config.Config, env guard.Env, types []string, tag string, now time.Time) []Item {
 	ents := cfg.EntriesTagged(types, tag)
 	items := make([]Item, len(ents))

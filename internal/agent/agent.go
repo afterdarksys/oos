@@ -81,6 +81,11 @@ func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) 
 	if err := state.Save(cfg.Policy.StateFile, st); err != nil {
 		fmt.Fprintf(errw, "oos: save state: %v\n", err)
 	}
+	// rate alert: where the last few hours of readings lead
+	fc := st.Forecast(now, cfg.Policy.ForecastWindow(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
+	if h := cfg.Policy.AlertHours(); h > 0 && fc.HoursToCritical > 0 && fc.HoursToCritical <= h {
+		msgs = append(msgs, fmt.Sprintf("critical in %.1fh at %+.2f GB/h; run oos -d to see what grew", fc.HoursToCritical, fc.RateGBPerHour))
+	}
 	notified := false
 	if len(msgs) > 0 {
 		if err := Notify("oos: disk "+label, strings.Join(msgs, "; ")); err != nil {
@@ -92,11 +97,17 @@ func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) 
 	if jsonOut {
 		_ = json.NewEncoder(out).Encode(map[string]any{
 			"free_gb": du.FreeGB(), "status": label, "drop_gb": drop, "notified": notified,
-			"alerts": msgs, "purged_batches": purgedNames, "purged_bytes": purgedBytes,
+			"alerts": msgs, "purged_batches": purgedNames, "purged_bytes": purgedBytes, "forecast": fc,
 		})
 		return code
 	}
 	fmt.Fprintf(out, "%s agent %s free=%.1fGB", now.Format("2006-01-02 15:04"), strings.ToLower(label), du.FreeGB())
+	if fc.Falling() {
+		fmt.Fprintf(out, " rate=%+.2fGB/h", fc.RateGBPerHour)
+		if fc.HoursToCritical > 0 {
+			fmt.Fprintf(out, " critical-in=%.1fh", fc.HoursToCritical)
+		}
+	}
 	if prev != nil {
 		fmt.Fprintf(out, " drop=%.1fGB", drop)
 	}

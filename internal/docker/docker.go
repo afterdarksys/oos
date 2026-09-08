@@ -101,7 +101,7 @@ func Timeout(p config.Policy) time.Duration {
 	return DefaultTimeout
 }
 
-// parseDockerSize reads the sizes docker prints: "19.72GB", "155.8MB",
+// ParseSize reads the sizes docker prints: "19.72GB", "155.8MB",
 // "1.093kB", "0B", also the binary "1.5GiB" form and a trailing " (77%)".
 func ParseSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
@@ -132,7 +132,7 @@ func ParseSize(s string) (int64, error) {
 	return int64(num*m + 0.5), nil
 }
 
-// parseDockerDF reads `docker system df --format '{{json .}}'`: one JSON
+// ParseDF reads `docker system df --format '{{json .}}'`: one JSON
 // object per line with Type, TotalCount, Active, Size, Reclaimable.
 func ParseDF(b []byte) (*Usage, error) {
 	u := &Usage{}
@@ -180,7 +180,7 @@ func ParseDF(b []byte) (*Usage, error) {
 	return u, nil
 }
 
-// parseDanglingVolumes reads `docker volume ls -f dangling=true --format
+// ParseDangling reads `docker volume ls -f dangling=true --format
 // '{{json .}}'`. Sizes are not in that listing; the caller measures what it can.
 func ParseDangling(b []byte) ([]Volume, error) {
 	var vols []Volume
@@ -204,7 +204,7 @@ func ParseDangling(b []byte) ([]Volume, error) {
 	return vols, nil
 }
 
-// collectDocker asks the daemon and sizes dangling volumes whose mountpoint
+// Collect asks the daemon and sizes dangling volumes whose mountpoint
 // is a directory on this host. Any failure is returned, never fatal to the
 // caller: sizing the rest of the disk does not depend on docker answering.
 func Collect(timeout time.Duration) (*Usage, error) {

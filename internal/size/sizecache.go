@@ -46,12 +46,12 @@ const cacheMinBytes = 4 << 20
 
 var Active = &Cache{}
 
-// openSizeCache loads the cache file; a missing or corrupt file starts empty.
+// OpenCache loads the cache file; a missing or corrupt file starts empty.
 func OpenCache(path string, ttl time.Duration) *Cache {
 	return OpenCacheWith(path, ttl, cacheMinBytes)
 }
 
-// openSizeCacheWith is openSizeCache with an explicit storage floor; tests use 0.
+// OpenCacheWith is openSizeCache with an explicit storage floor; tests use 0.
 func OpenCacheWith(path string, ttl time.Duration, minBytes int64) *Cache {
 	c := &Cache{path: path, ttl: ttl, entries: map[string]cacheEnt{}, enabled: path != "", minBytes: minBytes}
 	if !c.enabled {

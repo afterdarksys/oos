@@ -32,7 +32,7 @@ func TestHistoryTrend(t *testing.T) {
 	var out bytes.Buffer
 	doHistory(cfg, &opts{history: 2}, &out)
 	s := out.String()
-	if strings.Count(s, "\n") != 3 || !strings.Contains(s, "-10.0 GB over 24h0m0s") || !strings.Contains(s, "trend: -10.0 GB/day") {
+	if strings.Count(s, "\n") != 4 || !strings.Contains(s, "-10.0 GB over 24h0m0s") || !strings.Contains(s, "trend: -10.0 GB/day") || !strings.Contains(s, "forecast: needs 3 readings") {
 		t.Errorf("history output:\n%s", s)
 	}
 	out.Reset()

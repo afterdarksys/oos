@@ -126,6 +126,8 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `reference_open_files` | open file descriptors count as process references (one `lsof -n -P` on macOS, `/proc/*/fd` on Linux) |
 | `alert_drop_gb` | the tick notifies when free space fell by this much since the previous tick (default 10) |
 | `docker`, `docker_timeout_seconds` | ask the daemon during a sized check: unset means when `docker` is on the PATH, `false` never, `true` always and report a silent daemon; the deadline defaults to 120 s |
+| `forecast_window_hours`, `alert_hours_to_critical` | window the rate is fitted over (default 6) and how far ahead a projected critical crossing alerts (default 24; negative disables) |
+| `fleet`, `fleet_timeout_seconds` | ssh targets `--fleet` asks (`root@host`, or an ssh alias) and the per-host deadline (default 20) |
 
 ## rm-stale-children
 
@@ -270,7 +272,25 @@ is one `statfs` and one state write: it notifies (`osascript` or
 `alert_drop_gb` since the previous tick within three hours, and with
 `agent_purge_expired` it releases quarantine batches past their expiry.
 
+## Forecast
+
+Every tick and every check records free space, and the history is fitted
+with a least-squares line over the last `forecast_window_hours` (default
+6). With three readings spanning at least an hour the result is a rate in
+GB per hour and, when it is falling, the hours until the warn and critical
+lines. `--history` and a sized or quick `--check` print it, the JSON forms
+carry it as `forecast`, and the tick alerts when the critical crossing is
+inside `alert_hours_to_critical` (default 24; a negative value turns the
+rate alert off). Thin data says what it needs instead of guessing.
+
 ## Fleet
+
+`oos --fleet` asks every ssh target in `policy.fleet` (or `--hosts a,b`)
+for its quick check and prints one table: status, free, total, used,
+quarantine, forecast, host, least free first, unreachable hosts last with
+the ssh error. The remote command is `oos -c -q -j`, which sizes nothing.
+Exit code is the worst host: 3 when one did not answer, else the worst
+disk status. `fleet_timeout_seconds` bounds each host (default 20).
 
 `deploy/deploy.sh [--yes] host...` builds linux/amd64, ships the binary,
 seeds `~/.config/oos/oos.json` from `deploy/oos.server.json` only when the

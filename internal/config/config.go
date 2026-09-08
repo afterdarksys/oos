@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 //go:embed oos.json
@@ -17,7 +18,7 @@ var defaultConfigDarwin []byte
 //go:embed oos.linux.json
 var defaultConfigLinux []byte
 
-// defaultConfigFor picks the embedded default for a platform. macOS is the
+// DefaultFor picks the embedded default for a platform. macOS is the
 // fallback because that is where oos was born.
 func DefaultFor(goos string) []byte {
 	if goos == "linux" {
@@ -88,6 +89,38 @@ type Policy struct {
 	// host, so a deadline bounds it (default 120 s).
 	Docker               *bool `json:"docker,omitempty"`
 	DockerTimeoutSeconds int   `json:"docker_timeout_seconds,omitempty"`
+
+	// Forecast: the tick fits a rate to the readings inside
+	// ForecastWindowHours (default 6) and alerts when that rate reaches the
+	// critical line within AlertHoursToCritical hours (default 24; 0 keeps
+	// the default, a negative value disables the alert).
+	ForecastWindowHours  float64 `json:"forecast_window_hours,omitempty"`
+	AlertHoursToCritical float64 `json:"alert_hours_to_critical,omitempty"`
+
+	// Fleet: ssh targets --fleet asks when none are given on the command
+	// line, and how long to wait for each.
+	Fleet               []string `json:"fleet,omitempty"`
+	FleetTimeoutSeconds int      `json:"fleet_timeout_seconds,omitempty"`
+}
+
+// ForecastWindow is the fitted window as a duration.
+func (p Policy) ForecastWindow() time.Duration {
+	if p.ForecastWindowHours > 0 {
+		return time.Duration(p.ForecastWindowHours * float64(time.Hour))
+	}
+	return 6 * time.Hour
+}
+
+// AlertHours is how far ahead a projected critical crossing is worth an
+// alert; 0 means never.
+func (p Policy) AlertHours() float64 {
+	switch {
+	case p.AlertHoursToCritical < 0:
+		return 0
+	case p.AlertHoursToCritical == 0:
+		return 24
+	}
+	return p.AlertHoursToCritical
 }
 
 // Entry is one known large directory or file.
@@ -149,7 +182,7 @@ func Candidates(home string) []string {
 	}
 }
 
-// loadConfig reads the first config found, or the embedded default.
+// Load reads the first config found, or the embedded default.
 // It returns the config, the source it came from, and any error.
 func Load(explicit, home string) (*Config, string, error) {
 	if explicit != "" {
@@ -175,7 +208,7 @@ func Load(explicit, home string) (*Config, string, error) {
 	return cfg, "embedded default", err
 }
 
-// parseConfig decodes, expands ~ and validates. Unknown fields are an error:
+// Parse decodes, expands ~ and validates. Unknown fields are an error:
 // a typo in a policy key must not silently weaken the policy.
 func Parse(b []byte, home string) (*Config, error) {
 	dec := json.NewDecoder(strings.NewReader(string(b)))
@@ -261,6 +294,17 @@ func (c *Config) validate() error {
 	}
 	if p.DockerTimeoutSeconds < 0 {
 		add("policy.docker_timeout_seconds must be >= 0")
+	}
+	if p.ForecastWindowHours < 0 {
+		add("policy.forecast_window_hours must be >= 0")
+	}
+	if p.FleetTimeoutSeconds < 0 {
+		add("policy.fleet_timeout_seconds must be >= 0")
+	}
+	for i, h := range p.Fleet {
+		if strings.TrimSpace(h) == "" || strings.ContainsAny(h, " \t\n;|&") {
+			add("policy.fleet[%d] %q is not an ssh target", i, h)
+		}
 	}
 	for _, nt := range p.NeverTouch {
 		if !filepath.IsAbs(nt) {

@@ -50,6 +50,9 @@ func doHistory(cfg *config.Config, o *opts, out io.Writer) int {
 		perDay := (last.FreeGB - first.FreeGB) / (span.Hours() / 24)
 		fmt.Fprintf(out, "  trend: %+.1f GB/day over %s\n", perDay, span.Round(time.Hour))
 	}
+	// the forecast uses the policy window over the whole history, not the N rows shown
+	fc := st.Forecast(time.Now(), cfg.Policy.ForecastWindow(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
+	fmt.Fprintf(out, "  %s\n", fc.String())
 	return status.ExitOK
 }
 

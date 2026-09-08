@@ -49,6 +49,10 @@ type opts struct {
 	// --scan-builds
 	scanBuilds string
 	depth      int
+
+	// --fleet
+	fleet bool
+	hosts string
 }
 
 func parseFlags(args []string, stderr io.Writer) (*opts, error) {
@@ -125,6 +129,8 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.StringVar(&o.addTags, "tags", "", "comma-separated tags for --add")
 	fs.StringVar(&o.scanBuilds, "scan-builds", "", "size every git repo under DIR as source, .git and build output; suggest --add lines for build dirs of clean repos idle --older-than (default 30d)")
 	fs.IntVar(&o.depth, "depth", 0, "with --scan-builds: how many levels down to look for repos (default 4)")
+	fs.BoolVar(&o.fleet, "fleet", false, "ask every host in policy.fleet (or --hosts) for its quick check over ssh and print one table")
+	fs.StringVar(&o.hosts, "hosts", "", "with --fleet: comma-separated ssh targets instead of policy.fleet")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -147,7 +153,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != ""} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet} {
 		if m {
 			modes++
 		}
@@ -265,6 +271,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.scanBuilds != "" {
 		worst(doScanBuilds(cfg, env, o, now, stdout, stderr))
+	}
+	if o.fleet {
+		worst(doFleet(cfg, o, stdout, stderr))
 	}
 	if o.restore != "" {
 		worst(doRestore(cfg, o, stdout, stderr))
@@ -445,6 +454,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		}
 	}
 	st.Record("check", du, now)
+	fc := st.Forecast(now, cfg.Policy.ForecastWindow(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
 	if err := state.Save(cfg.Policy.StateFile, st); err != nil {
 		fmt.Fprintf(errw, "oos: save state: %v\n", err)
 	}
@@ -462,6 +472,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		j := map[string]any{
 			"volume": cfg.Volume, "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
 			"status": label, "quarantine_bytes": qBytes, "known": planJSON(items), "by_use_case": checkUseCases(cfg, items),
+			"version": Version, "forecast": fc,
 		}
 		if dkRan {
 			j["docker"] = docker.JSON(dk, dkErr)
@@ -474,6 +485,9 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		du.FreeGB(), du.TotalGB(), du.FreePct(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
 	if qBytes > 0 {
 		fmt.Fprintf(out, "  quarantine holds %s; --purge --yes frees expired batches, --purge-now --yes frees all\n", size.Human(qBytes))
+	}
+	if fc.Falling() {
+		fmt.Fprintf(out, "  %s\n", fc.String())
 	}
 	if o.quick {
 		fmt.Fprintln(out, "  (quick: known entries not sized; drop --quick or use --known)")

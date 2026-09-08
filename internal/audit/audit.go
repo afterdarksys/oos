@@ -87,7 +87,7 @@ var cacheName = regexp.MustCompile(`(?i)(^|[._-])(cache|caches|tmp|temp|target|n
 // audit calls it stale.
 const staleAfter = 180 * 24 * time.Hour
 
-// auditHome ranks every direct child of root by size and classifies it
+// Scan ranks every direct child of root by size and classifies it
 // against the config. It is read-only and never suggests an action it would
 // take itself; the suggestions are for the person editing oos.json.
 func Scan(cfg *config.Config, root string, minBytes int64, now time.Time) ([]Row, error) {

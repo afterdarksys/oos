@@ -57,7 +57,7 @@ func Load(path string) (*State, error) {
 	return &s, nil
 }
 
-// saveState writes atomically: temp file then rename.
+// Save writes atomically: temp file then rename.
 func Save(path string, s *State) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err

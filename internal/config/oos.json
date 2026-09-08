@@ -177,7 +177,12 @@
     "alert_drop_gb": 10,
     "size_cache_file": "~/.local/state/oos/sizes.json",
     "size_cache_hours": 6,
-    "reference_open_files": true
+    "reference_open_files": true,
+    "fleet": [
+      "root@relay-b",
+      "root@apps.afterdarksys.com"
+    ],
+    "fleet_timeout_seconds": 20
   },
   "known_dirs": [
     {

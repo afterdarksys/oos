@@ -3,6 +3,7 @@ package plan
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"os/exec"
@@ -17,12 +18,19 @@ import (
 )
 
 // Item is one entry after sizing and guarding.
+// UniqueFloor is the deletable size from which the plan measures what a
+// removal would really give back. Under it the recorded and returned figures
+// are taken as equal: the clone-aware walk opens every large file, and a
+// small entry cannot be far wrong.
+var UniqueFloor int64 = size.GB
+
 type Item struct {
 	config.Entry
-	Bytes     int64             // total under the path
-	Deletable int64             // what a live run would remove
-	Children  []guard.ChildPlan // rm-stale-children only
-	Refused   error             // non-nil means oos will not act on this entry
+	Bytes       int64             // total under the path
+	Deletable   int64             // what a live run would remove, as recorded
+	Reclaimable int64             // what the volume gets back; Deletable unless blocks are shared
+	Children    []guard.ChildPlan // rm-stale-children only
+	Refused     error             // non-nil means oos will not act on this entry
 }
 
 // Build sizes every candidate entry in parallel and runs the guards.
@@ -98,6 +106,10 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 		}
 	}
 
+	if it.Refused == nil && config.IsDestructive(e.Action) {
+		it.Reclaimable = reclaimable(it, now)
+	}
+
 	// Quarantine moves with rename, which cannot cross devices. Refuse now,
 	// visibly in the plan, rather than failing halfway through a live run.
 	if it.Refused == nil && cfg.Policy.Quarantine && config.IsDestructive(e.Action) {
@@ -106,6 +118,45 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 		}
 	}
 	return it
+}
+
+// reclaimable is what removing the item returns to the volume. Deletable is
+// the recorded figure, allocated blocks summed per file; where files share
+// blocks (APFS clones, hardlinks) the volume gives back less. The uv archive
+// on 2026-09-08 recorded 151 GB and returned 14. The measurement is a walk
+// that opens every large file, so it runs only from UniqueFloor up and is
+// cached against the deletable total it was taken for.
+func reclaimable(it Item, now time.Time) int64 {
+	if it.Deletable < UniqueFloor {
+		return it.Deletable
+	}
+	roots := []string{it.Path}
+	var keep []string
+	key := it.Path
+	if it.Action == config.ActionRmStaleChilds {
+		// the stale set can change with its total unchanged (two children
+		// of one size swapping state), so the set itself is in the key
+		roots = roots[:0]
+		h := fnv.New64a()
+		for _, c := range it.Children {
+			if c.Keep == "" {
+				roots = append(roots, c.Path)
+				h.Write([]byte(c.Path))
+				h.Write([]byte{0})
+			} else {
+				keep = append(keep, c.Path)
+			}
+		}
+		key += fmt.Sprintf("#stale:%x", h.Sum64())
+	}
+	u, ok := size.Active.Unique(key, it.Deletable, now, func() (int64, error) {
+		_, u, err := size.UniqueAgainst(keep, roots...)
+		return u, err
+	})
+	if !ok || u > it.Deletable {
+		return it.Deletable
+	}
+	return u
 }
 
 // sameDevice checks that p and the quarantine dir (or its nearest existing

@@ -75,6 +75,19 @@ func (q *Quarantine) take(src string, bytes int64, now time.Time) (string, error
 	return dst, q.writeManifest()
 }
 
+// Empty reports whether nothing has been recorded into the batch.
+func (q *Quarantine) Empty() bool { return len(q.man.Entries) == 0 }
+
+// Discard removes the batch directory when nothing was recorded into it, so
+// a run that only executed commands, or whose every move failed, leaves no
+// empty batch behind. A batch holding entries is left exactly as it is.
+func (q *Quarantine) Discard() error {
+	if !q.Empty() {
+		return nil
+	}
+	return os.RemoveAll(q.batchDir())
+}
+
 func (q *Quarantine) writeManifest() error {
 	b, err := json.MarshalIndent(q.man, "", "  ")
 	if err != nil {

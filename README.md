@@ -160,7 +160,13 @@ cannot be listed, the entry is refused rather than guessed.
 
 With `quarantine: true`, every rm action renames the path into
 `quarantine_dir/<batch>/<original absolute path>` and records it in the
-batch's `manifest.json`. Space is not freed until the batch is purged.
+batch's `manifest.json`. Space is not freed until the batch is purged, and
+the manifest records allocated blocks per file: where files share blocks
+(APFS clones, hardlinks) the volume gives back less than the recorded
+total, so `--purge` prints both the recorded figure and the volume's free
+space before and after. The plan says up front what a removal returns
+(`[shared: ~X reclaimable]` on an entry, `volume gets back about X` under
+the total) for destructive entries from 1 GB up.
 `--restore BATCH` moves everything back and refuses to overwrite anything
 that has reappeared. `--purge -y` removes batches older than
 `quarantine_days`; `--purge-now -y` removes all of them. A batch without a

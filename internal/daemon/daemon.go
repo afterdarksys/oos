@@ -327,7 +327,7 @@ func (d *Daemon) sized(cfg *config.Config, now time.Time) {
 			sum.Known[it.Path] = it.Bytes
 		}
 		if it.Refused == nil && config.IsDestructive(it.Action) {
-			sum.Reclaimable += it.Deletable
+			sum.Reclaimable += it.Reclaimable
 		}
 	}
 	if st, err := state.Load(cfg.Policy.StateFile); err == nil {

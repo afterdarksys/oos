@@ -28,7 +28,7 @@ import (
 	"github.com/afterdarksys/oos/internal/state"
 )
 
-const Version = "0.6.1"
+const Version = "0.6.2"
 
 type opts struct {
 	check, known, cleanup, show, diff, quick, yes, no, jsonOut, verbose bool
@@ -536,7 +536,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	fmt.Fprintf(out, "  free %.1f GB of %.1f GB (%.1f%%)   warn < %.0f GB   critical < %.0f GB\n",
 		du.FreeGB(), du.TotalGB(), du.FreePct(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
 	if qBytes > 0 {
-		fmt.Fprintf(out, "  quarantine holds %s; --purge --yes frees expired batches, --purge-now --yes frees all\n", size.Human(qBytes))
+		fmt.Fprintf(out, "  quarantine holds %s (recorded); --purge --yes frees expired batches, --purge-now --yes frees all\n", size.Human(qBytes))
 	}
 	if fc.Falling() {
 		fmt.Fprintf(out, "  %s\n", fc.String())
@@ -551,7 +551,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		mark := " "
 		if it.Refused == nil && config.IsDestructive(it.Action) {
 			mark = "*"
-			reclaimable += it.Deletable
+			reclaimable += it.Reclaimable
 		} else if it.Refused == nil {
 			mark = "c"
 		}
@@ -559,12 +559,15 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		if it.Action == config.ActionRmStaleChilds && it.Refused == nil {
 			sz = fmt.Sprintf("%s (%s stale)", size.Human(it.Bytes), size.Human(it.Deletable))
 		}
-		fmt.Fprintf(out, "  %s %9s  %-8s %-18s %s\n", mark, sz, it.Type, it.Action, it.Path)
+		fmt.Fprintf(out, "  %s %9s  %-8s %-18s %s%s\n", mark, sz, it.Type, it.Action, it.Path, sharedNote(it))
 		if o.verbose && it.Refused != nil {
 			fmt.Fprintf(out, "                refused: %v\n", it.Refused)
 		}
 	}
 	fmt.Fprintf(out, "  * reclaimable by --cleanup --yes now: %s   c = via command\n", size.Human(reclaimable))
+	if reclaimable < deletableSum(items) {
+		fmt.Fprintln(out, "    (entries marked shared hold clones or hardlinks; recorded size is per copy, reclaimable is what the volume gets back)")
+	}
 	if dkRan {
 		if dkErr != nil {
 			fmt.Fprintf(out, "docker: skipped (%v)\n", dkErr)
@@ -591,7 +594,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 func planJSON(items []plan.Item) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
 	for _, it := range items {
-		m := map[string]any{"path": it.Path, "type": it.Type, "action": it.Action, "bytes": it.Bytes, "deletable": it.Deletable}
+		m := map[string]any{"path": it.Path, "type": it.Type, "action": it.Action, "bytes": it.Bytes, "deletable": it.Deletable, "reclaimable": it.Reclaimable}
 		if it.Refused != nil {
 			m["refused"] = it.Refused.Error()
 		}
@@ -706,7 +709,7 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 					kept++
 				}
 			}
-			fmt.Fprintf(out, "  stale  %9s  %s  (%s of %s; %d kept)\n", size.Human(it.Deletable), it.Path, size.Human(it.Deletable), size.Human(it.Bytes), kept)
+			fmt.Fprintf(out, "  stale  %9s  %s  (%s of %s; %d kept)%s\n", size.Human(it.Deletable), it.Path, size.Human(it.Deletable), size.Human(it.Bytes), kept, sharedNote(it))
 			if o.verbose {
 				for _, c := range it.Children {
 					if c.Keep != "" {
@@ -718,10 +721,13 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 			}
 		default:
 			planned += it.Deletable
-			fmt.Fprintf(out, "  delete %9s  %s  (%s)\n", size.Human(it.Deletable), it.Path, it.Action)
+			fmt.Fprintf(out, "  delete %9s  %s  (%s)%s\n", size.Human(it.Deletable), it.Path, it.Action, sharedNote(it))
 		}
 	}
 	fmt.Fprintf(out, "  planned removals: %s   budget: %.0f GB\n", size.Human(planned), cfg.Policy.MaxDeleteGBPerRun)
+	if r := reclaimableSum(items); r < planned {
+		fmt.Fprintf(out, "  volume gets back about %s: the rest is blocks shared with files that stay (clones, hardlinks)\n", size.Human(r))
+	}
 	if !live {
 		fmt.Fprintln(out, "dry-run: nothing touched. Add --yes to execute.")
 		return status.ExitOK
@@ -752,14 +758,46 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	st, _ := state.Load(cfg.Policy.StateFile)
 	st.Record("cleanup", after, now)
 	_ = state.Save(cfg.Policy.StateFile, st)
-	if x.Q != nil {
-		fmt.Fprintf(out, "done: %s moved to quarantine batch %s; volume free %.1f GB -> %.1f GB\n", size.Human(freed), x.Q.Batch, before.FreeGB(), after.FreeGB())
+	if x.Q != nil && x.Q.Empty() {
+		// commands only, or every move failed: no batch to keep
+		_ = x.Q.Discard()
+		fmt.Fprintf(out, "done: nothing quarantined; volume free %.1f GB -> %.1f GB\n", before.FreeGB(), after.FreeGB())
+	} else if x.Q != nil {
+		fmt.Fprintf(out, "done: %s (recorded) moved to quarantine batch %s; volume free %.1f GB -> %.1f GB\n", size.Human(freed), x.Q.Batch, before.FreeGB(), after.FreeGB())
 		fmt.Fprintf(out, "      space returns on --purge --yes after %d days, or --purge-now --yes; undo with --restore %s\n", cfg.Policy.QuarantineDays, x.Q.Batch)
 	} else {
-		fmt.Fprintf(out, "done: %s removed; volume free %.1f GB -> %.1f GB\n", size.Human(freed), before.FreeGB(), after.FreeGB())
+		fmt.Fprintf(out, "done: %s (recorded) removed; volume free %.1f GB -> %.1f GB\n", size.Human(freed), before.FreeGB(), after.FreeGB())
 	}
 	_, code := status.Of(cfg.Policy, after)
 	return code
+}
+
+// sharedNote marks an entry whose removal returns less than it records.
+func sharedNote(it plan.Item) string {
+	if it.Refused != nil || !config.IsDestructive(it.Action) || it.Reclaimable >= it.Deletable {
+		return ""
+	}
+	return fmt.Sprintf("  [shared: ~%s reclaimable]", size.Human(it.Reclaimable))
+}
+
+func reclaimableSum(items []plan.Item) int64 {
+	var n int64
+	for _, it := range items {
+		if it.Refused == nil && config.IsDestructive(it.Action) {
+			n += it.Reclaimable
+		}
+	}
+	return n
+}
+
+func deletableSum(items []plan.Item) int64 {
+	var n int64
+	for _, it := range items {
+		if it.Refused == nil && config.IsDestructive(it.Action) {
+			n += it.Deletable
+		}
+	}
+	return n
 }
 
 func doRestore(cfg *config.Config, o *opts, out, errw io.Writer) int {
@@ -808,7 +846,7 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 			fmt.Fprintf(out, "  keep   %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
 		}
 	}
-	fmt.Fprintf(out, "  would free %s permanently\n", size.Human(planned))
+	fmt.Fprintf(out, "  would free up to %s permanently (recorded; blocks shared with files that stay return nothing)\n", size.Human(planned))
 	if !live {
 		fmt.Fprintln(out, "dry-run: nothing purged. Add --yes to execute.")
 		return status.ExitOK
@@ -819,13 +857,15 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 		return status.ExitCritical
 	}
 	defer logf.Close()
+	before, _ := size.Disk(cfg.Volume)
 	freed, names, err := plan.PurgeBatches(cfg.Policy.QuarantineDir, olderThan, now, o.purgeNow)
-	fmt.Fprintf(logf, "%s purge all=%v freed=%d batches=%s err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, freed, strings.Join(names, ","), err)
+	after, _ := size.Disk(cfg.Volume)
+	fmt.Fprintf(logf, "%s purge all=%v recorded=%d free_before=%d free_after=%d batches=%s err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, freed, before.Free, after.Free, strings.Join(names, ","), err)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: purge: %v\n", err)
 		return status.ExitCritical
 	}
-	fmt.Fprintf(out, "purged %d batches, %s freed\n", len(names), size.Human(freed))
+	fmt.Fprintf(out, "purged %d batches: recorded %s; volume free %.1f GB -> %.1f GB\n", len(names), size.Human(freed), before.FreeGB(), after.FreeGB())
 	return status.ExitOK
 }
 

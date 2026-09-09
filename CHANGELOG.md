@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2] - 2026-09-09
+
+### Fixed
+- Sizes on APFS counted every clone in full. uv installs by clone, so its archive of 1087 entries was recorded at 151.1 GB, `--purge-now` printed "151.1 GB freed", and the volume gained 14. Destructive entries from 1 GB up are now also measured clone-aware (`size.Unique`: hardlinks by inode everywhere, large regular files on darwin by the device offset of their first block via `F_LOG2PHYS`; files under 128 KB count per copy, so the figure is an upper bound). `Item.Reclaimable` carries it; the check's `* reclaimable` line, `--cleanup`'s plan (`volume gets back about X`), the JSON plan (`reclaimable`, `reclaimable_bytes`) and the daemon's sized summary use it, and rows whose removal returns less than they record are marked `[shared: ~X reclaimable]`. For `rm-stale-children` the kept children are walked first so a stale clone of a kept entry counts as nothing. The measurement is cached beside the size cache (`sizes.unique.json`) against the deletable total it was taken for, and remeasured when that total moves, after the TTL, or with `--fresh`.
+- `--purge` reports the manifest total as recorded and the volume's free space before and after, which is what actually came back; the dry run says "up to". `--cleanup` labels its total the same way. The audit log carries both numbers.
+- A live `--cleanup` whose only work was commands left an empty quarantine batch behind (20260908-210611 on the Mac). An empty batch is discarded at the end of the run and the summary says "nothing quarantined"; the JSON form drops `batch`.
+
 ## [0.6.1] - 2026-09-08
 
 ### Added

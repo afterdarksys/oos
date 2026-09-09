@@ -19,15 +19,16 @@ import (
 // doCleanupJSON is --cleanup's machine form: the plan, and when live, what
 // happened. One JSON document either way.
 func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item, live bool, now time.Time, out, errw io.Writer) int {
-	var planned int64
+	var planned, reclaimable int64
 	for _, it := range items {
 		if it.Refused == nil && config.IsDestructive(it.Action) {
 			planned += it.Deletable
+			reclaimable += it.Reclaimable
 		}
 	}
 	doc := map[string]any{
 		"live": live, "quarantine": cfg.Policy.Quarantine && !o.permanent, "plan": planJSON(items),
-		"planned_bytes": planned, "budget_gb": cfg.Policy.MaxDeleteGBPerRun,
+		"planned_bytes": planned, "reclaimable_bytes": reclaimable, "budget_gb": cfg.Policy.MaxDeleteGBPerRun,
 	}
 	if !live {
 		_ = json.NewEncoder(out).Encode(doc)
@@ -52,7 +53,12 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 	}
 	freed, err := x.Execute(items)
 	after, _ := size.Disk(cfg.Volume)
-	doc["freed_bytes"] = freed
+	if x.Q != nil && x.Q.Empty() {
+		_ = x.Q.Discard()
+		delete(doc, "batch")
+	}
+	doc["recorded_bytes"] = freed
+	doc["freed_bytes"] = freed // kept for readers of 0.6; the honest number is free_gb_after - free_gb_before
 	doc["free_gb_before"] = before.FreeGB()
 	doc["free_gb_after"] = after.FreeGB()
 	if err != nil {

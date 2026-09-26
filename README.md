@@ -331,7 +331,22 @@ are the whole output.
 On macOS a sized `--check` also asks `tmutil` for local Time Machine
 snapshots, the space no file walk can see, and prints the count, dates
 and the exact `tmutil thinlocalsnapshots` command that releases them.
-`policy.snapshots` forces it on or off. oos never runs that command.
+`com.apple.os.update-*` snapshots are listed separately. One of them is
+often the system the Mac is running, so oos never deletes a snapshot.
+`policy.snapshots` forces the `tmutil` question on or off.
+
+The same check reports the other space a home walk cannot see, and
+removes none of it. Purgeable bytes are the CacheDelete estimate
+(available for important use, minus free space): an estimate, not a
+folder. The paths are `/Library/Updates` (downloaded Software Update
+packages; a finished install usually clears them, an interrupted one
+leaves them), `/macOS Install Data` (the staged upgrade payload, also
+present under `/System/Volumes/Data`; delete it only after that upgrade
+has finished booting), `/Applications/Install macOS*.app` (the full
+installer, safe to remove once the Mac is already running that OS), and
+`$TMPDIR` (the real temporary directory, under `/var/folders`, which
+live processes are using). Two paths that are the same file are shown
+once.
 
 ## App leftovers
 

@@ -25,6 +25,7 @@ import (
 	"github.com/afterdarksys/oos/internal/guard"
 	"github.com/afterdarksys/oos/internal/plan"
 	"github.com/afterdarksys/oos/internal/size"
+	"github.com/afterdarksys/oos/internal/space"
 	"github.com/afterdarksys/oos/internal/state"
 )
 
@@ -474,6 +475,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	var snap *snapshots.Report
 	var snapErr error
 	snapRan := false
+	var inv *space.Report
 	if !o.quick {
 		items = plan.BuildTagged(cfg, env, splitTypes(o.types), o.tag, now)
 		if want, forced := docker.Wanted(cfg.Policy); want {
@@ -490,6 +492,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 				fmt.Fprintf(errw, "oos: snapshots: %v\n", snapErr)
 			}
 		}
+		inv = space.Collect(cfg.Volume, os.Getenv("TMPDIR"))
 	}
 	st, _ := state.Load(cfg.Policy.StateFile)
 	st.Volume = cfg.Volume
@@ -525,6 +528,9 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 			} else {
 				j["snapshots"] = snap
 			}
+		}
+		if inv != nil {
+			j["invisible"] = inv
 		}
 		if dkRan {
 			j["docker"] = docker.JSON(dk, dkErr)
@@ -581,6 +587,9 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		} else {
 			snapshots.Print(out, snap, o.verbose)
 		}
+	}
+	if inv != nil {
+		space.Print(out, inv)
 	}
 	paths := make([]string, len(items))
 	sizes := make([]int64, len(items))

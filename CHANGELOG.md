@@ -4,6 +4,7 @@
 
 ### Added
 - Application safety classes. `--app-leftovers` marks Caches, Logs, Saved Application State, WebKit and HTTPStorages as disposable and suggests `rm-contents`. Application Support, Containers, Group Containers, Preferences and LaunchAgents are keep: an orphan is suggested as `never`, and the folder is not offered for removal. Inside a keep folder, cache directories (Cache, Code Cache, GPUCache, cache2, CacheStorage and the other cache names) are suggested on their own; Bookmarks, Cookies, Login Data, places.sqlite, logins.json and the other user-data files are reported and never suggested. `--who` prints the same class for a path under ~/Library.
+- macOS invisible space on a sized `--check`. Time Machine snapshots and `com.apple.os.update-*` snapshots are listed apart; oos still never deletes a snapshot, because the running system may be one of the update snapshots. Purgeable bytes are the CacheDelete estimate. `/Library/Updates`, `macOS Install Data`, `Install macOS*.app` and `$TMPDIR` are sized and explained. Nothing in this section is removed.
 
 ## [0.6.2] - 2026-09-09
 

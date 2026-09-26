@@ -60,3 +60,18 @@ func TestParseAndCollect(t *testing.T) {
 		t.Errorf("failure must surface: %v", err)
 	}
 }
+
+func TestUpdateSnapshotsStayOutOfTheTimeMachineList(t *testing.T) {
+	const raw = "com.apple.TimeMachine.2026-09-06-101010.local\ncom.apple.os.update-ABCDEF\ncom.apple.os.update-MSUPrepareUpdate\n"
+	tm := Parse([]byte(raw))
+	up := ParseUpdates([]byte(raw))
+	if len(tm) != 1 || len(up) != 2 || up[0].Name != "com.apple.os.update-ABCDEF" {
+		t.Fatalf("tm %+v up %+v", tm, up)
+	}
+	r := &Report{Updates: up, Note: "n", Thin: "tmutil thinlocalsnapshots / 1 4"}
+	var out bytes.Buffer
+	Print(&out, r, true)
+	if !strings.Contains(out.String(), "os update snapshots: 2") || !strings.Contains(out.String(), "does not delete") || !strings.Contains(out.String(), "MSUPrepareUpdate") {
+		t.Errorf("print:\n%s", out.String())
+	}
+}

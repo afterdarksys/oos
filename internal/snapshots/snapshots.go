@@ -37,6 +37,7 @@ type Report struct {
 	Oldest  time.Time  `json:"oldest,omitempty"`
 	Newest  time.Time  `json:"newest,omitempty"`
 	Items   []Snapshot `json:"snapshots,omitempty"`
+	Updates []Snapshot `json:"update_snapshots,omitempty"`
 	Thin    string     `json:"thin_command"`
 	Note    string     `json:"note,omitempty"`
 	Elapsed time.Duration
@@ -74,23 +75,39 @@ func Supported() bool {
 
 // Parse reads `tmutil listlocalsnapshots /` output: one
 // com.apple.TimeMachine.YYYY-MM-DD-HHMMSS.local per line after a header.
+// OS-update snapshots are returned by ParseUpdates; they have no timestamp
+// in the name.
 func Parse(out []byte) []Snapshot {
-	var snaps []Snapshot
+	tm, _ := splitSnapshots(out)
+	return tm
+}
+
+// ParseUpdates returns com.apple.os.update-* snapshots from the same output.
+// The booted system is often one of these. They are not a deletion candidate.
+func ParseUpdates(out []byte) []Snapshot {
+	_, up := splitSnapshots(out)
+	return up
+}
+
+func splitSnapshots(out []byte) (tm, updates []Snapshot) {
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		const pre = "com.apple.TimeMachine."
-		if !strings.HasPrefix(line, pre) {
-			continue
+		const upd = "com.apple.os.update-"
+		switch {
+		case strings.HasPrefix(line, pre):
+			stamp := strings.TrimSuffix(strings.TrimPrefix(line, pre), ".local")
+			at, err := time.ParseInLocation("2006-01-02-150405", stamp, time.Local)
+			if err != nil {
+				continue
+			}
+			tm = append(tm, Snapshot{Name: line, At: at})
+		case strings.HasPrefix(line, upd):
+			updates = append(updates, Snapshot{Name: line})
 		}
-		stamp := strings.TrimSuffix(strings.TrimPrefix(line, pre), ".local")
-		at, err := time.ParseInLocation("2006-01-02-150405", stamp, time.Local)
-		if err != nil {
-			continue
-		}
-		snaps = append(snaps, Snapshot{Name: line, At: at})
 	}
-	sort.Slice(snaps, func(i, j int) bool { return snaps[i].At.Before(snaps[j].At) })
-	return snaps
+	sort.Slice(tm, func(i, j int) bool { return tm[i].At.Before(tm[j].At) })
+	return tm, updates
 }
 
 // Collect asks tmutil for the local snapshots of volume.
@@ -100,7 +117,8 @@ func Collect(volume string) (*Report, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tmutil listlocalsnapshots: %v", err)
 	}
-	r := &Report{Items: Parse(out), Elapsed: time.Since(start)}
+	tm, up := splitSnapshots(out)
+	r := &Report{Items: tm, Updates: up, Elapsed: time.Since(start)}
 	r.Count = len(r.Items)
 	if r.Count > 0 {
 		r.Oldest, r.Newest = r.Items[0].At, r.Items[r.Count-1].At
@@ -114,14 +132,24 @@ func Collect(volume string) (*Report, error) {
 func Print(out io.Writer, r *Report, verbose bool) {
 	if r.Count == 0 {
 		fmt.Fprintln(out, "local snapshots: none")
+	} else {
+		fmt.Fprintf(out, "local snapshots: %d (oldest %s, newest %s); %s\n", r.Count,
+			r.Oldest.Format("2006-01-02 15:04"), r.Newest.Format("2006-01-02 15:04"), r.Note)
+		fmt.Fprintf(out, "  release with: %s   (or: tmutil deletelocalsnapshots <date>)\n", r.Thin)
+		if verbose {
+			for _, s := range r.Items {
+				fmt.Fprintf(out, "    %s  %s\n", s.At.Format("2006-01-02 15:04"), s.Name)
+			}
+		}
+	}
+	if len(r.Updates) == 0 {
+		fmt.Fprintln(out, "os update snapshots: none")
 		return
 	}
-	fmt.Fprintf(out, "local snapshots: %d (oldest %s, newest %s); %s\n", r.Count,
-		r.Oldest.Format("2006-01-02 15:04"), r.Newest.Format("2006-01-02 15:04"), r.Note)
-	fmt.Fprintf(out, "  release with: %s   (or: tmutil deletelocalsnapshots <date>)\n", r.Thin)
+	fmt.Fprintf(out, "os update snapshots: %d; the running system may be one of them. oos does not delete snapshots.\n", len(r.Updates))
 	if verbose {
-		for _, s := range r.Items {
-			fmt.Fprintf(out, "    %s  %s\n", s.At.Format("2006-01-02 15:04"), s.Name)
+		for _, s := range r.Updates {
+			fmt.Fprintf(out, "    %s\n", s.Name)
 		}
 	}
 }

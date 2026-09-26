@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Refuse symlink ancestors and removal trees containing protected paths; use directory handles and mount checks for deletion, including Linux bind mounts and trash emptying. Read-only cleanup no longer changes permissions on hardlinked regular files.
+- Bypass cached sizes for destructive planning and remeasure before execution; enforce the remaining budget during removal and across ensure steps. Recheck live guards and each stale child’s references, age, and identity. Report execution and audit-write failures.
+- Allocate quarantine batches exclusively, persist move intent before rename, recover pending moves, and preserve unrecorded files on restore/discard. Automatic expiry excludes incomplete batches.
+- Open and verify the audit log before ensure purges, include expiry in its deletion budget, and measure actual free space after purging.
+
 ## [0.7.1] - 2026-09-26
 
 ### Added

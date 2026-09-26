@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -39,7 +40,28 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 	}
 	need := int64((target - du.FreeGB()) * size.GB)
 	var projected int64
+	maxBytes := int64(cfg.Policy.MaxDeleteGBPerRun * size.GB)
+	remaining := maxBytes
 
+	var logf *os.File
+	if live {
+		logf, err = state.OpenLog(cfg.Policy.LogFile)
+		if err != nil {
+			return res, fmt.Errorf("cannot open log %s: %v; refusing to act without an audit log", cfg.Policy.LogFile, err)
+		}
+		defer logf.Close()
+	}
+	if live {
+		if err := env.CheckInstall(); err != nil {
+			return res, err
+		}
+		if _, err := fmt.Fprintf(logf, "%s ensure start target_gb=%g\n", now.UTC().Format(time.RFC3339), target); err != nil {
+			return res, err
+		}
+		if err := logf.Sync(); err != nil {
+			return res, err
+		}
+	}
 	if cfg.Policy.Quarantine {
 		olderThan := time.Duration(cfg.Policy.QuarantineDays) * 24 * time.Hour
 		bs, _ := ListBatches(cfg.Policy.QuarantineDir)
@@ -51,9 +73,20 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		}
 		if expired > 0 {
 			if live {
-				freed, names, err := PurgeBatches(cfg.Policy.QuarantineDir, olderThan, now, false)
+				freed, names, err := purgeBatches(cfg.Policy.QuarantineDir, olderThan, now, false, &remaining)
 				res.Steps = append(res.Steps, fmt.Sprintf("purged %d expired quarantine batches, %s (err=%v)", len(names), size.Human(freed), err))
-				projected += freed
+				if _, logErr := fmt.Fprintf(logf, "%s ensure purge batches=%v recorded_bytes=%d err=%v\n", now.UTC().Format(time.RFC3339), names, freed, err); logErr != nil {
+					return res, logErr
+				}
+				if err != nil {
+					return res, err
+				}
+				size.Sync()
+				after, diskErr := size.Disk(cfg.Volume)
+				if diskErr != nil {
+					return res, diskErr
+				}
+				projected = int64(after.Free) - int64(du.Free)
 			} else {
 				res.Steps = append(res.Steps, fmt.Sprintf("purge %d expired quarantine batches, %s", len(bs), size.Human(expired)))
 				projected += expired
@@ -61,7 +94,11 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		}
 	}
 
-	items := Build(cfg, env, types, now)
+	// Ensure deletes permanently, so a quarantine filesystem mismatch must not
+	// exclude otherwise safe candidates.
+	planning := *cfg
+	planning.Policy.Quarantine = false
+	items := Build(&planning, env, types, now)
 	var rm, cmds []Item
 	for _, it := range items {
 		if it.Refused != nil {
@@ -75,18 +112,10 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 	}
 	ordered := append(rm, cmds...)
 
-	var logf *os.File
-	if live {
-		logf, err = state.OpenLog(cfg.Policy.LogFile)
-		if err != nil {
-			return res, fmt.Errorf("cannot open log %s: %v; refusing to act without an audit log", cfg.Policy.LogFile, err)
-		}
-		defer logf.Close()
-	}
-	x := &Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home}
-	var spent int64
-	maxBytes := int64(cfg.Policy.MaxDeleteGBPerRun * size.GB)
+	x := &Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env}
+	spent := maxBytes - remaining
 	final := du
+	var runErrs error
 	for _, it := range ordered {
 		if projected >= need {
 			break
@@ -102,13 +131,16 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 			continue
 		}
 		before, _ := size.Disk(cfg.Volume)
-		if _, err := x.Execute([]Item{it}); err != nil {
+		x.Policy.MaxDeleteGBPerRun = float64(maxBytes-spent) / size.GB
+		_, runErr := x.Execute([]Item{it})
+		spent += x.budgetUsed
+		if err := runErr; err != nil {
 			res.Steps = append(res.Steps, fmt.Sprintf("%s %s: %v", it.Action, it.Path, err))
-			continue
+			runErrs = errors.Join(runErrs, err)
+			break
 		}
 		after, _ := size.Disk(cfg.Volume)
 		got := int64(after.Free) - int64(before.Free)
-		spent += it.Deletable
 		projected += got
 		final = after
 		res.Steps = append(res.Steps, fmt.Sprintf("%s %s: %s freed", it.Action, it.Path, size.Human(got)))
@@ -122,7 +154,7 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		}
 		res.FreeGB = final.FreeGB()
 		res.Reached = final.FreeGB() >= target
-		return res, nil
+		return res, runErrs
 	}
 	if projected < need {
 		res.Steps = append(res.Steps, fmt.Sprintf("short by %s even after every allowed action", size.Human(need-projected)))

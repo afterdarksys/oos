@@ -65,13 +65,18 @@ func doTrash(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	var results []result
 	var freed int64
 	code := status.ExitOK
+	remaining := maxBytes
 	for _, b := range bins {
 		if b.Error != "" {
 			fmt.Fprintf(logf, "%s empty-trash %s skipped err=%s\n", now.UTC().Format(time.RFC3339), b.Path, b.Error)
 			results = append(results, result{Path: b.Path, Error: b.Error})
 			continue
 		}
-		nBytes, n, err := trash.Empty(b.Path, env.Home, uid)
+		if _, err := fmt.Fprintf(logf, "%s empty-trash intent %s\n", now.UTC().Format(time.RFC3339), b.Path); err != nil {
+			fmt.Fprintf(errw, "oos: cannot write audit log: %v\n", err)
+			return status.ExitCritical
+		}
+		nBytes, n, err := trash.EmptyLimited(b.Path, env.Home, uid, &remaining)
 		res := result{Path: b.Path, Bytes: nBytes, Entries: n}
 		if err != nil {
 			res.Error = err.Error()

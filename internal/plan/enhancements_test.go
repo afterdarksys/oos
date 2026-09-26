@@ -204,8 +204,8 @@ func TestQuarantineMoveFailureLeavesSourceIntact(t *testing.T) {
 	q, _ := OpenQuarantine(p.QuarantineDir, time.Now(), func(src, dst string) error { return errors.New("EXDEV") })
 	x := &Executor{Policy: p, Now: time.Now, Q: q}
 	items := []Item{{Entry: config.Entry{Path: dir, Action: config.ActionRmContents}, Bytes: 10, Deletable: 10}}
-	if _, err := x.Execute(items); err != nil {
-		t.Fatal(err) // per-item failure is reported, not fatal to the run
+	if _, err := x.Execute(items); err == nil {
+		t.Fatal("failed move must propagate to the caller")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "f")); err != nil {
 		t.Error("a failed move must leave the source in place")

@@ -8,15 +8,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/afterdarksys/oos/internal/size"
+	"github.com/afterdarksys/oos/internal/safefs"
 )
 
 // ChildPlan is one direct child of an rm-stale-children directory.
 type ChildPlan struct {
-	Path    string    `json:"path"`
-	Bytes   int64     `json:"bytes"`
-	ModTime time.Time `json:"mtime"`
-	Keep    string    `json:"keep,omitempty"` // reason to keep; empty means delete
+	Path    string      `json:"path"`
+	Bytes   int64       `json:"bytes"`
+	ModTime time.Time   `json:"mtime"`
+	Info    os.FileInfo `json:"-"`              // identity captured for the execution recheck
+	Keep    string      `json:"keep,omitempty"` // reason to keep; empty means delete
 }
 
 // References gathers every string a running process exposes that could name
@@ -78,7 +79,7 @@ func Referenced(child string, refs []string) bool {
 // floor. Everything else is a delete candidate. Every non-symlink child is
 // sized so the plan can show what is kept and why.
 func ClassifyChildren(dir string, staleAfter time.Duration, refs []string, now time.Time) ([]ChildPlan, error) {
-	ents, err := os.ReadDir(dir)
+	ents, err := safefs.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +90,7 @@ func ClassifyChildren(dir string, staleAfter time.Duration, refs []string, now t
 		if err != nil {
 			continue
 		}
-		c := ChildPlan{Path: p, ModTime: fi.ModTime()}
+		c := ChildPlan{Path: p, ModTime: fi.ModTime(), Info: fi}
 		switch {
 		case fi.Mode()&os.ModeSymlink != 0:
 			c.Keep = "symlink"
@@ -101,7 +102,11 @@ func ClassifyChildren(dir string, staleAfter time.Duration, refs []string, now t
 			c.Keep = fmt.Sprintf("modified %s ago, inside the %s floor", now.Sub(fi.ModTime()).Round(time.Minute), staleAfter)
 		}
 		if c.Keep != "symlink" {
-			c.Bytes, _ = size.PathSize(p)
+			var err error
+			c.Bytes, err = safefs.Measure(p)
+			if err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, c)
 	}

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/afterdarksys/oos/internal/config"
+	"github.com/afterdarksys/oos/internal/safefs"
 	"github.com/afterdarksys/oos/internal/size"
 )
 
@@ -98,7 +99,10 @@ func measure(path, kind string) (Bin, bool) {
 		b.Error = "not a real directory; refusing"
 		return b, true
 	}
-	b.Bytes, _ = size.PathSize(path)
+	b.Bytes, err = safefs.Measure(path)
+	if err != nil {
+		b.Error = err.Error()
+	}
 	b.Entries = count(path, kind)
 	return b, true
 }
@@ -164,6 +168,11 @@ func Allowed(path, home string, uid int) bool {
 // A symlink bin is refused. A symlink inside the bin is removed as a link.
 // A child on another device is left in place.
 func Empty(path, home string, uid int) (int64, int, error) {
+	return EmptyLimited(path, home, uid, nil)
+}
+
+// EmptyLimited shares the remaining run budget across trash bins.
+func EmptyLimited(path, home string, uid int, remaining *int64) (int64, int, error) {
 	if !Allowed(path, home, uid) {
 		return 0, 0, fmt.Errorf("refusing %s: not a trash bin", path)
 	}
@@ -175,7 +184,14 @@ func Empty(path, home string, uid int) (int64, int, error) {
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return 0, 0, fmt.Errorf("refusing %s: not a real directory", path)
 	}
-	bytes, _ := size.PathSize(path)
+	planned, err := safefs.Measure(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	if remaining != nil && planned > *remaining {
+		return 0, 0, fmt.Errorf("trash exceeds remaining deletion budget")
+	}
+	var bytes int64
 	kind := "home"
 	switch {
 	case strings.HasSuffix(path, string(filepath.Separator)+filepath.Join(".local", "share", "Trash")):
@@ -190,7 +206,7 @@ func Empty(path, home string, uid int) (int64, int, error) {
 	rootDev, have := size.DeviceOf(fi)
 	n := 0
 	for _, root := range roots {
-		ents, err := os.ReadDir(root)
+		ents, err := safefs.ReadDir(root)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -211,7 +227,9 @@ func Empty(path, home string, uid int) (int64, int, error) {
 					continue
 				}
 			}
-			if err := os.RemoveAll(child); err != nil {
+			removed, err := safefs.Remove(child, remaining)
+			bytes += removed
+			if err != nil {
 				return bytes, n, err
 			}
 			n++

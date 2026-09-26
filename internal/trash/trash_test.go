@@ -3,6 +3,7 @@ package trash
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -88,15 +89,41 @@ func TestLocateHomeAndVolume(t *testing.T) {
 	VolumeRoot = vols
 	t.Cleanup(func() { VolumeRoot = old })
 	testutil.Write(t, filepath.Join(home, ".Trash", "a"), 100)
+	testutil.Write(t, filepath.Join(home, ".local", "share", "Trash", "files", "a"), 100)
 	uid := os.Getuid()
 	testutil.Write(t, filepath.Join(vols, "Backup", ".Trashes", strconv.Itoa(uid), "b"), 200)
 	// a wrong uid is not this user's trash
 	testutil.Write(t, filepath.Join(vols, "Other", ".Trashes", strconv.Itoa(uid+1), "c"), 200)
 	bins := locate(home, uid)
+	if runtime.GOOS != "darwin" {
+		if len(bins) != 1 || bins[0].Kind != "freedesktop" || bins[0].Entries != 1 {
+			t.Fatalf("freedesktop bins: %+v", bins)
+		}
+		return
+	}
 	if len(bins) != 2 {
 		t.Fatalf("bins: %+v", bins)
 	}
 	if bins[0].Kind != "home" || bins[0].Entries != 1 || bins[1].Kind != "volume" || bins[1].Entries != 1 {
 		t.Fatalf("bins: %+v", bins)
+	}
+}
+
+func TestFreedesktopRefusesSymlinkFilesDirectory(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "share", "Trash")
+	outside := filepath.Join(home, "valuable")
+	testutil.Write(t, filepath.Join(outside, "data"), 4096)
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(bin, "files")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Empty(bin, home, os.Getuid()); err == nil {
+		t.Fatal("symlink files directory accepted")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "data")); err != nil {
+		t.Fatal(err)
 	}
 }

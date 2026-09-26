@@ -172,8 +172,11 @@ space before and after. The plan says up front what a removal returns
 the total) for destructive entries from 1 GB up.
 `--restore BATCH` moves everything back and refuses to overwrite anything
 that has reappeared. `--purge -y` removes batches older than
-`quarantine_days`; `--purge-now -y` removes all of them. A batch without a
-manifest is never auto-purged. Rename cannot cross filesystems, so an entry
+`quarantine_days`; `--purge-now -y` removes all of them. Batches with missing or incomplete manifests, pending moves, or unrecorded
+files are never auto-purged. Batch creation is exclusive; runs within the same
+second receive distinct names. Each move is journaled and synced before the
+rename. Restore recovers pending moves and preserves unrecorded data for manual
+inspection rather than deleting it. Rename cannot cross filesystems, so an entry
 on a different device from the quarantine dir is refused in the plan.
 
 ## Trash
@@ -186,7 +189,7 @@ permanently: the space comes back immediately, there is no `--restore`,
 and it is not quarantine. It is a dry-run unless `--yes`, it is refused
 when the total exceeds `max_delete_gb_per_run`, and a live run will not
 start unless the audit log can be opened. A symlink inside the bin is
-removed as a link. A child that is a mount point is left alone.
+removed as a link. Nested mount points cause a refusal; their contents are not deleted.
 
 ## Audit
 
@@ -212,6 +215,11 @@ what it measures, so the run after it is warm again with honest numbers;
 directories over 4 MB are stored, because a hit on a parent covers its
 children. On a 700 GB home directory a full audit went from 362 s cold to
 about 11 s warm.
+
+Cleanup plans and live deletion budgets bypass this cache. They use strict,
+fresh measurements and refuse unreadable trees instead of treating missing
+measurements as zero. The executor remeasures before acting and enforces the
+remaining budget while removing files.
 
 ## Filters, sorting and tags
 
@@ -446,6 +454,7 @@ internal/space/     macOS purgeable bytes and installer leftovers
 internal/trash/     the system trash, measured and emptied
 internal/guard/     the refusal rules and process/cwd/open-file references
 internal/plan/      plan building, the executor, quarantine
+internal/safefs/    strict filesystem walks, mount boundaries, bounded removal
 internal/state/     bigfile.json: sizes, scans, audits, free-space history
 internal/audit/     directory audits, tags, use-case breakdowns
 internal/docker/    docker system df and dangling volumes
@@ -481,9 +490,12 @@ adds paths. Deleting a hard-coded path from `oos.json`, clearing
 those. `softwareupdated`, the always-on daemon, is not treated as an
 install; `osinstallersetupd`, `InstallAssistant`, `startosinstall` and
 `installer` are. Then the run as a whole must fit the byte budget. Symlinks
-inside a directory are moved or unlinked as links, never followed. Sizes
-never cross onto another device, so a mounted volume inside a tree is not
-counted or touched. The config itself refuses nested destructive entries and
+inside a directory are moved or unlinked as links, never followed. Symlink
+ancestors are refused, except macOS's standard `/var`, `/tmp`, and `/etc`
+aliases. Removal uses directory handles and refuses nested mount boundaries;
+on Linux mount IDs also detect bind mounts sharing the same device. A tree
+containing a protected path is refused. Stale children have their references,
+age, and identity rechecked individually before removal. The config itself refuses nested destructive entries and
 any entry that overlaps the log, state or quarantine paths.
 
 ## State
@@ -510,3 +522,18 @@ be writable before a live run begins. The tests cover each refusal, the
 dry-run and symlink cases, stale classification and re-check, quarantine
 take, restore, partial restore, expiry and failed moves, diff, notification
 gating and agent file generation.
+
+## Filesystem validation and space estimates
+
+The cleanup layer uses allocated blocks and filesystem identity on macOS and
+Linux. Linux deletion also requires `/proc/self/fdinfo` mount IDs; if those
+cannot be read it refuses to act. The regression suite includes a Linux bind
+mount test, which skips when `CAP_SYS_ADMIN` is unavailable. Cross-building
+alone does not validate runtime behavior on HFS+, ext3/4, XFS, or Btrfs; these
+need disposable-volume integration runs on the target systems.
+
+Reclaimable bytes remain an estimate. Linux accounting deduplicates hardlinks
+within the measured set but does not detect XFS/Btrfs reflinks or snapshots;
+links outside the measured set can also retain blocks. Use the measured free
+space after cleanup to determine what was actually recovered. Deletion budgets
+use allocated bytes, never this reclaimable-space estimate.

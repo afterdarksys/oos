@@ -108,6 +108,9 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 			return Refuse("never_touch", "%s is under protected %s", path, nt)
 		}
 	}
+	if err := CheckRemovalPath(p, path, e.Home); err != nil {
+		return err
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return Refuse("stat", "%v", err)
@@ -171,4 +174,12 @@ func (e Env) installRunning() error {
 		return Refuse("install", "installer is running (%s); refusing to change the disk", cmd)
 	}
 	return nil
+}
+
+// CheckInstall applies run-wide installer guards before any disk mutation.
+func (e Env) CheckInstall() error {
+	if why, ok := protect.StagedInstall(); ok {
+		return Refuse("install", "macOS upgrade payload at %s", why)
+	}
+	return e.installRunning()
 }

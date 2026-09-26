@@ -787,7 +787,7 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
-	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: out, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home}
+	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: out, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env}
 	if cfg.Policy.Quarantine && !o.permanent {
 		q, err := plan.OpenQuarantine(cfg.Policy.QuarantineDir, now, os.Rename)
 		if err != nil {

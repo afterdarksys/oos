@@ -78,8 +78,26 @@ func TestMagicType(t *testing.T) {
 			t.Errorf("%s: typeOf = %q want %q", name, got, want)
 		}
 	}
-	// tiny files without an extension are not sniffed
-	if got := TypeOf(put("tiny", []byte("%PDF")), 4); got != "no extension" {
-		t.Errorf("tiny file should not be sniffed, got %q", got)
+	// a strong signature classifies an extensionless file of any size
+	if got := TypeOf(put("tiny", []byte("%PDF")), 4); got != "document" {
+		t.Errorf("tiny pdf: %q", got)
+	}
+	jpg := put("notes.jpg", []byte("%PDF-1.7"))
+	if got := TypeOf(jpg, 2<<20); got != "document" {
+		t.Errorf("a large file whose extension lies: %q", got)
+	}
+	if got := TypeOf(jpg, 4); got != "image" {
+		t.Errorf("a small file keeps its extension, got %q", got)
+	}
+	heic := put("noext-heic", []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'h', 'e', 'i', 'c'})
+	if got := TypeOf(heic, 2<<20); got != "image" {
+		t.Errorf("heic ftyp: %q", got)
+	}
+	mp4 := put("noext-mp4", []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2'})
+	if got := TypeOf(mp4, 2<<20); got != "video" {
+		t.Errorf("mp4 ftyp: %q", got)
+	}
+	if got := TypeOf(put("hello.txt", []byte{0x89, 'P', 'N', 'G'}), 32); got != "document" {
+		t.Errorf("small txt stays a document by extension, got %q", got)
 	}
 }

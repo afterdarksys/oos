@@ -23,13 +23,14 @@ import (
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/docker"
 	"github.com/afterdarksys/oos/internal/guard"
+	"github.com/afterdarksys/oos/internal/media"
 	"github.com/afterdarksys/oos/internal/plan"
 	"github.com/afterdarksys/oos/internal/size"
 	"github.com/afterdarksys/oos/internal/space"
 	"github.com/afterdarksys/oos/internal/state"
 )
 
-const Version = "0.6.2"
+const Version = "0.7.0"
 
 type opts struct {
 	check, known, cleanup, show, diff, quick, yes, no, jsonOut, verbose bool
@@ -652,6 +653,15 @@ func doScan(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) int
 		func(i int) time.Time { return hits[i].ModTime },
 		func(i int) string { return hits[i].Path }))
 	hits = hits[:size.CapRows(len(hits), f.Top, cfg.Policy.ScanTopN)]
+	for i := range hits {
+		if size.TypeOf(hits[i].Path, hits[i].Bytes) != "image" {
+			continue
+		}
+		if info, ok := media.Read(hits[i].Path); ok {
+			hits[i].Taken = info.TakenString()
+			hits[i].Device = info.Device
+		}
+	}
 	st, _ := state.Load(cfg.Policy.StateFile)
 	st.BigFiles = hits
 	st.ScanRoot = root
@@ -668,7 +678,14 @@ func doScan(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) int
 	}
 	fmt.Fprintf(out, "big files under %s (>= %d MB, %d shown%s):\n", root, minMB, len(hits), f.Describe())
 	for _, h := range hits {
-		fmt.Fprintf(out, "  %9s  %s  %s\n", size.Human(h.Bytes), h.ModTime.Format("2006-01-02"), h.Path)
+		extra := ""
+		if h.Taken != "" {
+			extra += "  taken " + h.Taken
+		}
+		if h.Device != "" {
+			extra += "  " + h.Device
+		}
+		fmt.Fprintf(out, "  %9s  %s  %s%s\n", size.Human(h.Bytes), h.ModTime.Format("2006-01-02"), h.Path, extra)
 	}
 	fmt.Fprintf(out, "recorded %d files in %s\n", len(hits), cfg.Policy.StateFile)
 	return status.ExitOK

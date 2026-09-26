@@ -216,74 +216,96 @@ func init() {
 	add("font", "ttf", "otf", "woff", "woff2", "eot")
 }
 
-// magicType sniffs a file whose extension said nothing. Cheap: one read of
-// the first 512 bytes plus the tar magic at offset 257.
-func magicType(path string) string {
+// sniff reads the first 512 bytes. strong is a signature (a JPEG, a PDF);
+// a guess from "this looks like text" is not strong and must not override
+// a known extension.
+func sniff(path string) (cat string, strong bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return "", false
 	}
 	defer f.Close()
 	head := make([]byte, 512)
 	n, _ := f.Read(head)
 	head = head[:n]
 	if n < 4 {
-		return ""
+		return "", false
 	}
 	switch {
 	case bytes.HasPrefix(head, []byte{0x1f, 0x8b}):
-		return "archive"
+		return "archive", true
 	case bytes.HasPrefix(head, []byte("PK\x03\x04")), bytes.HasPrefix(head, []byte("7z\xBC\xAF\x27\x1C")), bytes.HasPrefix(head, []byte("Rar!")), bytes.HasPrefix(head, []byte{0xFD, '7', 'z', 'X', 'Z', 0}), bytes.HasPrefix(head, []byte("BZh")), bytes.HasPrefix(head, []byte{0x28, 0xB5, 0x2F, 0xFD}):
-		return "archive"
+		return "archive", true
 	case n > 262 && string(head[257:262]) == "ustar":
-		return "archive"
+		return "archive", true
 	case bytes.HasPrefix(head, []byte("%PDF")):
-		return "document"
+		return "document", true
 	case bytes.HasPrefix(head, []byte("SQLite format 3")):
-		return "database"
+		return "database", true
 	case bytes.HasPrefix(head, []byte{0x7f, 'E', 'L', 'F'}), bytes.HasPrefix(head, []byte{0xCF, 0xFA, 0xED, 0xFE}), bytes.HasPrefix(head, []byte{0xCA, 0xFE, 0xBA, 0xBE}), bytes.HasPrefix(head, []byte("MZ")):
-		return "binary"
+		return "binary", true
 	case bytes.HasPrefix(head, []byte{0x89, 'P', 'N', 'G'}), bytes.HasPrefix(head, []byte{0xFF, 0xD8, 0xFF}), bytes.HasPrefix(head, []byte("GIF8")), bytes.HasPrefix(head, []byte("RIFF")) && n >= 12 && string(head[8:12]) == "WEBP":
-		return "image"
+		return "image", true
 	case n >= 12 && string(head[4:8]) == "ftyp":
-		return "video"
+		return ftypKind(string(head[8:12])), true
 	case bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}):
-		return "video"
+		return "video", true
 	case bytes.HasPrefix(head, []byte("ID3")), bytes.HasPrefix(head, []byte("fLaC")), bytes.HasPrefix(head, []byte("OggS")), bytes.HasPrefix(head, []byte("RIFF")) && n >= 12 && string(head[8:12]) == "WAVE":
-		return "audio"
+		return "audio", true
 	case bytes.HasPrefix(head, []byte("koly")):
-		return "disk image"
+		return "disk image", true
 	}
-	// text vs binary: a NUL in the first 512 bytes means binary
 	if bytes.IndexByte(head, 0) >= 0 {
-		return "binary"
+		return "binary", false
 	}
 	sc := bufio.NewScanner(bytes.NewReader(head))
 	if sc.Scan() {
 		line := sc.Text()
-		if strings.HasPrefix(line, "#!") {
-			return "source"
-		}
-		if len(line) > 0 && (line[0] == '{' || line[0] == '[') {
-			return "source"
+		if strings.HasPrefix(line, "#!") || (len(line) > 0 && (line[0] == '{' || line[0] == '[')) {
+			return "source", false
 		}
 	}
-	return "text"
+	return "text", false
 }
 
-// TypeOf classifies a file by extension, then by magic when the extension
-// says nothing and the file is big enough to matter.
+// ftypKind reads the ISO brand after an "ftyp" box. HEIC and AVIF are
+// images; everything else in that family is treated as video.
+func ftypKind(brand string) string {
+	switch brand {
+	case "heic", "heix", "hevc", "hevx", "heim", "heis", "heif", "mif1", "msf1", "avif":
+		return "image"
+	case "M4A ", "mp4a":
+		return "audio"
+	default:
+		return "video"
+	}
+}
+
+// TypeOf classifies a file by extension, then by magic. A strong signature
+// wins over a contradictory extension once the file is at least 1 MB, and
+// it classifies an extensionless file of any size. A text-or-binary guess
+// never overrides an extension, and it is only used for an extensionless
+// file of at least 1 MB.
 func TypeOf(path string, size int64) string {
 	e := ExtOf(path)
+	extType := ""
 	if e != "" {
 		if t, ok := fileTypes[e]; ok {
-			return t
+			extType = t
 		}
 	}
-	if size >= 1<<20 {
-		if t := magicType(path); t != "" {
-			return t
+	if extType == "" || size >= 1<<20 {
+		if cat, strong := sniff(path); cat != "" {
+			if extType == "" && (strong || size >= 1<<20) {
+				return cat
+			}
+			if extType != "" && strong && cat != extType {
+				return cat
+			}
 		}
+	}
+	if extType != "" {
+		return extType
 	}
 	if e == "" {
 		return "no extension"

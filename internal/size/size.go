@@ -92,11 +92,14 @@ func PathSizeWalk(root string) (int64, error) {
 	return total, err
 }
 
-// BigFile is one scan hit.
+// BigFile is one scan hit. Taken and Device come from picture metadata
+// when the file has it. They are labels; nothing decides a deletion from them.
 type BigFile struct {
 	Path    string    `json:"path"`
 	Bytes   int64     `json:"bytes"`
 	ModTime time.Time `json:"mtime"`
+	Taken   string    `json:"taken,omitempty"`
+	Device  string    `json:"device,omitempty"`
 }
 
 // ScanBig lists regular files under root with at least minBytes allocated,

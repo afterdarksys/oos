@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/afterdarksys/oos/internal/media"
 	"github.com/afterdarksys/oos/internal/size"
 )
 
@@ -33,6 +34,7 @@ type Row struct {
 	Type     string    `json:"type"`
 	Verdicts []string  `json:"verdicts,omitempty"`
 	Detail   string    `json:"detail,omitempty"` // the app, original or folder a verdict refers to
+	Shot     string    `json:"shot,omitempty"`   // capture time and camera, when the file has them
 }
 
 // Result is the whole report.
@@ -163,6 +165,11 @@ func Scan(root, home string, f size.Filter, now time.Time) (*Result, error) {
 		} else {
 			r.Bytes = size.Allocated(fi)
 			r.Type = size.TypeOf(p, r.Bytes)
+			if r.Type == "image" {
+				if info, ok := media.Read(p); ok {
+					r.Shot = shotLine(info)
+				}
+			}
 		}
 		sizes[r.Name] = r.Bytes
 		rows = append(rows, r)
@@ -234,6 +241,18 @@ func judge(r *Row, names map[string]bool, sizes map[string]int64, apps map[strin
 	}
 }
 
+func shotLine(info media.Info) string {
+	s := info.TakenString()
+	switch {
+	case s != "" && info.Device != "":
+		return "taken " + s + "  " + info.Device
+	case s != "":
+		return "taken " + s
+	default:
+		return info.Device
+	}
+}
+
 // Print is the human report.
 func Print(out *strings.Builder, res *Result, now time.Time, verbose bool, top int) {
 	n := len(res.Rows)
@@ -258,6 +277,9 @@ func Print(out *strings.Builder, res *Result, now time.Time, verbose bool, top i
 		fmt.Fprintf(out, "  %9s  %4dd  %-12s %-22s %s\n", size.Human(r.Bytes), int(now.Sub(r.ModTime).Hours()/24), r.Type, v, r.Name)
 		if r.Detail != "" {
 			fmt.Fprintf(out, "                                                     %s\n", r.Detail)
+		}
+		if r.Shot != "" {
+			fmt.Fprintf(out, "                                                     %s\n", r.Shot)
 		}
 	}
 	keys := make([]string, 0, len(res.ByVerdict))

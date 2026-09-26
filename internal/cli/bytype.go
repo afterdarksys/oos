@@ -8,6 +8,7 @@ import (
 
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/guard"
+	"github.com/afterdarksys/oos/internal/media"
 	"github.com/afterdarksys/oos/internal/size"
 	"github.com/afterdarksys/oos/internal/status"
 )
@@ -32,6 +33,19 @@ func doByType(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, er
 		fmt.Fprintf(errw, "oos: by-type %s: %v\n", root, err)
 		return status.ExitUsage
 	}
+	for i := range rows {
+		if rows[i].Type != "image" {
+			continue
+		}
+		for j := range rows[i].Largest {
+			info, ok := media.Read(rows[i].Largest[j].Path)
+			if !ok {
+				continue
+			}
+			rows[i].Largest[j].Taken = info.TakenString()
+			rows[i].Largest[j].Device = info.Device
+		}
+	}
 	rows = rows[:size.CapRows(len(rows), f.Top, 0)]
 	if o.jsonOut {
 		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "total_bytes": total, "types": rows})
@@ -49,7 +63,14 @@ func doByType(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, er
 		}
 		fmt.Fprintf(out, "  %9s  %5.1f%%  %7d files  %s\n", size.Human(r.Bytes), pct, r.Files, r.Type)
 		for _, b := range r.Largest {
-			fmt.Fprintf(out, "                 %9s  %s  %s\n", size.Human(b.Bytes), b.ModTime.Format("2006-01-02"), b.Path)
+			extra := ""
+			if b.Taken != "" {
+				extra += "  taken " + b.Taken
+			}
+			if b.Device != "" {
+				extra += "  " + b.Device
+			}
+			fmt.Fprintf(out, "                 %9s  %s  %s%s\n", size.Human(b.Bytes), b.ModTime.Format("2006-01-02"), b.Path, extra)
 		}
 	}
 	return status.ExitOK

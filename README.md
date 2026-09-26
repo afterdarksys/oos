@@ -223,7 +223,12 @@ matches every compound that ends in it); `--sort size|oldest|newest|name`
 and `--top N` order and cap the rows. `--by-type DIR` buckets every
 regular file by category (disk image, archive, package, video, audio,
 image, document, log, database, binary, model, source, font) from its
-extension, sniffing the first bytes of anything over 1 MB that has none.
+extension. A strong signature classifies an extensionless file of any
+size, and on a file of at least 1 MB it wins when the extension
+disagrees; HEIC and AVIF count as images. A text-or-binary guess never
+overrides an extension. `--scan`, `--by-type` and `--downloads` add the
+capture time and camera when a picture carries EXIF. That label is not
+used to decide a deletion.
 
 Tags are labels. An entry carries the ones you give it (`--add --tags`,
 or `tags` in the config), and `--check`, `--known` and `--cleanup` narrow
@@ -434,6 +439,10 @@ cmd/oos/            the binary: three lines that call cli.Run
 internal/cli/       flags, every command, all human-facing output
 internal/config/    oos.json shape, policy, entries, owners, attribution, validation
 internal/size/      statfs, allocated sizes, the size cache, filters, file types
+internal/media/     picture capture time and camera, from EXIF
+internal/appsafety/ which application data regenerates and which does not
+internal/space/     macOS purgeable bytes and installer leftovers
+internal/trash/     the system trash, measured and emptied
 internal/guard/     the refusal rules and process/cwd/open-file references
 internal/plan/      plan building, the executor, quarantine
 internal/state/     bigfile.json: sizes, scans, audits, free-space history

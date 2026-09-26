@@ -34,7 +34,7 @@ func Files(home, exe string) map[string]string {
   <key>StandardErrorPath</key><string>%s/agent.log</string>
 </dict>
 </plist>
-`, agentLabel, exe, logDir, logDir)
+`, agentLabel, XMLText(exe), XMLText(logDir), XMLText(logDir))
 	return map[string]string{plist: content}
 }
 

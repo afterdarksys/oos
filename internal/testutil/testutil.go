@@ -47,5 +47,22 @@ func Age(t *testing.T, p string, d time.Duration) {
 	}
 }
 
+// AgeTree sets the mtime of p and everything under it d into the past.
+// Staleness looks at the newest time in a subtree, so aging the top alone
+// leaves it fresh. Symlinks are skipped: Chtimes would follow them.
+func AgeTree(t *testing.T, p string, d time.Duration) {
+	t.Helper()
+	when := time.Now().Add(-d)
+	err := filepath.WalkDir(p, func(q string, de os.DirEntry, err error) error {
+		if err != nil || de.Type()&os.ModeSymlink != 0 {
+			return err
+		}
+		return os.Chtimes(q, when, when)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // NoProcs is a process lister that sees nothing.
 func NoProcs() ([]string, error) { return nil, nil }

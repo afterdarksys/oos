@@ -26,7 +26,7 @@ func TestStaleKeepsChildrenOfRealProcesses(t *testing.T) {
 	dir := filepath.Join(home, "a", "archive")
 	for _, n := range []string{"bycmd", "bycwd", "byfd", "orphan"} {
 		testutil.Write(t, filepath.Join(dir, n, "f"), 16)
-		testutil.Age(t, filepath.Join(dir, n), 48*time.Hour)
+		testutil.AgeTree(t, filepath.Join(dir, n), 48*time.Hour)
 	}
 	start := func(name string, args ...string) *exec.Cmd {
 		c := exec.Command(name, args...)

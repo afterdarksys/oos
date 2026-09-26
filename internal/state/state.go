@@ -3,10 +3,13 @@ package state
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/afterdarksys/oos/internal/audit"
 	"github.com/afterdarksys/oos/internal/size"
@@ -30,6 +33,10 @@ type State struct {
 	AuditRoot string           `json:"audit_root,omitempty"`
 	AuditedAt time.Time        `json:"audited_at,omitempty"`
 	History   []HistoryPoint   `json:"history"`
+
+	// loadErr is set when the file exists but could not be read; Save refuses
+	// such a state so an empty stand-in never overwrites the real history.
+	loadErr error
 }
 
 type HistoryPoint struct {
@@ -38,13 +45,16 @@ type HistoryPoint struct {
 	Event  string    `json:"event"`
 }
 
+// Load reads the state file. It always returns a usable *State: on a read
+// error other than not-exist the state is empty, the error is returned too,
+// and Save refuses to write that empty state back over the unreadable file.
 func Load(path string) (*State, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return &State{Known: map[string]int64{}}, nil
 	}
 	if err != nil {
-		return nil, err
+		return &State{Known: map[string]int64{}, loadErr: err}, err
 	}
 	var s State
 	if err := json.Unmarshal(b, &s); err != nil {
@@ -58,8 +68,12 @@ func Load(path string) (*State, error) {
 	return &s, nil
 }
 
-// Save writes atomically: temp file then rename.
+// Save writes atomically: a unique temp file, fsync, rename, fsync the
+// directory. A state whose Load failed is never written.
 func Save(path string, s *State) error {
+	if s.loadErr != nil {
+		return fmt.Errorf("state %s was unreadable, not overwriting it: %w", path, s.loadErr)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -71,11 +85,68 @@ func Save(path string, s *State) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	return writeAtomic(path, b)
+}
+
+func writeAtomic(path string, b []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer os.Remove(f.Name())
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// Update is load-modify-save under an exclusive flock on path+".lock", so the
+// daemon, the agent and the CLI do not lose each other's writes. When the
+// file cannot be read, fn is not applied, nothing is written, and the
+// returned state is an empty stand-in alongside the error.
+func Update(path string, fn func(*State)) (*State, error) {
+	if path == "" {
+		return &State{Known: map[string]int64{}}, errors.New("no state file configured")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return &State{Known: map[string]int64{}}, err
+	}
+	lf, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return &State{Known: map[string]int64{}}, err
+	}
+	defer lf.Close()
+	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+		return &State{Known: map[string]int64{}}, err
+	}
+	defer unix.Flock(int(lf.Fd()), unix.LOCK_UN)
+	s, err := Load(path)
+	if err != nil {
+		return s, err
+	}
+	fn(s)
+	return s, Save(path, s)
 }
 
 func (s *State) Record(event string, du size.DiskUsage, now time.Time) {

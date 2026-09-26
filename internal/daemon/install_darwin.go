@@ -13,7 +13,9 @@ import (
 
 const label = "com.afterdarksys.oos.daemon"
 
-// Files returns the LaunchAgent that keeps the daemon running.
+// Files returns the LaunchAgent that keeps the daemon running. launchd
+// restarts it only after a failing exit, at most once a minute; a clean
+// stop (SIGTERM at logout, --uninstall-daemon) stays stopped.
 func Files(home, exe string, system bool) map[string]string {
 	plist := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
 	logDir := filepath.Join(home, ".local", "state", "oos")
@@ -27,14 +29,19 @@ func Files(home, exe string, system bool) map[string]string {
     <string>%s</string>
     <string>--daemon</string>
   </array>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>RunAtLoad</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>10</integer>
   <key>StandardOutPath</key><string>%s/daemon.log</string>
   <key>StandardErrorPath</key><string>%s/daemon.log</string>
 </dict>
 </plist>
-`, label, exe, logDir, logDir)
+`, label, agent.XMLText(exe), agent.XMLText(logDir), agent.XMLText(logDir))
 	return map[string]string{plist: content}
 }
 

@@ -19,7 +19,9 @@ func unitDir(home string, system bool) string {
 	return filepath.Join(home, ".config", "systemd", "user")
 }
 
-// Files returns the systemd service that keeps the daemon running.
+// Files returns the systemd service that keeps the daemon running. It is
+// restarted only after a failure, and gives up after five failures in ten
+// minutes so a permanent error does not loop forever.
 func Files(home, exe string, system bool) map[string]string {
 	hardening := ""
 	if system {
@@ -33,16 +35,20 @@ NoNewPrivileges=yes
 	service := fmt.Sprintf(`[Unit]
 Description=oos disk watcher daemon
 After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=%s --daemon
-Restart=always
+Restart=on-failure
 RestartSec=10
+Nice=10
+IOSchedulingClass=idle
 %s
 [Install]
 WantedBy=default.target
-`, exe, hardening)
+`, agent.SystemdQuote(exe), hardening)
 	return map[string]string{filepath.Join(unitDir(home, system), unit): service}
 }
 

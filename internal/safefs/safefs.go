@@ -2,7 +2,9 @@
 package safefs
 
 import (
+	"context"
 	"fmt"
+	"github.com/afterdarksys/oos/internal/worklimit"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,19 +105,31 @@ func entries(r *os.Root) ([]os.DirEntry, error) {
 
 // Measure fails on unreadable trees or nested mounts instead of undercounting.
 // The selected root may itself be a volume; descendants may not be mounts.
-func Measure(path string) (int64, error) {
+func Measure(path string) (int64, error) { return MeasureContext(context.Background(), path) }
+
+func MeasureContext(ctx context.Context, path string) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	parent, err := OpenDir(filepath.Dir(path))
 	if err != nil {
 		return 0, err
 	}
 	defer parent.Close()
-	return walk(parent, filepath.Base(path), nil, nil, false)
+	return walkContext(ctx, parent, filepath.Base(path), nil, nil, false)
 }
 
 // Remove removes a single child tree. It refuses mounted roots as well as
 // nested mounts, checks the remaining budget at each unlink, and never chmods
 // regular files (which may have hardlinks outside the removal tree).
 func Remove(path string, remaining *int64) (int64, error) {
+	return RemoveContext(context.Background(), path, remaining)
+}
+
+func RemoveContext(ctx context.Context, path string, remaining *int64) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	parent, err := OpenDir(filepath.Dir(path))
 	if err != nil {
 		return 0, err
@@ -125,10 +139,16 @@ func Remove(path string, remaining *int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return walk(parent, filepath.Base(path), &boundary, remaining, true)
+	return walkContext(ctx, parent, filepath.Base(path), &boundary, remaining, true)
 }
 
 func walk(parent *os.Root, name string, boundary *mountIdentity, remaining *int64, remove bool) (int64, error) {
+	return walkContext(context.Background(), parent, name, boundary, remaining, remove)
+}
+func walkContext(ctx context.Context, parent *os.Root, name string, boundary *mountIdentity, remaining *int64, remove bool) (int64, error) {
+	if err := worklimit.Step(ctx); err != nil {
+		return 0, err
+	}
 	fi, err := parent.Lstat(name)
 	if err != nil {
 		return 0, err
@@ -163,7 +183,7 @@ func walk(parent *os.Root, name string, boundary *mountIdentity, remaining *int6
 			return 0, err
 		}
 		for _, de := range ents {
-			n, err := walk(child, de.Name(), &id, remaining, remove)
+			n, err := walkContext(ctx, child, de.Name(), &id, remaining, remove)
 			total += n
 			if err != nil {
 				return total, err
@@ -183,6 +203,9 @@ func walk(parent *os.Root, name string, boundary *mountIdentity, remaining *int6
 	if remove {
 		if remaining != nil && b > *remaining {
 			return total, fmt.Errorf("deletion budget exhausted at %s/%s", parent.Name(), name)
+		}
+		if err := ctx.Err(); err != nil {
+			return total, err
 		}
 		if err := parent.Remove(name); err != nil {
 			return total, err

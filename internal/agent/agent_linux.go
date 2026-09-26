@@ -36,7 +36,7 @@ Description=oos disk headroom check
 [Service]
 Type=oneshot
 ExecStart=%s --agent-tick
-%s`, exe, hardening)
+%s`, SystemdQuote(exe), hardening)
 	timer := `[Unit]
 Description=oos hourly disk headroom check
 

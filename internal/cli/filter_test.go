@@ -245,7 +245,7 @@ func TestEntryTagsFilterAndAdd(t *testing.T) {
 		t.Errorf("check honours --tag:\n%s", out.String())
 	}
 	out.Reset()
-	doShow(cfg, "test", &opts{}, &out)
+	doShow(cfg, "test", &opts{}, &out, &out)
 	if !strings.Contains(out.String(), "[Build-Output]") {
 		t.Errorf("show prints tags:\n%s", out.String())
 	}

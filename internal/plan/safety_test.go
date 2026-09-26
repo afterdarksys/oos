@@ -159,7 +159,7 @@ func TestQuarantineIntentSurvivesInterruptedMove(t *testing.T) {
 	if bs, _ := ListBatches(dir); len(bs) != 1 || bs[0].Count != -1 {
 		t.Fatalf("pending batch eligible for purge: %+v", bs)
 	}
-	if _, names, err := PurgeBatches(dir, 0, now.Add(time.Hour), false); err != nil || len(names) != 0 {
+	if _, names, err := PurgeBatches(dir, 0, now.Add(time.Hour), false, false); err != nil || len(names) != 0 {
 		t.Fatalf("pending batch purged: %v %v", names, err)
 	}
 	n, _, err := RestoreBatch(dir, q.Batch, nil)
@@ -222,7 +222,7 @@ func TestStaleRefreshesReferencesForEveryChild(t *testing.T) {
 	dir := filepath.Join(home, "cache")
 	for _, name := range []string{"a", "b"} {
 		testutil.Write(t, filepath.Join(dir, name, "data"), 4096)
-		testutil.Age(t, filepath.Join(dir, name), 48*time.Hour)
+		testutil.AgeTree(t, filepath.Join(dir, name), 48*time.Hour)
 	}
 	cfg := &config.Config{Home: home, Policy: testutil.PolicyFor(home), KnownDirs: []config.Entry{{Path: dir, Action: config.ActionRmStaleChilds, StaleAfterHours: 24}}}
 	items := Build(cfg, guard.Env{Home: home, Procs: testutil.NoProcs}, nil, time.Now())
@@ -255,17 +255,17 @@ func TestStaleRechecksAgeAndIdentity(t *testing.T) {
 			dir := filepath.Join(home, "cache")
 			child := filepath.Join(dir, "old")
 			testutil.Write(t, filepath.Join(child, "data"), 4096)
-			testutil.Age(t, child, 48*time.Hour)
+			testutil.AgeTree(t, child, 48*time.Hour)
 			cfg := &config.Config{Home: home, Policy: testutil.PolicyFor(home), KnownDirs: []config.Entry{{Path: dir, Action: config.ActionRmStaleChilds, StaleAfterHours: 24}}}
 			items := Build(cfg, guard.Env{Home: home, Procs: testutil.NoProcs}, nil, time.Now())
 			if change == "age" {
-				testutil.Age(t, child, time.Minute)
+				testutil.AgeTree(t, child, time.Minute)
 			} else {
 				if err := os.Rename(child, filepath.Join(home, "original")); err != nil {
 					t.Fatal(err)
 				}
 				testutil.Write(t, filepath.Join(child, "valuable"), 4096)
-				testutil.Age(t, child, 48*time.Hour)
+				testutil.AgeTree(t, child, 48*time.Hour)
 			}
 			x := Executor{Home: home, Policy: cfg.Policy, Now: time.Now, Refs: testutil.NoProcs}
 			if _, err := x.Execute(items); err != nil {
@@ -315,13 +315,16 @@ func TestPurgePreservesUnrecordedDataUnlessExplicit(t *testing.T) {
 	}
 	unknown := filepath.Join(q.batchDir(), "unrecorded")
 	testutil.Write(t, unknown, 4096)
-	if _, names, err := PurgeBatches(dir, 0, now, false); err != nil || len(names) != 0 {
+	if _, names, err := PurgeBatches(dir, 0, now, false, false); err != nil || len(names) != 0 {
 		t.Fatalf("auto-purge: %v %v", names, err)
+	}
+	if _, names, err := PurgeBatches(dir, 0, now, true, false); err != nil || len(names) != 0 {
+		t.Fatalf("purge-all without include-held: %v %v", names, err)
 	}
 	if _, err := os.Stat(unknown); err != nil {
 		t.Fatal(err)
 	}
-	if _, names, err := PurgeBatches(dir, 0, now, true); err != nil || len(names) != 1 {
+	if _, names, err := PurgeBatches(dir, 0, now, true, true); err != nil || len(names) != 1 {
 		t.Fatalf("explicit purge: %v %v", names, err)
 	}
 }

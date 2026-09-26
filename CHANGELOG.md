@@ -2,11 +2,48 @@
 
 ## Unreleased
 
+Safety review: every path a cleanup, restore, purge or the daemon can take
+was reviewed for data loss, OS/boot damage and integrity, and fixed below.
+
+### Changed (read before upgrading)
+- `allow_commands` now defaults to false. Enable it in your config if you rely on `command` entries.
+- `oos.json` in the working directory is no longer loaded; pass it with `--config`.
+- `--purge-now --yes` keeps held batches and says why; add `--include-held` to delete them too.
+- The Linux default's `/var/lib/docker` command entry is now `never`. On macOS, the default `/Library/Developer/CoreSimulator` and Docker `vms/0/data` command entries are refused by the home and `never_touch` rules and show as refused in plans.
+
+### Security
+- A config file (explicit or default) must be owned by the effective user and not group/other-writable; the check is made on the opened file. `--add`/`--forget` refuse such files too.
+- Command entries must pass the home, `never_touch` and protected-path rules. The command-text scan is case-insensitive, drops quotes, expands `$HOME`/`${HOME}`/`~`/`~user`, cleans `.`, `..` and `//`, reads `/private/...` and `/System/Volumes/Data/...` spellings, checks `never_touch`, and refuses a command naming `/` or the home itself (`rm -rf /`, `find / -delete`, `rm -rf ~/*`). It remains advisory.
+- The built-in protected list grew and is per-platform: macOS `/Library` system state (Keychains, LaunchDaemons, LaunchAgents, Preferences, Extensions, TCC), `/Applications`, `/private/etc`, `/private/var/{db,root,vm,protected}`, Preboot/Recovery, iCloud Drive, CloudStorage, Mail, Messages, MobileSync backups, Photos libraries; Linux `/efi`, `/var/lib`, `/opt`, `/proc`, `/sys`, `/dev`, `/run`, `/root`, `/snap`, `/nix`, keyrings; credential stores (`.netrc`, `.git-credentials`, `.docker`, `.password-store`, gcloud, azure, gh) on both.
+- Restore re-applies removal-time protections (always_disallowed, never_touch, home/allow_outside_home) to every manifest target before writing anything, refuses stores owned by another uid, and recreates missing parents 0700.
+- Every removal refuses paths that overlap oos's own quarantine stores, state, log, size cache or mutation lock, through case and inode aliases.
+- Daemon alerts pass their text to `osascript` as arguments, so a file name can no longer inject AppleScript.
+
 ### Fixed
+- Staleness uses the newest mtime/ctime anywhere in a child's subtree (bounded, no symlinks, no mount crossing); a walk that fails keeps the child. The execution recheck uses the same rule.
+- `rm-contents` keeps children a running process references and refuses the entry when references cannot be listed.
+- Linux package managers and `softwareupdate` freeze disk changes; `--empty-trash` checks for a running install first.
+- Quarantine expiry ignores a source path recreated after quarantine (apps recreate caches at once); only a pending, missing, changed or unrecorded quarantined object holds a batch. Restore still refuses to overwrite a recreated path.
+- A take aborted by cancellation or a changed source rolls back its journal intent instead of pinning the batch. Stale `.manifest-*` temps left by a crash no longer hold a batch.
+- Purge renames a batch to a `.purging-` tombstone before deleting it; a later purge finishes interrupted deletions.
+- An unreadable state file no longer crashes the daemon and agent into a restart loop; it is reported and never overwritten. A panicking tick is recovered. launchd uses `KeepAlive {SuccessfulExit=false}` and systemd `Restart=on-failure` with a start limit; both run at background priority.
+- SIGTERM at logout/shutdown reaches ensure, which stops at a safe point. The auto-act cooldown survives a restart; a busy mutation lock is not counted as a failure.
+- A second daemon exits cleanly instead of running as a duplicate. The socket path is only removed when it is a socket.
+- Installed agents and daemons record the stable `oos` path, not the versioned Homebrew Cellar path, so `brew upgrade` no longer breaks them; plist values are XML-escaped and systemd `ExecStart` is quoted.
+- State and size-cache writes use a unique temp file, fsync and rename; read-modify-write of state holds a lock, so concurrent CLI/daemon/agent runs cannot tear or lose them.
+- `--ensure` and daemon auto-act steps and log lines say "permanently deleted"; the dry-run counts only expired batches.
 - Refuse symlink ancestors and removal trees containing protected paths; use directory handles and mount checks for deletion, including Linux bind mounts and trash emptying. Read-only cleanup no longer changes permissions on hardlinked regular files.
-- Bypass cached sizes for destructive planning and remeasure before execution; enforce the remaining budget during removal and across ensure steps. Recheck live guards and each stale child’s references, age, and identity. Report execution and audit-write failures.
-- Allocate quarantine batches exclusively, persist move intent before rename, recover pending moves, and preserve unrecorded files on restore/discard. Automatic expiry excludes incomplete batches.
+- Bypass cached sizes for destructive planning and remeasure before execution; enforce the remaining budget during removal and across ensure steps. Recheck live guards and each stale child's references, age, and identity. Report execution and audit-write failures.
+- Allocate quarantine batches exclusively, persist move intent before rename, recover pending moves, and preserve unrecorded files on restore/discard.
 - Open and verify the audit log before ensure purges, include expiry in its deletion budget, and measure actual free space after purging.
+
+### Filesystem integrity
+- Serialize cooperating cleanup writers and use atomic no-overwrite quarantine/restore moves.
+- Add checksummed v2 journals, identity checks, optional content hashes, read-only verification and metadata-only recovery.
+- Support explicitly configured per-volume quarantine stores and a central index.
+- Replace unsafe APFS first-block clone inference with conservative accounting (the first-block behavior described under 0.6.2 is superseded); add bounded Linux FIEMAP probes and filesystem diagnostics.
+- Add cooperative cancellation, scan/read limits, per-filesystem concurrency and a persisted daemon recovery brake.
+- Add a disposable Linux VM fixture and crash-checkpoint tests, isolated behind guest markers and build tags. Runtime filesystem/power-loss validation is still pending.
 
 ## [0.7.1] - 2026-09-26
 

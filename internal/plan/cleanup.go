@@ -1,9 +1,10 @@
 package plan
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
+	"github.com/afterdarksys/oos/internal/worklimit"
 	"io"
 	"os"
 	"os/exec"
@@ -32,6 +33,7 @@ type Item struct {
 	Deletable   int64             // what a live run would remove, as recorded
 	Reclaimable int64             // what the volume gets back; Deletable unless blocks are shared
 	Children    []guard.ChildPlan // rm-stale-children only
+	Accounting  *size.Accounting  `json:"accounting,omitempty"`
 	Info        os.FileInfo       `json:"-"` // identity at planning time
 	Refused     error             // non-nil means oos will not act on this entry
 }
@@ -44,16 +46,46 @@ func Build(cfg *config.Config, env guard.Env, types []string, now time.Time) []I
 
 // BuildTagged is buildPlan narrowed to entries carrying tag ("" = all).
 func BuildTagged(cfg *config.Config, env guard.Env, types []string, tag string, now time.Time) []Item {
+	ctx, cancel := context.WithTimeout(env.Context(), cfg.Policy.OperationTimeout())
+	defer cancel()
+	ctx = worklimit.With(ctx, cfg.Policy.EntryBudget(), cfg.Policy.VerificationBudget())
+	env.Ctx = ctx
 	ents := cfg.EntriesTagged(types, tag)
 	items := make([]Item, len(ents))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, 16)
+	volumeSlots := map[uint64]chan struct{}{}
+	for _, e := range ents {
+		dev, _ := deviceOfPath(e.Path)
+		if volumeSlots[dev] == nil {
+			volumeSlots[dev] = make(chan struct{}, cfg.Policy.Workers())
+		}
+	}
 	for i, e := range ents {
 		wg.Add(1)
 		go func(i int, e config.Entry) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				items[i] = Item{Entry: e, Refused: ctx.Err()}
+				return
+			}
 			defer func() { <-sem }()
+			dev, _ := deviceOfPath(e.Path)
+			slot := volumeSlots[dev]
+			// A disappearing/changing device is refused instead of waiting on nil.
+			if slot == nil {
+				items[i] = Item{Entry: e, Refused: fmt.Errorf("device changed during planning")}
+				return
+			}
+			select {
+			case slot <- struct{}{}:
+			case <-ctx.Done():
+				items[i] = Item{Entry: e, Refused: ctx.Err()}
+				return
+			}
+			defer func() { <-slot }()
 			items[i] = planItem(cfg, env, e, now)
 		}(i, e)
 	}
@@ -96,7 +128,7 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 			it.Bytes, _ = size.PathSize(e.Path)
 			return it
 		}
-		children, err := guard.ClassifyChildren(e.Path, time.Duration(e.StaleAfterHours)*time.Hour, refs, now)
+		children, err := guard.ClassifyChildrenContext(env.Context(), e.Path, time.Duration(e.StaleAfterHours)*time.Hour, refs, now)
 		if err != nil {
 			it.Refused = guard.Refuse("children", "%v", err)
 			return it
@@ -112,7 +144,7 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 		var b int64
 		var err error
 		if it.Refused == nil && config.IsDestructive(e.Action) {
-			b, err = safefs.Measure(e.Path)
+			b, err = safefs.MeasureContext(env.Context(), e.Path)
 		} else {
 			b, err = size.PathSize(e.Path)
 		}
@@ -126,13 +158,28 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 	}
 
 	if it.Refused == nil && config.IsDestructive(e.Action) {
-		it.Reclaimable = reclaimable(it, now)
+		roots := []string{it.Path}
+		if it.Action == config.ActionRmStaleChilds {
+			roots = nil
+			for _, c := range it.Children {
+				if c.Keep == "" {
+					roots = append(roots, c.Path)
+				}
+			}
+		}
+		a, err := size.Account(env.Context(), nil, roots...)
+		if err == nil {
+			it.Accounting = &a
+			it.Reclaimable = a.Upper
+		} else {
+			it.Reclaimable = it.Deletable
+		}
 	}
 
 	// Quarantine moves with rename, which cannot cross devices. Refuse now,
 	// visibly in the plan, rather than failing halfway through a live run.
 	if it.Refused == nil && cfg.Policy.Quarantine && config.IsDestructive(e.Action) {
-		if err := sameDevice(e.Path, cfg.Policy.QuarantineDir); err != nil {
+		if err := sameDevice(e.Path, cfg.Policy.QuarantineFor(e.Path)); err != nil {
 			it.Refused = guard.Refuse("quarantine", "%v", err)
 		}
 	}
@@ -145,39 +192,6 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 // on 2026-09-08 recorded 151 GB and returned 14. The measurement is a walk
 // that opens every large file, so it runs only from UniqueFloor up and is
 // cached against the deletable total it was taken for.
-func reclaimable(it Item, now time.Time) int64 {
-	if it.Deletable < UniqueFloor {
-		return it.Deletable
-	}
-	roots := []string{it.Path}
-	var keep []string
-	key := it.Path
-	if it.Action == config.ActionRmStaleChilds {
-		// the stale set can change with its total unchanged (two children
-		// of one size swapping state), so the set itself is in the key
-		roots = roots[:0]
-		h := fnv.New64a()
-		for _, c := range it.Children {
-			if c.Keep == "" {
-				roots = append(roots, c.Path)
-				h.Write([]byte(c.Path))
-				h.Write([]byte{0})
-			} else {
-				keep = append(keep, c.Path)
-			}
-		}
-		key += fmt.Sprintf("#stale:%x", h.Sum64())
-	}
-	u, ok := size.Active.Unique(key, it.Deletable, now, func() (int64, error) {
-		_, u, err := size.UniqueAgainst(keep, roots...)
-		return u, err
-	})
-	if !ok || u > it.Deletable {
-		return it.Deletable
-	}
-	return u
-}
-
 // sameDevice checks that p and the quarantine dir (or its nearest existing
 // ancestor) live on one filesystem.
 func sameDevice(p, qdir string) error {
@@ -219,6 +233,8 @@ func deviceOfPath(p string) (uint64, error) {
 
 // Executor performs the plan. Everything it removes is logged first.
 type Executor struct {
+	Stores     *Stores
+	Ctx        context.Context
 	Policy     config.Policy
 	Log        io.Writer // append-only audit log
 	Out        io.Writer // human output
@@ -253,6 +269,16 @@ func (x *Executor) outf(f string, a ...any) {
 // anything, when the planned deletions exceed the per-run budget. Returns the
 // bytes removed or quarantined by rm actions (commands report their own).
 func (x *Executor) Execute(items []Item) (int64, error) {
+	originalCtx := x.Ctx
+	defer func() { x.Ctx = originalCtx }()
+	ctx := x.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, x.Policy.OperationTimeout())
+	defer cancel()
+	ctx = worklimit.With(ctx, x.Policy.EntryBudget(), x.Policy.VerificationBudget())
+	x.Ctx = ctx
 	if x.Now == nil {
 		x.Now = time.Now
 	}
@@ -266,7 +292,7 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 			if err := unchangedItem(it); err != nil {
 				return 0, err
 			}
-			actual, err := removalSize(it)
+			actual, err := removalSizeContext(ctx, it)
 			if err != nil {
 				return 0, err
 			}
@@ -297,6 +323,9 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 	var runErr error
 	var freed int64
 	for _, it := range items {
+		if err := ctx.Err(); err != nil {
+			return freed, err
+		}
 		if it.Refused != nil {
 			continue
 		}
@@ -348,7 +377,7 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 				x.outf("  %s: refused, %s is always disallowed\n", it.Path, prefix)
 				continue
 			}
-			if prefix, ok := protect.CommandHits(it.Command, x.Home, x.Policy.AlwaysDisallowed); ok {
+			if prefix, ok := protect.CommandHits(it.Command, x.Home, guard.CommandProtected(x.Policy)); ok {
 				x.logf("command %s refused mentions %s", it.Path, prefix)
 				x.outf("  %s: refused, command mentions %s\n", it.Path, prefix)
 				continue
@@ -363,7 +392,11 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 			if x.logErr != nil {
 				return freed, x.logErr
 			}
-			if err := x.Run(it.Command); err != nil {
+			run := x.Run
+			if run == nil {
+				run = func(cmd string) error { return ShellRunContext(ctx, cmd) }
+			}
+			if err := run(it.Command); err != nil {
 				runErr = errors.Join(runErr, err)
 				x.logf("command %s err=%v", it.Path, err)
 				x.outf("  %s: command failed: %v\n", it.Path, err)
@@ -392,7 +425,7 @@ func (x *Executor) disposeChecked(path string, check func() error) (int64, error
 	if err := guard.CheckRemovalPath(x.Policy, path, x.Home); err != nil {
 		return 0, err
 	}
-	bytes, err := safefs.Measure(path)
+	bytes, err := safefs.MeasureContext(x.Ctx, path)
 	if err != nil {
 		return 0, err
 	}
@@ -410,31 +443,44 @@ func (x *Executor) disposeChecked(path string, check func() error) (int64, error
 		return 0, x.logErr
 	}
 	if x.Q != nil {
+		if err := x.Ctx.Err(); err != nil {
+			return 0, err
+		}
 		// Reserve before the move: a journal/sync failure may occur after rename.
 		x.remaining -= bytes
-		dst, err := x.Q.take(path, bytes, x.Now())
+		q := x.Q
+		if x.Stores != nil {
+			var err error
+			q, err = x.Stores.For(path)
+			if err != nil {
+				return 0, err
+			}
+		}
+		q.Ctx = x.Ctx
+		dst, err := q.take(path, bytes, x.Now())
 		if err != nil {
 			return 0, err
 		}
 		x.logf("quarantine %s -> %s bytes=%d", path, dst, bytes)
 		return bytes, nil
 	}
-	n, err := safefs.Remove(path, &x.remaining)
+	n, err := safefs.RemoveContext(x.Ctx, path, &x.remaining)
 	x.logf("remove %s bytes=%d err=%v", path, n, err)
 	return n, err
 }
 
 // removalSize never consults the observational size cache.
-func removalSize(it Item) (int64, error) {
+func removalSize(it Item) (int64, error) { return removalSizeContext(context.Background(), it) }
+func removalSizeContext(ctx context.Context, it Item) (int64, error) {
 	if it.Action != config.ActionRmStaleChilds {
-		return safefs.Measure(it.Path)
+		return safefs.MeasureContext(ctx, it.Path)
 	}
 	var n int64
 	for _, c := range it.Children {
 		if c.Keep != "" {
 			continue
 		}
-		b, err := safefs.Measure(c.Path)
+		b, err := safefs.MeasureContext(ctx, c.Path)
 		if os.IsNotExist(err) {
 			continue
 		}
@@ -451,6 +497,15 @@ func (x *Executor) rmContents(dir string) (int64, error) {
 	if prefix, ok := protect.Hit(dir, x.Home, x.Policy.AlwaysDisallowed); ok {
 		return 0, guard.Refuse("always_disallowed", "refusing %s: %s cannot be removed", dir, prefix)
 	}
+	// Like rmStale, a child a running process uses (command line, cwd or open
+	// file) is left in place. Without a reference list the entry is refused.
+	if x.Refs == nil {
+		return 0, guard.Refuse("references", "no reference lister; refusing to empty %s blind", dir)
+	}
+	refs, err := x.Refs()
+	if err != nil {
+		return 0, guard.Refuse("references", "cannot list process references for %s: %v", dir, err)
+	}
 	entries, err := safefs.ReadDir(dir)
 	if err != nil {
 		return 0, err
@@ -459,6 +514,10 @@ func (x *Executor) rmContents(dir string) (int64, error) {
 	var firstErr error
 	for _, de := range entries {
 		child := filepath.Join(dir, de.Name())
+		if guard.Referenced(child, refs) {
+			x.logf("rm-contents %s child=%s kept referenced by a running process", dir, child)
+			continue
+		}
 		n, err := x.dispose(child)
 		freed += n
 		if err != nil {
@@ -499,8 +558,13 @@ func (x *Executor) rmStale(it Item) (freed int64, kept int, err error) {
 			if statErr != nil {
 				return statErr
 			}
-			if fi.Mode()&os.ModeSymlink != 0 || (c.Info != nil && !os.SameFile(c.Info, fi)) ||
-				x.Now().Sub(fi.ModTime()) < time.Duration(it.StaleAfterHours)*time.Hour || guard.Referenced(c.Path, refs) {
+			if fi.Mode()&os.ModeSymlink != 0 || (c.Info != nil && !os.SameFile(c.Info, fi)) || guard.Referenced(c.Path, refs) {
+				return errKeepChild
+			}
+			// Same rule as the plan: newest change anywhere in the subtree,
+			// and a walk that cannot finish keeps the child.
+			newest, walkErr := guard.NewestChange(x.Ctx, c.Path)
+			if walkErr != nil || x.Now().Sub(newest) < time.Duration(it.StaleAfterHours)*time.Hour {
 				return errKeepChild
 			}
 			return nil
@@ -522,7 +586,10 @@ func (x *Executor) rmStale(it Item) (freed int64, kept int, err error) {
 }
 
 func ShellRun(cmd string) error {
-	c := exec.Command("/bin/sh", "-c", cmd)
+	return ShellRunContext(context.Background(), cmd)
+}
+func ShellRunContext(ctx context.Context, cmd string) error {
+	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	return c.Run()

@@ -27,14 +27,14 @@ func staleFixture(t *testing.T) (home, dir string) {
 	home = t.TempDir()
 	dir = filepath.Join(home, "a", "archive")
 	testutil.Write(t, filepath.Join(dir, "oldunref", "f"), 4096)
-	testutil.Age(t, filepath.Join(dir, "oldunref"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, "oldunref"), 48*time.Hour)
 	testutil.Write(t, filepath.Join(dir, "oldref", "bin", "python"), 4096)
-	testutil.Age(t, filepath.Join(dir, "oldref"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, "oldref"), 48*time.Hour)
 	testutil.Write(t, filepath.Join(dir, "fresh", "f"), 4096)
 	testutil.Write(t, filepath.Join(dir, "cwdref", "f"), 4096)
-	testutil.Age(t, filepath.Join(dir, "cwdref"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, "cwdref"), 48*time.Hour)
 	testutil.Write(t, filepath.Join(dir, ".lock"), 1)
-	testutil.Age(t, filepath.Join(dir, ".lock"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, ".lock"), 48*time.Hour)
 	if err := os.Symlink(filepath.Join(home, "a"), filepath.Join(dir, "lnk")); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestQuarantineTakeRestorePurge(t *testing.T) {
 		t.Fatal(err)
 	}
 	var log bytes.Buffer
-	x := &Executor{Policy: p, Log: &log, Now: time.Now, Q: q}
+	x := &Executor{Policy: p, Log: &log, Now: time.Now, Q: q, Refs: testutil.NoProcs}
 	items := []Item{{Entry: config.Entry{Path: dir, Action: config.ActionRmContents}, Bytes: 150, Deletable: 150}}
 	if _, err := x.Execute(items); err != nil {
 		t.Fatal(err)
@@ -167,8 +167,10 @@ func TestQuarantineTakeRestorePurge(t *testing.T) {
 	if err != nil || n != 1 || len(skipped) != 1 {
 		t.Fatalf("partial restore: n=%d skipped=%v err=%v", n, skipped, err)
 	}
+	// A recreated source only blocks restore; the intact quarantined object
+	// still expires, or apps that recreate caches would pin batches forever.
 	if bs, _ := ListBatches(p.QuarantineDir); len(bs) != 1 || bs[0].Count != 1 {
-		t.Fatalf("batch should remain with 1 entry: %+v", bs)
+		t.Fatalf("conflicted batch should stay eligible for expiry: %+v", bs)
 	}
 
 	// purge: an old batch goes, a fresh one stays; purge-all takes both
@@ -177,7 +179,7 @@ func TestQuarantineTakeRestorePurge(t *testing.T) {
 	testutil.Write(t, filepath.Join(oldDir, "x", "f"), 10)
 	testutil.Write(t, filepath.Join(oldDir, "manifest.json"), 0)
 	_ = os.WriteFile(filepath.Join(oldDir, "manifest.json"), []byte(`{"batch":"`+oldName+`","created":"`+now.Add(-10*24*time.Hour).Format(time.RFC3339)+`","entries":[{"from":"/x/f","to":"`+filepath.Join(oldDir, "x", "f")+`","bytes":10}]}`), 0o644)
-	freed, names, err := PurgeBatches(p.QuarantineDir, 7*24*time.Hour, now, false)
+	freed, names, err := PurgeBatches(p.QuarantineDir, 7*24*time.Hour, now, false, false)
 	if err != nil || len(names) != 1 || names[0] != oldName || freed != 10 {
 		t.Fatalf("purge expired: freed=%d names=%v err=%v", freed, names, err)
 	}
@@ -187,7 +189,7 @@ func TestQuarantineTakeRestorePurge(t *testing.T) {
 	if bs, _ := ListBatches(p.QuarantineDir); len(bs) != 1 {
 		t.Error("fresh batch should survive an expiry purge")
 	}
-	_, names, err = PurgeBatches(p.QuarantineDir, 7*24*time.Hour, now, true)
+	_, names, err = PurgeBatches(p.QuarantineDir, 7*24*time.Hour, now, true, false)
 	if err != nil || len(names) != 1 {
 		t.Fatalf("purge all: %v %v", names, err)
 	}
@@ -202,7 +204,7 @@ func TestQuarantineMoveFailureLeavesSourceIntact(t *testing.T) {
 	testutil.Write(t, filepath.Join(dir, "f"), 10)
 	p := quarantinePolicy(home)
 	q, _ := OpenQuarantine(p.QuarantineDir, time.Now(), func(src, dst string) error { return errors.New("EXDEV") })
-	x := &Executor{Policy: p, Now: time.Now, Q: q}
+	x := &Executor{Policy: p, Now: time.Now, Q: q, Refs: testutil.NoProcs}
 	items := []Item{{Entry: config.Entry{Path: dir, Action: config.ActionRmContents}, Bytes: 10, Deletable: 10}}
 	if _, err := x.Execute(items); err == nil {
 		t.Fatal("failed move must propagate to the caller")

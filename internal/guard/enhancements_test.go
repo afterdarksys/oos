@@ -15,14 +15,14 @@ func staleFixture(t *testing.T) (home, dir string) {
 	home = t.TempDir()
 	dir = filepath.Join(home, "a", "archive")
 	testutil.Write(t, filepath.Join(dir, "oldunref", "f"), 4096)
-	testutil.Age(t, filepath.Join(dir, "oldunref"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, "oldunref"), 48*time.Hour)
 	testutil.Write(t, filepath.Join(dir, "oldref", "bin", "python"), 4096)
-	testutil.Age(t, filepath.Join(dir, "oldref"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, "oldref"), 48*time.Hour)
 	testutil.Write(t, filepath.Join(dir, "fresh", "f"), 4096)
 	testutil.Write(t, filepath.Join(dir, "cwdref", "f"), 4096)
-	testutil.Age(t, filepath.Join(dir, "cwdref"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, "cwdref"), 48*time.Hour)
 	testutil.Write(t, filepath.Join(dir, ".lock"), 1)
-	testutil.Age(t, filepath.Join(dir, ".lock"), 48*time.Hour)
+	testutil.AgeTree(t, filepath.Join(dir, ".lock"), 48*time.Hour)
 	if err := os.Symlink(filepath.Join(home, "a"), filepath.Join(dir, "lnk")); err != nil {
 		t.Fatal(err)
 	}

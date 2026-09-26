@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 
 // Env is what the guards need from the outside world. Tests inject it.
 type Env struct {
+	Ctx   context.Context
 	Home  string
 	Procs func() ([]string, error) // running process command lines
 	Cwds  func() ([]string, error) // running process working directories
@@ -89,26 +91,24 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 		return Refuse("install", "macOS upgrade payload at %s; refusing to change the disk until that directory is gone", why)
 	}
 	if ent.Action == config.ActionCommand {
-		if prefix, ok := protect.CommandHits(ent.Command, e.Home, p.AlwaysDisallowed); ok {
+		// The text scan is advisory (see protect.CommandHits); allow_commands
+		// is the gate. The entry's path still has to be one oos may clean:
+		// a command filed under a protected path is refused like an rm.
+		if prefix, ok := protect.CommandHits(ent.Command, e.Home, CommandProtected(p)); ok {
 			return Refuse("always_disallowed", "command mentions %s, which cannot be removed", prefix)
+		}
+		if err := e.checkPlace(p, path); err != nil {
+			return err
 		}
 		if err := e.installRunning(); err != nil {
 			return err
 		}
-		return nil // other path rules do not apply; AllowCommands gates the run
+		return nil // depth and kind do not apply; AllowCommands gates the run
 	}
 	if config.PathDepth(path) < p.MinPathDepth {
 		return Refuse("depth", "%s has depth %d, policy requires >= %d", path, config.PathDepth(path), p.MinPathDepth)
 	}
-	if !p.AllowOutsideHome && !config.IsUnder(path, e.Home) {
-		return Refuse("home", "%s is outside %s and allow_outside_home is false", path, e.Home)
-	}
-	for _, nt := range p.NeverTouch {
-		if config.IsUnder(path, nt) {
-			return Refuse("never_touch", "%s is under protected %s", path, nt)
-		}
-	}
-	if err := CheckRemovalPath(p, path, e.Home); err != nil {
+	if err := e.checkPlace(p, path); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)
@@ -157,6 +157,25 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 	return nil
 }
 
+// checkPlace applies the home, never_touch and removal-path rules to path.
+func (e Env) checkPlace(p config.Policy, path string) error {
+	if !p.AllowOutsideHome && !config.IsUnder(path, e.Home) {
+		return Refuse("home", "%s is outside %s and allow_outside_home is false", path, e.Home)
+	}
+	for _, nt := range p.NeverTouch {
+		if config.IsUnder(path, nt) {
+			return Refuse("never_touch", "%s is under protected %s", path, nt)
+		}
+	}
+	return CheckRemovalPath(p, path, e.Home)
+}
+
+// CommandProtected is what a command's text is scanned against on top of
+// protect.Builtin: always_disallowed and never_touch.
+func CommandProtected(p config.Policy) []string {
+	return append(append([]string{}, p.AlwaysDisallowed...), p.NeverTouch...)
+}
+
 // installRunning refuses the disk change while an OS installer is executing.
 // A process list that fails is a refusal: guessing that no installer is
 // running is how an upgrade gets files pulled out from under it. A nil
@@ -182,4 +201,11 @@ func (e Env) CheckInstall() error {
 		return Refuse("install", "macOS upgrade payload at %s", why)
 	}
 	return e.installRunning()
+}
+
+func (e Env) Context() context.Context {
+	if e.Ctx != nil {
+		return e.Ctx
+	}
+	return context.Background()
 }

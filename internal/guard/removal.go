@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -28,15 +29,65 @@ func CheckRemovalPath(p config.Policy, path, home string) error {
 			raw = filepath.Join(home, strings.TrimPrefix(raw, "~/"))
 		}
 		base := safefs.CanonicalAlias(raw)
-		if base != "/" && config.IsUnder(base, path) {
+		// Preserve the explicit /usr/local exception, including filesystem aliases.
+		if base == "/usr" && physicalUnder(path, "/usr/local") {
+			continue
+		}
+		if base != "/" && (config.IsUnder(base, path) || physicalUnder(path, base) || physicalUnder(base, path)) {
 			return Refuse("always_disallowed", "%s contains protected %s", path, base)
 		}
 	}
 	for _, raw := range p.NeverTouch {
 		base := safefs.CanonicalAlias(raw)
-		if config.IsUnder(path, base) || (base != "/" && config.IsUnder(base, path)) {
+		if config.IsUnder(path, base) || (base != "/" && (config.IsUnder(base, path) || physicalUnder(path, base) || physicalUnder(base, path))) {
 			return Refuse("never_touch", "%s overlaps protected %s", path, base)
 		}
 	}
+	for _, own := range OwnData(p, home) {
+		base := safefs.CanonicalAlias(own)
+		if config.IsUnder(path, base) || config.IsUnder(base, path) || physicalUnder(path, base) || physicalUnder(base, path) {
+			return Refuse("own_data", "%s overlaps oos's own %s", path, base)
+		}
+	}
 	return nil
+}
+
+// OwnData is every path oos keeps its records in: quarantine stores, the
+// state file and its companions, the log and the mutation lock. The config
+// loader checks entries against these lexically; CheckRemovalPath checks
+// every removal at run time, through case and inode aliases.
+func OwnData(p config.Policy, home string) []string {
+	out := p.QuarantineStores()
+	for _, f := range []string{p.LogFile, p.StateFile, p.SizeCacheFile} {
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	if p.StateFile != "" {
+		out = append(out, p.StateFile+".quarantine-index.json", p.StateFile+".auto-act.json")
+	}
+	if home != "" && home != "." && filepath.IsAbs(home) {
+		out = append(out, filepath.Join(home, ".local", "state", "oos", "mutation.lock"))
+	}
+	return out
+}
+
+// physicalUnder compares existing object identities along the path's ancestry.
+// This recognizes case and Unicode aliases without guessing filesystem rules.
+func physicalUnder(path, base string) bool {
+	b, err := os.Stat(base)
+	if err != nil {
+		return false
+	}
+	for {
+		f, err := os.Stat(path)
+		if err == nil && os.SameFile(f, b) {
+			return true
+		}
+		next := filepath.Dir(path)
+		if next == path {
+			return false
+		}
+		path = next
+	}
 }

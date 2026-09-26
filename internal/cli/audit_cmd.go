@@ -35,14 +35,16 @@ func doAudit(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		return status.ExitUsage
 	}
 	rows = audit.ApplyFilter(rows, f, now, 0)
-	if st, err := state.Load(cfg.Policy.StateFile); err == nil {
+	auditDU, auditDUErr := size.Disk(cfg.Volume)
+	if _, err := state.Update(cfg.Policy.StateFile, func(st *state.State) {
 		st.Audit = rows
 		st.AuditRoot = root
 		st.AuditedAt = now
-		if du, err := size.Disk(cfg.Volume); err == nil {
-			st.Record("audit", du, now)
+		if auditDUErr == nil {
+			st.Record("audit", auditDU, now)
 		}
-		_ = state.Save(cfg.Policy.StateFile, st)
+	}); err != nil {
+		fmt.Fprintf(errw, "oos: save state: %v\n", err)
 	}
 	if o.jsonOut {
 		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "rows": rows, "by_use_case": audit.GroupByUseCaseDeep(cfg, rows)})

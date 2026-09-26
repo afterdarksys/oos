@@ -30,7 +30,7 @@ func TestExecuteRmContentsKeepsDirAndDoesNotFollowSymlinks(t *testing.T) {
 	_ = os.Chmod(ro, 0o555)
 
 	var log bytes.Buffer
-	x := &Executor{Policy: testutil.PolicyFor(home), Log: &log, Now: time.Now}
+	x := &Executor{Policy: testutil.PolicyFor(home), Log: &log, Now: time.Now, Refs: testutil.NoProcs}
 	items := []Item{{Entry: config.Entry{Path: dir, Action: config.ActionRmContents}, Bytes: 160}}
 	freed, err := x.Execute(items)
 	if err != nil {

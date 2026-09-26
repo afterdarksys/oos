@@ -41,21 +41,26 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
-	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env}
+	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env, Ctx: env.Context()}
 	if cfg.Policy.Quarantine && !o.permanent {
-		q, err := plan.OpenQuarantine(cfg.Policy.QuarantineDir, now, os.Rename)
+		stores, err := plan.OpenStores(cfg, now)
 		if err != nil {
 			fmt.Fprintf(errw, "oos: cannot open quarantine: %v\n", err)
 			return status.ExitCritical
 		}
-		x.Q = q
-		doc["batch"] = q.Batch
+		x.Stores = stores
+		x.Q = stores.Primary()
+		defer stores.DiscardEmpty()
+		doc["batch"] = x.Q.Batch
 	}
 	freed, err := x.Execute(items)
 	after, _ := size.Disk(cfg.Volume)
 	if x.Q != nil && x.Q.Empty() {
 		_ = x.Q.Discard()
 		delete(doc, "batch")
+	}
+	if x.Stores != nil {
+		doc["batches"] = x.Stores.Batches()
 	}
 	doc["recorded_bytes"] = freed
 	doc["freed_bytes"] = freed // kept for readers of 0.6; the honest number is free_gb_after - free_gb_before
@@ -64,9 +69,8 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 	if err != nil {
 		doc["refused"] = err.Error()
 	}
-	if st, e := state.Load(cfg.Policy.StateFile); e == nil {
-		st.Record("cleanup", after, now)
-		_ = state.Save(cfg.Policy.StateFile, st)
+	if _, e := state.Update(cfg.Policy.StateFile, func(st *state.State) { st.Record("cleanup", after, now) }); e != nil {
+		fmt.Fprintf(errw, "oos: save state: %v\n", e)
 	}
 	_ = json.NewEncoder(out).Encode(doc)
 	if err != nil {

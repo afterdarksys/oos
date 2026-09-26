@@ -49,6 +49,12 @@ func doTrash(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		fmt.Fprintln(out, "dry-run: trash was not emptied. This is a permanent delete, not quarantine. Add --yes to empty it.")
 		return status.ExitOK
 	}
+	// Emptying the trash is a disk change like any other: not while an OS or
+	// package install is writing the machine, and not when that is unknown.
+	if err := env.CheckInstall(); err != nil {
+		fmt.Fprintf(errw, "oos: %v; refusing to empty the trash\n", err)
+		return status.ExitCritical
+	}
 	logf, err := state.OpenLog(cfg.Policy.LogFile)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: cannot open log %s: %v; refusing to empty the trash without an audit log\n", cfg.Policy.LogFile, err)

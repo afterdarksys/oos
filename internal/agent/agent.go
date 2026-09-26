@@ -2,10 +2,12 @@ package agent
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,7 +33,10 @@ func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) 
 		return status.ExitUsage
 	}
 	label, code := status.Of(cfg.Policy, du)
-	st, _ := state.Load(cfg.Policy.StateFile)
+	st, err := state.Load(cfg.Policy.StateFile)
+	if err != nil {
+		fmt.Fprintf(errw, "oos: read state: %v\n", err)
+	}
 	var prev *state.HistoryPoint
 	for i := len(st.History) - 1; i >= 0; i-- {
 		if st.History[i].Event == "agent" {
@@ -57,8 +62,7 @@ func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) 
 	var purgedNames []string
 	var purgedBytes int64
 	if cfg.Policy.Quarantine && cfg.Policy.AgentPurgeExpired {
-		olderThan := time.Duration(cfg.Policy.QuarantineDays) * 24 * time.Hour
-		freed, names, perr := plan.PurgeBatches(cfg.Policy.QuarantineDir, olderThan, now, false)
+		freed, names, perr := plan.PurgeConfigured(cfg, now)
 		purgedNames, purgedBytes = names, freed
 		if len(names) > 0 || perr != nil {
 			if logf, lerr := state.OpenLog(cfg.Policy.LogFile); lerr == nil {
@@ -76,10 +80,15 @@ func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) 
 			}
 		}
 	}
-	st.Volume = cfg.Volume
-	st.Record("agent", du, now)
-	if err := state.Save(cfg.Policy.StateFile, st); err != nil {
+	if ust, err := state.Update(cfg.Policy.StateFile, func(s *state.State) {
+		s.Volume = cfg.Volume
+		s.Record("agent", du, now)
+	}); err != nil {
 		fmt.Fprintf(errw, "oos: save state: %v\n", err)
+		st.Volume = cfg.Volume
+		st.Record("agent", du, now) // the forecast still sees this reading
+	} else {
+		st = ust
 	}
 	// rate alert: where the last few hours of readings lead
 	fc := st.Forecast(now, cfg.Policy.ForecastWindow(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
@@ -128,6 +137,50 @@ var (
 )
 
 type Runner func(name string, args ...string) error
+
+// StableExecutable is the path an installed launchd or systemd job should
+// run. os.Executable may name a versioned location (a Homebrew Cellar path on
+// Linux, where it reads /proc/self/exe) that disappears on upgrade; the name
+// the user invoked, found on PATH, is the stable one. It is used only when it
+// is absolute and is the same file as the running executable.
+func StableExecutable() (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return stableExecutable(os.Args[0], self), nil
+}
+
+func stableExecutable(arg0, self string) string {
+	p, err := exec.LookPath(arg0)
+	if err != nil || !filepath.IsAbs(p) {
+		return self
+	}
+	a, err := os.Stat(p)
+	if err != nil {
+		return self
+	}
+	b, err := os.Stat(self)
+	if err != nil || !os.SameFile(a, b) {
+		return self
+	}
+	return filepath.Clean(p)
+}
+
+// XMLText escapes s for a plist <string> element.
+func XMLText(s string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
+
+// SystemdQuote renders one ExecStart argument: double-quoted with \ and "
+// escaped, and % and $ doubled so systemd expands neither specifiers nor
+// variables inside a path.
+func SystemdQuote(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "%", "%%", "$", "$$", "\n", `\n`)
+	return `"` + r.Replace(s) + `"`
+}
 
 func ExecRun(name string, args ...string) error {
 	c := exec.Command(name, args...)

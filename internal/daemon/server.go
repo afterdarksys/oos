@@ -15,22 +15,63 @@ import (
 // Serve answers /status and /health on a unix socket until ctx ends. A live
 // daemon already on the socket is an error; a dead socket file is removed.
 func Serve(ctx context.Context, sock string, d *Daemon) error {
-	if sock == "" {
-		<-ctx.Done()
-		return nil
-	}
-	if _, err := Query(sock, time.Second); err == nil {
-		return fmt.Errorf("another oos daemon answers on %s", sock)
-	}
-	_ = os.Remove(sock)
-	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
-		return err
-	}
-	ln, err := net.Listen("unix", sock)
+	ln, err := Listen(sock)
 	if err != nil {
 		return err
 	}
+	return ServeOn(ctx, ln, sock, d)
+}
+
+// ErrRunning is returned by Listen when a live daemon already answers.
+var ErrRunning = errors.New("another oos daemon is running")
+
+// Listen claims the socket. It fails when another daemon answers on it, or
+// when the path holds something that is not a socket (which is never
+// removed). An empty sock means no socket: a nil listener and no error.
+func Listen(sock string) (net.Listener, error) {
+	if sock == "" {
+		return nil, nil
+	}
+	if _, err := Query(sock, time.Second); err == nil {
+		return nil, fmt.Errorf("%w: it answers on %s", ErrRunning, sock)
+	}
+	if err := removeSocket(sock); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		return nil, err
+	}
 	_ = os.Chmod(sock, 0o600)
+	return ln, nil
+}
+
+// removeSocket removes sock only when Lstat says it is a socket; a missing
+// path is fine, anything else is refused rather than deleted.
+func removeSocket(sock string) error {
+	fi, err := os.Lstat(sock)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Type() != os.ModeSocket {
+		return fmt.Errorf("%s exists and is not a socket; refusing to remove it", sock)
+	}
+	return os.Remove(sock)
+}
+
+// ServeOn serves on a listener from Listen until ctx ends. A nil listener
+// (no socket configured) just waits.
+func ServeOn(ctx context.Context, ln net.Listener, sock string, d *Daemon) error {
+	if ln == nil {
+		<-ctx.Done()
+		return nil
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -47,7 +88,7 @@ func Serve(ctx context.Context, sock string, d *Daemon) error {
 		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(c)
-		_ = os.Remove(sock)
+		_ = removeSocket(sock)
 	}()
 	d.logf("listening on %s", sock)
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {

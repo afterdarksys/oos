@@ -1,15 +1,21 @@
 package plan
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/afterdarksys/oos/internal/config"
+	"github.com/afterdarksys/oos/internal/guard"
+	"github.com/afterdarksys/oos/internal/protect"
 	"github.com/afterdarksys/oos/internal/safefs"
 )
 
@@ -17,34 +23,42 @@ const BatchLayout = "20060102-150405"
 
 // QEntry is one quarantined path.
 type QEntry struct {
-	From    string    `json:"from"`
-	To      string    `json:"to"`
-	Bytes   int64     `json:"bytes"`
-	At      time.Time `json:"at"`
-	Pending bool      `json:"pending,omitempty"`
+	From     string    `json:"from"`
+	To       string    `json:"to"`
+	Bytes    int64     `json:"bytes"`
+	At       time.Time `json:"at"`
+	Pending  bool      `json:"pending,omitempty"`
+	Identity *Identity `json:"identity,omitempty"`
+	SHA256   string    `json:"sha256,omitempty"`
 }
 
 // Manifest is what a batch directory records about itself.
 type Manifest struct {
-	Batch   string    `json:"batch"`
-	Created time.Time `json:"created"`
-	Entries []QEntry  `json:"entries"`
+	Version   int       `json:"version,omitempty"`
+	Operation string    `json:"operation_id,omitempty"`
+	Checksum  string    `json:"checksum,omitempty"`
+	Batch     string    `json:"batch"`
+	Created   time.Time `json:"created"`
+	Entries   []QEntry  `json:"entries"`
 }
 
 // Quarantine is one run's batch. Paths are moved, never copied, so a take is
 // instant and the space stays used until the batch is purged.
 type Quarantine struct {
-	Dir   string
-	Batch string
-	man   Manifest
-	move  func(src, dst string) error
+	Ctx        context.Context
+	Dir        string
+	Batch      string
+	man        Manifest
+	Hash       bool               // opt-in payload hashing
+	checkpoint func(string) error // fault injection in package tests only
+	move       func(src, dst string) error
 }
 
 func OpenQuarantine(dir string, now time.Time, move func(src, dst string) error) (*Quarantine, error) {
 	if move == nil {
-		move = os.Rename
+		move = safefs.MoveNoReplace
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := safefs.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	if _, err := safefs.ReadDir(dir); err != nil {
@@ -62,7 +76,11 @@ func OpenQuarantine(dir string, now time.Time, move func(src, dst string) error)
 		batch = filepath.Base(unique)
 	}
 	q := &Quarantine{Dir: dir, Batch: batch, move: move}
-	q.man = Manifest{Batch: batch, Created: now}
+	id, err := operationID()
+	if err != nil {
+		return nil, err
+	}
+	q.man = Manifest{Version: 2, Operation: id, Batch: batch, Created: now}
 	return q, q.writeManifest()
 }
 
@@ -77,8 +95,11 @@ func (q *Quarantine) dest(src string) string {
 // take durably journals intent before moving. Pending entries are recoverable
 // by restore but never automatically purged after an interrupted move.
 func (q *Quarantine) take(src string, bytes int64, now time.Time) (string, error) {
+	if q.Ctx == nil {
+		q.Ctx = context.Background()
+	}
 	dst := q.dest(src)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	if err := safefs.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", err
 	}
 	if err := safefs.CheckAncestors(src); err != nil {
@@ -92,19 +113,46 @@ func (q *Quarantine) take(src string, bytes int64, now time.Time) (string, error
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}
-	q.man.Entries = append(q.man.Entries, QEntry{From: src, To: dst, Bytes: bytes, At: now, Pending: true})
-	if err := q.writeManifest(); err != nil {
+	id, err := identify(src)
+	if err != nil {
 		return "", err
 	}
-	if err := q.move(src, dst); err != nil {
-		// Roll back only when the destination is absent and the source still exists.
-		// An ambiguous/injected partial move remains journaled for recovery.
+	entry := QEntry{From: src, To: dst, Bytes: bytes, At: now, Pending: true, Identity: id}
+	// abandon drops the intent only when nothing moved: the source is still in
+	// place and the destination is absent. Anything else stays journaled.
+	abandon := func(cause error) error {
 		_, srcErr := os.Lstat(src)
 		_, dstErr := os.Lstat(dst)
 		if srcErr == nil && os.IsNotExist(dstErr) {
 			q.man.Entries = q.man.Entries[:len(q.man.Entries)-1]
-			return "", errors.Join(err, q.writeManifest())
+			return errors.Join(cause, q.writeManifest())
 		}
+		return cause
+	}
+	if q.Hash {
+		entry.SHA256, err = treeDigestContext(q.Ctx, src)
+		if err != nil {
+			return "", err
+		}
+	}
+	q.man.Entries = append(q.man.Entries, entry)
+	if err := q.writeManifest(); err != nil {
+		return "", err
+	}
+	if err := q.checkpointAt("intent-durable"); err != nil {
+		return "", err
+	}
+	if err := q.Ctx.Err(); err != nil {
+		return "", abandon(err)
+	}
+	if !id.matches(src) {
+		return "", abandon(fmt.Errorf("source %s changed before move; nothing moved", src))
+	}
+	if err := q.move(src, dst); err != nil {
+		// An ambiguous/injected partial move remains journaled for recovery.
+		return "", abandon(err)
+	}
+	if err := q.checkpointAt("payload-moved"); err != nil {
 		return "", err
 	}
 	if err := syncParents(filepath.Dir(src)); err != nil {
@@ -113,8 +161,17 @@ func (q *Quarantine) take(src string, bytes int64, now time.Time) (string, error
 	if err := syncParents(filepath.Dir(dst)); err != nil {
 		return "", err
 	}
+	if !id.matches(dst) {
+		return "", fmt.Errorf("moved object changed; pending journal preserved")
+	}
 	q.man.Entries[len(q.man.Entries)-1].Pending = false
-	return dst, q.writeManifest()
+	if err := q.checkpointAt("move-durable"); err != nil {
+		return "", err
+	}
+	if err := q.writeManifest(); err != nil {
+		return "", err
+	}
+	return dst, q.checkpointAt("complete-durable")
 }
 
 // Empty reports whether nothing has been recorded into the batch.
@@ -131,6 +188,9 @@ func (q *Quarantine) Discard() error {
 }
 
 func (q *Quarantine) writeManifest() error {
+	if q.man.Version >= 2 {
+		q.man.Checksum = manifestDigest(q.man)
+	}
 	b, err := json.MarshalIndent(q.man, "", "  ")
 	if err != nil {
 		return err
@@ -163,10 +223,12 @@ func (q *Quarantine) writeManifest() error {
 
 // Batch is a summary of one quarantine batch on disk.
 type Batch struct {
+	Store   string    `json:"store,omitempty"`
 	Name    string    `json:"name"`
 	Created time.Time `json:"created"`
 	Count   int       `json:"count"`
 	Bytes   int64     `json:"bytes"`
+	Held    string    `json:"held,omitempty"` // why Count is -1
 }
 
 func readManifest(dir, name string) (*Manifest, error) {
@@ -177,7 +239,21 @@ func readManifest(dir, name string) (*Manifest, error) {
 	if err := safefs.CheckAncestors(path); err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(path)
+	parent, err := safefs.OpenDir(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	file, err := parent.OpenFile("manifest.json", os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	fi, err := file.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("manifest is not a regular file")
+	}
+	b, err := io.ReadAll(io.LimitReader(file, 16<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -185,11 +261,21 @@ func readManifest(dir, name string) (*Manifest, error) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("batch %s manifest: %w", name, err)
 	}
+	if m.Version != 0 && m.Version != 2 {
+		return nil, fmt.Errorf("unsupported manifest version %d", m.Version)
+	}
+	if m.Version == 2 && (m.Checksum == "" || m.Checksum != manifestDigest(m)) {
+		return nil, fmt.Errorf("manifest checksum mismatch")
+	}
 	return &m, nil
 }
 
-// ListBatches returns batches oldest first. A directory without a readable
-// manifest is reported with Count -1 so it is visible but never auto-purged.
+// ListBatches returns batches oldest first. A batch that is not provably
+// complete (no readable manifest, a pending entry, unrecorded data, or a
+// quarantined object that is missing or changed) is reported with Count -1
+// and the reason in Held, so it is visible but never auto-purged. A source
+// path recreated after quarantine does not hold a batch: it only matters to
+// restore, which refuses to overwrite it.
 func ListBatches(dir string) ([]Batch, error) {
 	ents, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -208,23 +294,30 @@ func ListBatches(dir string) ([]Batch, error) {
 			continue // not one of ours
 		}
 		b := Batch{Name: de.Name(), Created: created}
+		hold := func(why string) {
+			if b.Held == "" {
+				b.Count, b.Held = -1, why
+			}
+		}
 		if m, err := readManifest(dir, de.Name()); err == nil {
 			b.Count = len(m.Entries)
 			for _, e := range m.Entries {
 				b.Bytes += e.Bytes
-				if e.Pending {
-					b.Count = -1
-				}
 			}
 			if !m.Created.IsZero() {
 				b.Created = m.Created
 			}
 			q := &Quarantine{Dir: dir, Batch: de.Name(), man: *m}
-			if q.checkContents() != nil {
-				b.Count = -1
+			if err := q.checkContents(); err != nil {
+				hold(err.Error())
+			}
+			for _, e := range m.Entries {
+				if why := purgeBlocker(e); why != "" {
+					hold(e.From + ": " + why)
+				}
 			}
 		} else {
-			b.Count = -1
+			hold("manifest: " + err.Error())
 		}
 		out = append(out, b)
 	}
@@ -245,28 +338,56 @@ func QuarantineBytes(dir string) int64 {
 
 // RestoreBatch moves every entry back to where it came from. An entry whose
 // original path now exists is left in quarantine and reported. When every
-// entry is restored the batch directory is removed.
-func RestoreBatch(dir, name string, move func(src, dst string) error) (restored int, skipped []string, err error) {
+// entry is restored the batch directory is removed. Without a policy only the
+// hard-coded always_disallowed list (resolved against $HOME) guards targets.
+func RestoreBatch(dir, name string, move func(src, dst string) error) (int, []string, error) {
+	return RestoreBatchContext(context.Background(), dir, name, move)
+}
+func RestoreBatchContext(ctx context.Context, dir, name string, move func(src, dst string) error) (restored int, skipped []string, err error) {
+	home, _ := os.UserHomeDir()
+	return RestoreBatchPolicyContext(ctx, config.Policy{AllowOutsideHome: true}, home, dir, name, move)
+}
+
+// geteuid is replaced in package tests only.
+var geteuid = os.Geteuid
+
+// RestoreBatchPolicyContext re-applies the removal-time path protections to
+// every manifest target before anything is written: a forged or damaged
+// manifest must not create files under the OS, credential directories,
+// never_touch, or outside home. It refuses to run as a user other than the
+// owner of the quarantine store.
+func RestoreBatchPolicyContext(ctx context.Context, p config.Policy, home, dir, name string, move func(src, dst string) error) (restored int, skipped []string, err error) {
 	if move == nil {
-		move = os.Rename
+		move = safefs.MoveNoReplace
+	}
+	if err := checkStoreOwner(dir); err != nil {
+		return 0, nil, err
 	}
 	m, err := readManifest(dir, name)
 	if err != nil {
 		return 0, nil, err
 	}
 	q := &Quarantine{Dir: dir, Batch: name, man: *m}
-	var remaining []QEntry
 	for _, e := range m.Entries {
 		// Never accept paths outside this batch from a damaged manifest.
 		if !filepath.IsAbs(e.From) || filepath.Clean(e.To) != q.dest(e.From) {
-			return restored, skipped, fmt.Errorf("invalid quarantine entry %q -> %q", e.From, e.To)
+			return 0, nil, fmt.Errorf("invalid quarantine entry %q -> %q", e.From, e.To)
+		}
+		if err := restoreTarget(p, home, e.From); err != nil {
+			return 0, nil, err
+		}
+	}
+	var remaining []QEntry
+	for i, e := range m.Entries {
+		if err := ctx.Err(); err != nil {
+			return restored, skipped, err
 		}
 		if err := safefs.CheckAncestors(e.To); err != nil {
 			return restored, skipped, err
 		}
 		_, toErr := os.Lstat(e.To)
 		_, fromErr := os.Lstat(e.From)
-		if os.IsNotExist(toErr) && fromErr == nil {
+		if os.IsNotExist(toErr) && fromErr == nil && e.Identity != nil && e.Identity.matches(e.From) {
 			// Intent not executed, or a restore completed before its manifest update.
 			continue
 		}
@@ -275,12 +396,30 @@ func RestoreBatch(dir, name string, move func(src, dst string) error) (restored 
 			remaining = append(remaining, e)
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(e.From), 0o755); err != nil {
+		if err := safefs.MkdirAll(filepath.Dir(e.From), 0o700); err != nil {
 			skipped = append(skipped, e.From+" ("+err.Error()+")")
 			remaining = append(remaining, e)
 			continue
 		}
-		if err := safefs.CheckAncestors(e.From); err != nil {
+		// With the parents present, the full removal check also covers symlink
+		// ancestors and physical aliases of protected paths.
+		if err := guard.CheckRemovalPath(p, e.From, home); err != nil {
+			return restored, skipped, err
+		}
+		if e.Identity != nil && !e.Identity.matches(e.To) {
+			skipped = append(skipped, e.From+" (quarantined identity changed)")
+			remaining = append(remaining, e)
+			continue
+		}
+		if e.SHA256 != "" {
+			hash, err := treeDigestContext(ctx, e.To)
+			if err != nil || hash != e.SHA256 {
+				skipped = append(skipped, e.From+" (content verification failed)")
+				remaining = append(remaining, e)
+				continue
+			}
+		}
+		if err := ctx.Err(); err != nil {
 			return restored, skipped, err
 		}
 		if err := move(e.To, e.From); err != nil {
@@ -295,6 +434,10 @@ func RestoreBatch(dir, name string, move func(src, dst string) error) (restored 
 			return restored, skipped, err
 		}
 		restored++
+		q.man.Entries = append(append([]QEntry{}, remaining...), m.Entries[i+1:]...)
+		if err := q.writeManifest(); err != nil {
+			return restored, skipped, err
+		}
 	}
 	q.man.Entries = remaining
 	if err := q.writeManifest(); err != nil {
@@ -306,19 +449,108 @@ func RestoreBatch(dir, name string, move func(src, dst string) error) (restored 
 	return restored, skipped, nil
 }
 
+// checkStoreOwner refuses to act on a store owned by another user: restore
+// would otherwise recreate that user's paths with this process's identity.
+func checkStoreOwner(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("quarantine store %s: owner unavailable", dir)
+	}
+	if uid := geteuid(); uid < 0 || uint32(uid) != st.Uid {
+		return fmt.Errorf("quarantine store %s is owned by uid %d; refusing to restore as uid %d", dir, st.Uid, uid)
+	}
+	return nil
+}
+
+// restoreTarget applies the removal-time protections that need no existing
+// parent directory, then the full guard when the parent already exists.
+func restoreTarget(p config.Policy, home, from string) error {
+	from = filepath.Clean(from)
+	if from == string(filepath.Separator) {
+		return guard.Refuse("root", "refusing to restore onto /")
+	}
+	paths := []string{from, safefs.CanonicalAlias(from)}
+	homes := []string{home, safefs.CanonicalAlias(home)}
+	for _, path := range paths {
+		for _, h := range homes {
+			if prefix, ok := protect.Hit(path, h, p.AlwaysDisallowed); ok {
+				return guard.Refuse("always_disallowed", "restore target %s is protected by %s", from, prefix)
+			}
+		}
+		for _, nt := range p.NeverTouch {
+			if config.IsUnder(path, nt) || config.IsUnder(path, safefs.CanonicalAlias(nt)) {
+				return guard.Refuse("never_touch", "restore target %s is under protected %s", from, nt)
+			}
+		}
+	}
+	if !p.AllowOutsideHome && (home == "" || !(config.IsUnder(paths[0], homes[0]) || config.IsUnder(paths[1], homes[1]))) {
+		return guard.Refuse("home", "restore target %s is outside %s and allow_outside_home is false", from, home)
+	}
+	if _, err := os.Lstat(filepath.Dir(from)); err == nil {
+		return guard.CheckRemovalPath(p, from, home)
+	}
+	return nil
+}
+
+// tombstonePrefix marks a batch committed to deletion. ListBatches, FindBatch
+// and restore do not recognise the name; the next purge finishes it.
+const tombstonePrefix = ".purging-"
+
+// purgeCheckpoint is fault injection in package tests only.
+var purgeCheckpoint func(stage string) error
+
 // PurgeBatches permanently removes batches. With all=false only batches
-// older than olderThan go; batches without a manifest are never auto-purged.
-func PurgeBatches(dir string, olderThan time.Duration, now time.Time, all bool) (freed int64, names []string, err error) {
-	return purgeBatches(dir, olderThan, now, all, nil)
+// older than olderThan go. Held batches (Count < 0) are skipped unless
+// includeHeld is set.
+func PurgeBatches(dir string, olderThan time.Duration, now time.Time, all, includeHeld bool) (freed int64, names []string, err error) {
+	return purgeBatchesContext(context.Background(), dir, olderThan, now, all, includeHeld, nil)
 }
 
 func purgeBatches(dir string, olderThan time.Duration, now time.Time, all bool, remaining *int64) (freed int64, names []string, err error) {
-	bs, err := ListBatches(dir)
+	return purgeBatchesContext(context.Background(), dir, olderThan, now, all, false, remaining)
+}
+
+// finishTombstones deletes batches an earlier purge renamed but did not
+// finish removing. They were already committed, so no budget applies.
+func finishTombstones(ctx context.Context, dir string) (freed int64, names []string, err error) {
+	ents, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil, nil
+	}
 	if err != nil {
 		return 0, nil, err
 	}
+	for _, de := range ents {
+		name, ok := strings.CutPrefix(de.Name(), tombstonePrefix)
+		if !ok || !de.IsDir() {
+			continue
+		}
+		if _, e := batchTime(name); e != nil {
+			continue
+		}
+		n, e := safefs.RemoveContext(ctx, filepath.Join(dir, de.Name()), nil)
+		if e != nil {
+			err = errors.Join(err, e)
+			continue
+		}
+		freed += n
+		names = append(names, name)
+	}
+	return freed, names, err
+}
+
+func purgeBatchesContext(ctx context.Context, dir string, olderThan time.Duration, now time.Time, all, includeHeld bool, remaining *int64) (freed int64, names []string, err error) {
+	freed, names, err = finishTombstones(ctx, dir)
+	bs, listErr := ListBatches(dir)
+	if listErr != nil {
+		return freed, names, errors.Join(err, listErr)
+	}
 	for _, b := range bs {
-		if b.Count < 0 && !all {
+		if b.Count < 0 && !includeHeld {
 			continue
 		}
 		if !all && now.Sub(b.Created) < olderThan {
@@ -326,7 +558,7 @@ func purgeBatches(dir string, olderThan time.Duration, now time.Time, all bool, 
 		}
 		p := filepath.Join(dir, b.Name)
 		// Preflight the whole batch before deleting any of it.
-		bytes, scanErr := safefs.Measure(p)
+		bytes, scanErr := safefs.MeasureContext(ctx, p)
 		if scanErr != nil {
 			err = errors.Join(err, scanErr)
 			continue
@@ -334,7 +566,23 @@ func purgeBatches(dir string, olderThan time.Duration, now time.Time, all bool, 
 		if remaining != nil && bytes > *remaining {
 			continue
 		}
-		if _, rmErr := safefs.Remove(p, remaining); rmErr != nil {
+		// Rename first so an interrupted delete never leaves a half batch that
+		// is still listed or restorable.
+		tomb := filepath.Join(dir, tombstonePrefix+b.Name)
+		if mvErr := safefs.MoveNoReplace(p, tomb); mvErr != nil {
+			err = errors.Join(err, mvErr)
+			continue
+		}
+		if syncErr := syncParents(dir); syncErr != nil {
+			err = errors.Join(err, syncErr)
+		}
+		if purgeCheckpoint != nil {
+			if cpErr := purgeCheckpoint("tombstoned"); cpErr != nil {
+				err = errors.Join(err, cpErr)
+				continue
+			}
+		}
+		if _, rmErr := safefs.RemoveContext(ctx, tomb, remaining); rmErr != nil {
 			err = errors.Join(err, rmErr)
 			continue
 		}
@@ -388,7 +636,7 @@ func (q *Quarantine) removeEmptyBatch() error {
 	if _, err := safefs.Measure(q.batchDir()); err != nil {
 		return err
 	}
-	var dirs []string
+	var dirs, temps []string
 	err := filepath.WalkDir(q.batchDir(), func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -400,10 +648,19 @@ func (q *Quarantine) removeEmptyBatch() error {
 		if p == q.manifestPath() && d.Type().IsRegular() {
 			return nil
 		}
+		if q.manifestTemp(p, d) {
+			temps = append(temps, p)
+			return nil
+		}
 		return fmt.Errorf("unrecorded quarantine data preserved at %s", p)
 	})
 	if err != nil {
 		return err
+	}
+	for _, t := range temps {
+		if err := os.Remove(t); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	// No recursive removals, even if a writer creates a file after the walk.
 	for i := len(dirs) - 1; i > 0; i-- {
@@ -420,12 +677,18 @@ func (q *Quarantine) removeEmptyBatch() error {
 // checkContents prevents automatic expiry from deleting files absent from a
 // manifest left by an older release or an interrupted journal update.
 func (q *Quarantine) checkContents() error {
+	return q.checkContentsContext(context.Background())
+}
+func (q *Quarantine) checkContentsContext(ctx context.Context) error {
 	for _, e := range q.man.Entries {
 		if !filepath.IsAbs(e.From) || filepath.Clean(e.To) != q.dest(e.From) {
 			return fmt.Errorf("invalid quarantine entry %q", e.To)
 		}
 	}
 	return filepath.WalkDir(q.batchDir(), func(path string, d os.DirEntry, err error) error {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
 		if err != nil {
 			return err
 		}
@@ -449,6 +712,24 @@ func (q *Quarantine) checkContents() error {
 		if d.IsDir() {
 			return nil
 		} // empty mirroring directories contain no unrecorded data
+		if q.manifestTemp(path, d) {
+			return nil
+		}
 		return fmt.Errorf("unrecorded quarantine data at %s", path)
 	})
+}
+
+// manifestTemp recognises a journal temp that writeManifest left behind when
+// it was interrupted. It is scaffolding, not payload; payload is never a
+// direct regular-file child of the batch named like one unless recorded,
+// and recorded entries are matched before this is consulted.
+func (q *Quarantine) manifestTemp(path string, d os.DirEntry) bool {
+	return filepath.Dir(path) == q.batchDir() && strings.HasPrefix(d.Name(), ".manifest-") && d.Type().IsRegular()
+}
+
+func (q *Quarantine) checkpointAt(stage string) error {
+	if q.checkpoint != nil {
+		return q.checkpoint(stage)
+	}
+	return nil
 }

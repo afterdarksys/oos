@@ -1,6 +1,7 @@
 package size
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -157,5 +158,35 @@ func TestSizeCacheFloorSkipsSmallDirs(t *testing.T) {
 	}
 	if _, ok := c.entries[dir]; !ok {
 		t.Error("the root over the floor must be stored")
+	}
+}
+
+func TestWriteJSONConcurrentWritersNeverTear(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	done := make(chan error)
+	for i := 0; i < 20; i++ {
+		go func(i int) {
+			v := map[string]int{}
+			for j := 0; j < 2000; j++ {
+				v[filepath.Join("/k", string(rune('a'+i%26)), time.Duration(j).String())] = i
+			}
+			done <- writeJSON(p, v)
+		}(i)
+	}
+	for i := 0; i < 20; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]int
+	if err := json.Unmarshal(b, &got); err != nil || len(got) != 2000 {
+		t.Fatalf("torn cache file: %v (%d keys)", err, len(got))
+	}
+	if m, _ := filepath.Glob(filepath.Join(filepath.Dir(p), ".cache.json.tmp-*")); len(m) != 0 {
+		t.Errorf("temp files left behind: %v", m)
 	}
 }

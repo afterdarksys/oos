@@ -7,7 +7,7 @@
     "require_yes": true,
     "max_delete_gb_per_run": 100,
     "allow_outside_home": false,
-    "allow_commands": true,
+    "allow_commands": false,
     "always_disallowed": [],
     "never_touch": [
       "/",
@@ -127,9 +127,8 @@
     {
       "path": "/var/lib/docker",
       "type": "vm",
-      "action": "command",
-      "command": "docker builder prune -f && docker image prune -f",
-      "note": "Docker data root. Never rm; ask the daemon. Needs docker group or sudo."
+      "action": "never",
+      "note": "Docker data root, under the built-in /var/lib protection. Never rm; prune by hand: docker builder prune -f && docker image prune -f (needs docker group or sudo)."
     },
     {
       "path": "~/.local/share/Trash",

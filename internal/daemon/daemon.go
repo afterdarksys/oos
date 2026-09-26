@@ -70,6 +70,9 @@ type SizedSummary struct {
 
 // AutoActStatus says whether the daemon may act and what it last did.
 type AutoActStatus struct {
+	Paused   bool               `json:"paused"`
+	Reason   string             `json:"pause_reason,omitempty"`
+	Failures int                `json:"consecutive_recovery_failures"`
 	Enabled  bool               `json:"enabled"`
 	TargetGB float64            `json:"target_gb"`
 	LastAt   time.Time          `json:"last_at,omitempty"`
@@ -77,22 +80,23 @@ type AutoActStatus struct {
 }
 
 // Daemon holds the loop's state. Only Tick mutates the tick-private fields
-// (sampler, lastAlert, lastSized, lastAct, prevFree); st is shared with the
+// (sampler, lastAlert, lastSized, recovery, prevFree); st is shared with the
 // socket and is only touched under mu, and never while anything slow runs.
+// The last auto-act time lives in recovery so a restart honours the cooldown.
 type Daemon struct {
-	mu      sync.Mutex
-	cfg     *config.Config
-	cfgSrc  string
-	env     guard.Env
-	deps    Deps
-	version string
-	st      Status
+	recovery RecoveryBrake
+	mu       sync.Mutex
+	cfg      *config.Config
+	cfgSrc   string
+	env      guard.Env
+	deps     Deps
+	version  string
+	st       Status
 
 	sampler   *Sampler
 	lastLabel string
 	lastAlert map[string]time.Time
 	lastSized time.Time
-	lastAct   time.Time
 	prevFree  float64
 	havePrev  bool
 }
@@ -116,6 +120,7 @@ func New(cfg *config.Config, cfgSrc string, env guard.Env, version string, deps 
 	d := &Daemon{cfg: cfg, cfgSrc: cfgSrc, env: env, deps: deps, version: version, sampler: NewSampler(), lastAlert: map[string]time.Time{}}
 	d.st = Status{Version: version, PID: os.Getpid(), Started: deps.Now(), Volume: cfg.Volume, Config: cfgSrc, Interval: cfg.Policy.Daemon.Interval().String()}
 	d.st.AutoAct = AutoActStatus{Enabled: cfg.Policy.Daemon.AutoAct, TargetGB: cfg.Policy.Daemon.Target(cfg.Policy)}
+	d.loadRecovery()
 	return d
 }
 
@@ -213,11 +218,15 @@ func (d *Daemon) Tick(now time.Time) Status {
 	label, _ := status.Of(p, du)
 	free := du.FreeGB()
 
-	st, _ := state.Load(p.StateFile)
-	st.Volume = cfg.Volume
-	st.Record("daemon", du, now)
-	if err := state.Save(p.StateFile, st); err != nil {
-		d.note("save state: " + err.Error())
+	st, err := state.Update(p.StateFile, func(s *state.State) {
+		s.Volume = cfg.Volume
+		s.Record("daemon", du, now)
+	})
+	if err != nil {
+		// the state file is left as it is; the forecast works from this reading alone
+		d.note("state: " + err.Error())
+		st.Volume = cfg.Volume
+		st.Record("daemon", du, now)
 	}
 	fc := st.Forecast(now, p.ForecastWindow(), p.WarnFreeGB, p.MinFreeGB)
 
@@ -274,24 +283,35 @@ func (d *Daemon) Tick(now time.Time) Status {
 	}
 
 	// expired quarantine, as the hourly tick does
-	if p.Quarantine && p.AgentPurgeExpired {
-		olderThan := time.Duration(p.QuarantineDays) * 24 * time.Hour
-		if freed, names, perr := plan.PurgeBatches(p.QuarantineDir, olderThan, now, false); len(names) > 0 || perr != nil {
+	if p.Quarantine && p.AgentPurgeExpired && !d.recovery.Paused {
+		if freed, names, perr := plan.PurgeConfigured(cfg, now); len(names) > 0 || perr != nil {
 			d.logf("purge expired quarantine: freed=%s batches=%s err=%v", size.Human(freed), strings.Join(names, ","), perr)
 		}
 	}
 
-	// act only when told to, only under critical, only after the cooldown
-	if dp.AutoAct && label == "CRITICAL" && (d.lastAct.IsZero() || now.Sub(d.lastAct) >= dp.Cooldown()) {
-		d.lastAct = now
+	// act only when told to, only under critical, only after the cooldown,
+	// and never once shutdown has begun
+	stopping := d.env.Ctx != nil && d.env.Ctx.Err() != nil
+	last := d.recovery.LastAct
+	// A last_act in the future (the clock moved back) does not block.
+	if dp.AutoAct && !stopping && !d.recovery.Paused && label == "CRITICAL" && (last.IsZero() || last.After(now) || now.Sub(last) >= dp.Cooldown()) && d.startAct(now) {
 		target := dp.Target(p)
 		d.busy("acting: ensure " + fmt.Sprintf("%.0f GB", target))
 		res, err := d.deps.Ensure(cfg, d.env, target, true, now)
+		if lockBusy(err) {
+			// another oos held the mutation lock: nothing was tried, so the
+			// cooldown does not start and the brake does not count it
+			d.recovery.LastAct = last
+		}
+		d.recovery.Observe(res, err, dp.RecoveryFailureLimit)
+		d.saveRecovery()
 		d.busy("")
 		d.set(func(s *Status) { s.AutoAct.LastAt = now; s.AutoAct.Last = &res })
 		if err != nil {
 			d.note("auto-act: " + err.Error())
-			d.alert(dp, "auto-act", "oos: could not act", err.Error(), now, true)
+			if !lockBusy(err) {
+				d.alert(dp, "auto-act", "oos: could not act", err.Error(), now, true)
+			}
 		} else {
 			verb := "reached"
 			if !res.Reached {
@@ -318,6 +338,19 @@ func (d *Daemon) Tick(now time.Time) Status {
 	return d.Snapshot()
 }
 
+// startAct persists the action time before acting, so a crash or restart
+// mid-act still waits out the cooldown. If that cannot be persisted the brake
+// pauses and there is no action.
+func (d *Daemon) startAct(now time.Time) bool {
+	d.recovery.LastAct = now
+	d.saveRecovery()
+	if d.recovery.Paused {
+		d.note("auto-act: " + d.recovery.Reason)
+		return false
+	}
+	return true
+}
+
 func (d *Daemon) sized(cfg *config.Config, now time.Time) {
 	start := d.deps.Now()
 	items := plan.Build(cfg, d.env, nil, now)
@@ -330,11 +363,12 @@ func (d *Daemon) sized(cfg *config.Config, now time.Time) {
 			sum.Reclaimable += it.Reclaimable
 		}
 	}
-	if st, err := state.Load(cfg.Policy.StateFile); err == nil {
+	if _, err := state.Update(cfg.Policy.StateFile, func(st *state.State) {
 		for k, v := range sum.Known {
 			st.Known[k] = v
 		}
-		_ = state.Save(cfg.Policy.StateFile, st)
+	}); err != nil {
+		d.note("sized state: " + err.Error())
 	}
 	if want, _ := docker.Wanted(cfg.Policy); want {
 		if u, err := docker.Collect(docker.Timeout(cfg.Policy)); err == nil {
@@ -359,11 +393,14 @@ func describeWriters(ws []Writer, n int) string {
 	return strings.Join(parts, ", ")
 }
 
-// Run ticks until ctx ends. The first tick is immediate.
+// Run ticks until ctx ends. The first tick is immediate. ctx also reaches
+// the ensure path through env.Ctx, so a SIGTERM stops a running cleanup at
+// its next safe point instead of being SIGKILLed mid-delete.
 func (d *Daemon) Run(ctx context.Context) {
+	d.env.Ctx = ctx
 	cfg := d.config()
 	d.logf("oos daemon %s started on %s, interval %s, socket %q, auto_act=%v", d.version, cfg.Volume, cfg.Policy.Daemon.Interval(), cfg.Policy.Daemon.SocketPath(d.env.Home), cfg.Policy.Daemon.AutoAct)
-	d.Tick(d.deps.Now())
+	d.safeTick()
 	for {
 		wait := d.config().Policy.Daemon.Interval()
 		select {
@@ -371,7 +408,19 @@ func (d *Daemon) Run(ctx context.Context) {
 			d.logf("stopping: %v", ctx.Err())
 			return
 		case <-time.After(wait):
-			d.Tick(d.deps.Now())
+			d.safeTick()
 		}
 	}
+}
+
+// safeTick runs one tick; a panic is recorded as an error, not a crash, so
+// one bad tick cannot put the service manager into a restart loop.
+func (d *Daemon) safeTick() {
+	defer func() {
+		if r := recover(); r != nil {
+			d.busy("")
+			d.note(fmt.Sprintf("tick panic: %v", r))
+		}
+	}()
+	d.Tick(d.deps.Now())
 }

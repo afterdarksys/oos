@@ -195,9 +195,10 @@ func doEnsure(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, er
 	return status.ExitCritical
 }
 
-// configFileForEdit returns the config path --add/--forget should modify,
-// seeding ~/.config/oos/oos.json from the embedded default when nothing
-// on disk exists yet.
+// configFileForEdit returns the config path --add/--forget should modify:
+// --config when given, else ~/.config/oos/oos.json (the working directory
+// is never consulted), seeded from the embedded default when it does not
+// exist yet.
 func configFileForEdit(o *opts, home string) (string, error) {
 	if o.config != "" {
 		return o.config, nil
@@ -219,8 +220,10 @@ func configFileForEdit(o *opts, home string) (string, error) {
 
 // rewriteConfig applies edit to the raw JSON document, validates the result
 // by parsing it exactly as loadConfig would, and only then writes it.
+// The file must pass the same owner and mode check as loading: editing a
+// config another user can write would launder it into one oos trusts.
 func rewriteConfig(path, home string, edit func(doc map[string]any) error) error {
-	b, err := os.ReadFile(path)
+	b, err := config.ReadFile(path)
 	if err != nil {
 		return err
 	}

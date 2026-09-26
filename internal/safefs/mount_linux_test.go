@@ -10,6 +10,10 @@ import (
 )
 
 func TestLinuxBindMountBoundary(t *testing.T) {
+	marker, markerErr := os.ReadFile("/etc/oos-disposable-vm")
+	if os.Getenv("OOS_DISPOSABLE_VM") != "1" || markerErr != nil || string(marker) != "OOS-DISPOSABLE-VM-V1\n" {
+		t.Skip("requires disposable VM opt-in")
+	}
 	home := t.TempDir()
 	source := filepath.Join(home, "source")
 	tree := filepath.Join(home, "tree")

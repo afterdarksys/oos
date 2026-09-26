@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,11 +30,26 @@ func doDaemon(cfg *config.Config, src string, env guard.Env, o *opts, stdout, st
 		defer lf.Close()
 		logw = io.MultiWriter(stdout, lf)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// the signal context reaches Ensure, so SIGTERM at logout stops a cleanup
+	// at a safe point before launchd or systemd escalate to SIGKILL
+	env.Ctx = ctx
 	d := daemon.New(cfg, src, env, Version, daemon.Deps{
 		Disk: size.Disk, Now: time.Now, Notify: agent.Notify, OpenFiles: guard.OpenFilesByProcess, Log: logw,
 	})
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// claim the socket before ticking: a second daemon must exit, not act as a duplicate
+	sock := cfg.Policy.Daemon.SocketPath(env.Home)
+	ln, err := daemon.Listen(sock)
+	if errors.Is(err, daemon.ErrRunning) {
+		// a clean exit: launchd's KeepAlive{SuccessfulExit=false} must not respawn a duplicate
+		fmt.Fprintln(stderr, "oos: daemon:", err)
+		return status.ExitOK
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "oos: daemon:", err)
+		return status.ExitUsage
+	}
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
@@ -47,7 +63,13 @@ func doDaemon(cfg *config.Config, src string, env guard.Env, o *opts, stdout, st
 		}
 	}()
 	errc := make(chan error, 1)
-	go func() { errc <- daemon.Serve(ctx, cfg.Policy.Daemon.SocketPath(env.Home), d) }()
+	go func() {
+		err := daemon.ServeOn(ctx, ln, sock, d)
+		if err != nil {
+			stop() // a daemon that cannot answer --status stops rather than run blind
+		}
+		errc <- err
+	}()
 	d.Run(ctx)
 	if err := <-errc; err != nil {
 		fmt.Fprintln(stderr, "oos: daemon:", err)
@@ -62,7 +84,10 @@ func doStatus(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) i
 	sock := cfg.Policy.Daemon.SocketPath(env.Home)
 	s, err := daemon.Query(sock, 3*time.Second)
 	if err != nil {
-		st, _ := state.Load(cfg.Policy.StateFile)
+		st, serr := state.Load(cfg.Policy.StateFile)
+		if serr != nil {
+			fmt.Fprintf(errw, "oos: read state: %v\n", serr)
+		}
 		du, derr := size.Disk(cfg.Volume)
 		if derr != nil {
 			fmt.Fprintf(errw, "oos: statfs %s: %v\n", cfg.Volume, derr)
@@ -100,6 +125,9 @@ func doStatus(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) i
 	fmt.Fprintf(out, "  %s: %.1f GB free of %.1f GB on %s; last tick %s, next %s\n", strings.ToLower(s.Label), s.FreeGB, s.TotalGB, s.Volume,
 		s.LastTick.Local().Format("15:04:05"), s.NextTick.Local().Format("15:04:05"))
 	fmt.Fprintf(out, "  %s\n", s.Forecast.String())
+	if s.AutoAct.Paused {
+		fmt.Fprintf(out, "  automatic cleanup PAUSED: %s\n", s.AutoAct.Reason)
+	}
 	if s.Busy != "" {
 		fmt.Fprintf(out, "  busy: %s\n", s.Busy)
 	}
@@ -145,12 +173,8 @@ func doInstallDaemon(env guard.Env, o *opts, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "daemon removed; --install-agent brings the hourly tick back")
 		return status.ExitOK
 	}
-	exe, err := os.Executable()
-	if err == nil {
-		if r, e2 := filepath.EvalSymlinks(exe); e2 == nil {
-			exe = r
-		}
-	}
+	// the stable path, not the resolved one: a Homebrew Cellar path dies on upgrade
+	exe, err := agent.StableExecutable()
 	if err != nil {
 		fmt.Fprintln(stderr, "oos: cannot resolve own path:", err)
 		return status.ExitUsage

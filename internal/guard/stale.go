@@ -1,14 +1,18 @@
 package guard
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/afterdarksys/oos/internal/safefs"
+	"github.com/afterdarksys/oos/internal/size"
+	"github.com/afterdarksys/oos/internal/worklimit"
 )
 
 // ChildPlan is one direct child of an rm-stale-children directory.
@@ -79,6 +83,9 @@ func Referenced(child string, refs []string) bool {
 // floor. Everything else is a delete candidate. Every non-symlink child is
 // sized so the plan can show what is kept and why.
 func ClassifyChildren(dir string, staleAfter time.Duration, refs []string, now time.Time) ([]ChildPlan, error) {
+	return ClassifyChildrenContext(context.Background(), dir, staleAfter, refs, now)
+}
+func ClassifyChildrenContext(ctx context.Context, dir string, staleAfter time.Duration, refs []string, now time.Time) ([]ChildPlan, error) {
 	ents, err := safefs.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -98,12 +105,20 @@ func ClassifyChildren(dir string, staleAfter time.Duration, refs []string, now t
 			c.Keep = "lock file"
 		case Referenced(p, refs):
 			c.Keep = "referenced by a running process"
-		case now.Sub(fi.ModTime()) < staleAfter:
-			c.Keep = fmt.Sprintf("modified %s ago, inside the %s floor", now.Sub(fi.ModTime()).Round(time.Minute), staleAfter)
+		default:
+			newest, err := NewestChange(ctx, p)
+			if err != nil {
+				c.Keep = fmt.Sprintf("staleness unknown: %v", err)
+				break
+			}
+			c.ModTime = newest
+			if now.Sub(newest) < staleAfter {
+				c.Keep = fmt.Sprintf("modified %s ago, inside the %s floor", now.Sub(newest).Round(time.Minute), staleAfter)
+			}
 		}
 		if c.Keep != "symlink" {
 			var err error
-			c.Bytes, err = safefs.Measure(p)
+			c.Bytes, err = safefs.MeasureContext(ctx, p)
 			if err != nil {
 				return nil, err
 			}
@@ -111,4 +126,69 @@ func ClassifyChildren(dir string, staleAfter time.Duration, refs []string, now t
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// StaleWalkMax bounds the entries NewestChange visits under one child. A
+// child larger than this is kept: its age cannot be established cheaply.
+var StaleWalkMax = 200000
+
+// StaleUsesChangeTime counts ctime as well as mtime. Extracting an archive
+// or copying with preserved times leaves old mtimes on new files; ctime is
+// set by the kernel and records the arrival. It cannot be set from user
+// space, so tests that age fixtures with Chtimes turn it off.
+var StaleUsesChangeTime = true
+
+// NewestChange is the newest modification (and, where the platform exposes
+// it, status change) time of path and everything under it. Symlinks are not
+// followed and a directory on another device is an error, as is exceeding
+// StaleWalkMax or the context's work budget. Callers treat any error as
+// "not stale".
+func NewestChange(ctx context.Context, path string) (time.Time, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	root, err := os.Lstat(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	dev, ok := size.DeviceOf(root)
+	if !ok {
+		return time.Time{}, errors.New("device id unavailable")
+	}
+	var newest time.Time
+	seen := 0
+	err = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := worklimit.Step(ctx); err != nil {
+			return err
+		}
+		if seen++; seen > StaleWalkMax {
+			return fmt.Errorf("more than %d entries under %s", StaleWalkMax, path)
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if fi.IsDir() {
+			if dd, ok := size.DeviceOf(fi); !ok || dd != dev {
+				return fmt.Errorf("mount boundary at %s", p)
+			}
+		}
+		t := fi.ModTime()
+		if StaleUsesChangeTime {
+			if ct, ok := changeTime(fi); ok && ct.After(t) {
+				t = ct
+			}
+		}
+		if t.After(newest) {
+			newest = t
+		}
+		return nil
+	})
+	if err != nil {
+		return time.Time{}, err
+	}
+	return newest, nil
 }

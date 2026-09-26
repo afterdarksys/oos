@@ -60,8 +60,8 @@ func TestBuildReportsReclaimableUnderClones(t *testing.T) {
 	if it.Refused != nil || it.Deletable < 3*(400<<10) {
 		t.Fatalf("item: %+v", it)
 	}
-	if it.Reclaimable >= it.Deletable || it.Reclaimable < 400<<10 {
-		t.Errorf("reclaimable=%d should be about one copy, deletable=%d", it.Reclaimable, it.Deletable)
+	if it.Reclaimable != it.Deletable {
+		t.Errorf("reclaimable=%d should remain an upper estimate, deletable=%d", it.Reclaimable, it.Deletable)
 	}
 }
 
@@ -74,7 +74,7 @@ func TestStaleReclaimableCountsSharedChildrenOnce(t *testing.T) {
 	cloneOrSkip(t, filepath.Join(dir, "kept", "lib.so"), filepath.Join(dir, "stale1"))
 	cloneOrSkip(t, filepath.Join(dir, "kept", "lib.so"), filepath.Join(dir, "stale2"))
 	for _, c := range []string{"stale1", "stale2"} {
-		testutil.Age(t, filepath.Join(dir, c), 48*time.Hour)
+		testutil.AgeTree(t, filepath.Join(dir, c), 48*time.Hour)
 	}
 	// kept stays fresh by mtime; the clones aged out
 	old := UniqueFloor
@@ -91,8 +91,8 @@ func TestStaleReclaimableCountsSharedChildrenOnce(t *testing.T) {
 	}
 	// both stale children share blocks with the kept child, which stays, so
 	// removing them returns almost nothing
-	if it.Reclaimable >= 400<<10 {
-		t.Errorf("reclaimable=%d should be near zero when the origin is kept, deletable=%d", it.Reclaimable, it.Deletable)
+	if it.Reclaimable != it.Deletable {
+		t.Errorf("reclaimable=%d must preserve unknown clone ownership as an upper estimate, deletable=%d", it.Reclaimable, it.Deletable)
 	}
 }
 

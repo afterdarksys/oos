@@ -7,13 +7,19 @@ package protect
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
-// Builtin is the always_disallowed list compiled into the binary. "/" matches
-// only itself. Entries starting with "~/" are resolved against the home
-// directory at check time. /usr is the operating system; /usr/local is not.
-var Builtin = []string{
+// Builtin is the always_disallowed list compiled into the binary for this
+// platform. "/" matches only itself. Entries starting with "~/" are resolved
+// against the home directory at check time. /usr is the operating system;
+// /usr/local is not.
+var Builtin = BuiltinFor(runtime.GOOS)
+
+// common applies on every platform. Credential stores are listed here even
+// when they began life on one OS: a token file is a token file.
+var common = []string{
 	"/",
 	"/System",
 	"/usr",
@@ -36,7 +42,84 @@ var Builtin = []string{
 	"~/.aws",
 	"~/.kube",
 	"~/Library/Keychains",
+	"~/.password-store",
+	"~/.netrc",
+	"~/.git-credentials",
+	"~/.docker",
+	"~/.config/gcloud",
+	"~/.azure",
+	"~/.config/gh",
 }
+
+// darwin protects system configuration and user data stores. /Library as a
+// whole is not listed: /Library/Developer/CoreSimulator is a shipped default
+// entry, so only the subdirectories that hold system state are.
+var darwin = []string{
+	"/Applications",
+	"/Library/Keychains",
+	"/Library/LaunchDaemons",
+	"/Library/LaunchAgents",
+	"/Library/Preferences",
+	"/Library/Extensions",
+	"/Library/Application Support/com.apple.TCC",
+	"/private/etc",
+	"/private/var/root",
+	"/var/root",
+	"/private/var/vm",
+	"/var/vm",
+	"/private/var/protected",
+	"/var/protected",
+	"/System/Volumes/Preboot",
+	"/System/Volumes/Recovery",
+	"~/Library/Mobile Documents",
+	"~/Library/CloudStorage",
+	"~/Library/Mail",
+	"~/Library/Messages",
+	"~/Library/Application Support/MobileSync",
+	"~/Library/Accounts",
+	"~/Library/Cookies",
+	"~/Pictures/Photos Library.photoslibrary",
+}
+
+// linux protects the FHS system trees and per-user secret stores. /var/lib
+// holds package databases and service state (databases, containers).
+var linux = []string{
+	"/efi",
+	"/lib32",
+	"/libx32",
+	"/proc",
+	"/sys",
+	"/dev",
+	"/run",
+	"/root",
+	"/snap",
+	"/nix",
+	"/opt",
+	"/var/lib",
+	"~/.local/share/keyrings",
+	"~/.local/share/kwalletd",
+	"~/.pki",
+	"~/.mozilla",
+}
+
+// BuiltinFor is the built-in list for goos.
+func BuiltinFor(goos string) []string {
+	out := append([]string{}, common...)
+	switch goos {
+	case "darwin":
+		out = append(out, darwin...)
+	case "linux":
+		out = append(out, linux...)
+	}
+	return out
+}
+
+// PhotosLibrary is the bundle suffix Photos uses. A library can live
+// anywhere, so any path component carrying it is protected, not only the
+// default ~/Pictures location. Detecting a library below a directory that
+// is about to be removed would need a walk; the removal walk does not look
+// for bundles, so the ancestor case is covered only by never_touch.
+const PhotosLibrary = ".photoslibrary"
 
 // InstallDataDirs are created while a macOS upgrade is staged. Tests point
 // them at a temporary directory. A non-empty directory means an install is
@@ -71,6 +154,11 @@ func Hit(path, home string, extra []string) (string, bool) {
 			return raw, true
 		}
 	}
+	for _, part := range strings.Split(path, string(filepath.Separator)) {
+		if len(part) > len(PhotosLibrary) && strings.HasSuffix(strings.ToLower(part), PhotosLibrary) {
+			return "*" + PhotosLibrary, true
+		}
+	}
 	return "", false
 }
 
@@ -101,15 +189,126 @@ func CommandHitsOS(cmd string) (string, bool) {
 
 // CommandHits reports when a shell command names an always_disallowed path,
 // including home-relative entries once home is known, and any extra from
-// the config. /usr/local is not a hit unless extra lists it.
+// the config (callers pass never_touch here too). /usr/local is not a hit
+// unless extra lists it.
+//
+// The scan is advisory. It reads the command text, not what the shell will
+// do: a variable, a glob, a cd, or a script the command runs can reach a
+// protected path without naming it. It catches the plain mistakes; the real
+// gate for commands is allow_commands, which defaults to false. Matching is
+// case-insensitive (APFS and HFS+ are), $HOME, ${HOME} and ~ are expanded,
+// and the /private and /System/Volumes/Data spellings of a path are also
+// read as the short form, so /private/etc/x names /etc.
 func CommandHits(cmd, home string, extra []string) (string, bool) {
 	if strings.TrimSpace(cmd) == "" {
 		return "", false
 	}
-	if prefix, ok := scanCommand(cmd, home, extra); ok {
-		return prefix, true
+	for _, form := range commandForms(cmd, home) {
+		if prefix, ok := wholeTree(form, home); ok {
+			return prefix, true
+		}
+		if prefix, ok := scanCommand(form, home, extra); ok {
+			return prefix, true
+		}
+		if prefix, ok := scanCommand(form, home, Builtin); ok {
+			return prefix, true
+		}
 	}
-	return scanCommand(cmd, home, Builtin)
+	return "", false
+}
+
+// commandForms is the lowercased command with quotes dropped, the home
+// spellings expanded and each absolute path cleaned (so "$HOME"/.ssh,
+// /x//y and /usr/local/../bin read as the paths they name), followed by the
+// same text with the firmlink and /private aliases removed.
+func commandForms(cmd, home string) []string {
+	cmd = strings.ToLower(cmd)
+	cmd = strings.NewReplacer(`"`, "", `'`, "").Replace(cmd)
+	if home != "" {
+		h := strings.ToLower(filepath.Clean(home))
+		cmd = strings.ReplaceAll(cmd, "${home}", h)
+		cmd = strings.ReplaceAll(cmd, "$home", h)
+		cmd = expandTilde(cmd, "~"+filepath.Base(h), h)
+		cmd = expandTilde(cmd, "~", h)
+	}
+	cmd = cleanPaths(cmd)
+	forms := []string{cmd}
+	for _, alias := range []string{"/system/volumes/data", "/private"} {
+		if short := dropAlias(cmd, alias); short != cmd {
+			forms = append(forms, short)
+		}
+	}
+	return forms
+}
+
+// expandTilde replaces tilde (~, or ~user for the home's own user) where it
+// starts a word and is followed by "/" or a word boundary. Other ~user forms
+// and a ~ inside a word are left alone.
+func expandTilde(cmd, tilde, home string) string {
+	var b strings.Builder
+	for i := 0; i < len(cmd); {
+		end := i + len(tilde)
+		if strings.HasPrefix(cmd[i:], tilde) && (i == 0 || isBoundary(cmd[i-1])) && (end == len(cmd) || cmd[end] == '/' || isBoundary(cmd[end])) {
+			b.WriteString(home)
+			i = end
+			continue
+		}
+		b.WriteByte(cmd[i])
+		i++
+	}
+	return b.String()
+}
+
+// cleanPaths runs filepath.Clean over every word that starts with "/".
+func cleanPaths(cmd string) string {
+	var b strings.Builder
+	for i := 0; i < len(cmd); {
+		if cmd[i] != '/' || (i > 0 && !isBoundary(cmd[i-1])) {
+			b.WriteByte(cmd[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(cmd) && !isBoundary(cmd[j]) {
+			j++
+		}
+		b.WriteString(filepath.Clean(cmd[i:j]))
+		i = j
+	}
+	return b.String()
+}
+
+// wholeTree reports a word that names the root or the home itself, alone or
+// with a trailing glob: rm -rf /, find / -delete, rm -rf ~/*.
+func wholeTree(cmd, home string) (string, bool) {
+	h := ""
+	if home != "" {
+		h = strings.ToLower(filepath.Clean(home))
+	}
+	for _, w := range strings.FieldsFunc(cmd, func(r rune) bool { return r < 128 && isBoundary(byte(r)) }) {
+		w = strings.TrimRight(w, "*")
+		if w == "/" {
+			return "/", true
+		}
+		if h != "" && strings.TrimSuffix(w, "/") == h {
+			return "~", true
+		}
+	}
+	return "", false
+}
+
+// dropAlias removes alias where it starts a word and is followed by "/".
+func dropAlias(cmd, alias string) string {
+	var b strings.Builder
+	for i := 0; i < len(cmd); {
+		if strings.HasPrefix(cmd[i:], alias+"/") && (i == 0 || isBoundary(cmd[i-1])) {
+			i += len(alias)
+			continue
+		}
+		b.WriteByte(cmd[i])
+		i++
+	}
+	return b.String()
 }
 
 func scanCommand(cmd, home string, list []string) (string, bool) {
@@ -123,7 +322,7 @@ func scanCommand(cmd, home string, list []string) (string, bool) {
 			cands = append(cands, filepath.Clean(home+strings.TrimPrefix(raw, "~")))
 		}
 		for _, p := range cands {
-			if mentions(cmd, p) {
+			if mentions(cmd, strings.ToLower(p)) {
 				return raw, true
 			}
 		}
@@ -159,7 +358,7 @@ func localUsr(cmd string, at int, prefix string) bool {
 
 func isBoundary(b byte) bool {
 	switch b {
-	case ' ', '\t', '\n', '"', '\'', '=', ';', '|', '&', '<', '>', '(', ')':
+	case ' ', '\t', '\n', '"', '\'', '=', ';', '|', '&', '<', '>', '(', ')', ':', ',', '`', '{', '}':
 		return true
 	default:
 		return false
@@ -167,14 +366,33 @@ func isBoundary(b byte) bool {
 }
 
 // installBins are process basenames that mean an OS or package install is
-// writing the machine. softwareupdated is the always-on daemon and is not
-// in this list.
+// writing the machine. Only programs that run for the length of an install
+// are listed; anything resident on an idle system would freeze oos forever.
+// softwareupdated (macOS), snapd and packagekitd (Linux) are daemons that
+// stay up between installs and are not in this list. Package manager lock
+// files are not used either: dpkg and rpm locks exist while idle.
 var installBins = []string{
 	"osinstallersetupd",
 	"InstallAssistant",
 	"startosinstall",
 	"installer",
+	"softwareupdate",
+	"apt",
+	"apt-get",
+	"dpkg",
+	"dnf",
+	"yum",
+	"rpm",
+	"pacman",
+	"zypper",
+	"unattended-upgr",
+	"unattended-upgrade",
+	"flatpak",
 }
+
+// interpreters run package managers written as scripts (dnf, yum,
+// unattended-upgrade); the program is then the first argument.
+var interpreters = []string{"python", "python2", "python3", "perl", "sh", "bash", "dash"}
 
 // InstallerCommand reports whether one process command line is an installer.
 func InstallerCommand(cmd string) bool {
@@ -183,12 +401,24 @@ func InstallerCommand(cmd string) bool {
 		return false
 	}
 	base := filepath.Base(fields[0])
+	if len(fields) > 1 && isInterpreter(base) {
+		base = filepath.Base(fields[1])
+	}
 	for _, n := range installBins {
 		if base == n {
 			return true
 		}
 	}
 	return strings.Contains(cmd, "Install macOS")
+}
+
+func isInterpreter(base string) bool {
+	for _, n := range interpreters {
+		if base == n || strings.HasPrefix(base, n+".") {
+			return true
+		}
+	}
+	return false
 }
 
 // StagedInstall reports a macOS upgrade payload still on disk.

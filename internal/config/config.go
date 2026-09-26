@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -74,9 +75,16 @@ type Policy struct {
 	// Quarantine: when true, rm actions move into QuarantineDir/<batch>/ instead
 	// of deleting. Space comes back on --purge (batches older than
 	// QuarantineDays) or --purge-now.
-	Quarantine     bool   `json:"quarantine"`
-	QuarantineDir  string `json:"quarantine_dir"`
-	QuarantineDays int    `json:"quarantine_days"`
+	Quarantine              bool               `json:"quarantine"`
+	QuarantineDir           string             `json:"quarantine_dir"`
+	QuarantineDays          int                `json:"quarantine_days"`
+	QuarantineHash          bool               `json:"quarantine_hash,omitempty"`
+	QuarantineVolumes       []QuarantineVolume `json:"quarantine_volumes,omitempty"`
+	OperationTimeoutSeconds int                `json:"operation_timeout_seconds,omitempty"`
+	ScanConcurrency         int                `json:"scan_concurrency,omitempty"`
+
+	ScanMaxEntries       int64 `json:"scan_max_entries,omitempty"`
+	VerificationMaxBytes int64 `json:"verification_max_bytes,omitempty"`
 
 	// Owners map path patterns to use-case labels for reports and --who.
 	Owners []Owner `json:"owners,omitempty"`
@@ -117,10 +125,57 @@ type Policy struct {
 	Daemon DaemonPolicy `json:"daemon,omitempty"`
 }
 
+type QuarantineVolume struct {
+	Volume    string `json:"volume"`
+	Directory string `json:"directory"`
+}
+
+func (p Policy) QuarantineFor(path string) string {
+	result := p.QuarantineDir
+	longest := 0
+	for _, v := range p.QuarantineVolumes {
+		if IsUnder(path, v.Volume) && len(v.Volume) > longest {
+			result = v.Directory
+			longest = len(v.Volume)
+		}
+	}
+	return result
+}
+func (p Policy) QuarantineStores() []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, d := range append([]string{p.QuarantineDir}, func() []string {
+		var a []string
+		for _, v := range p.QuarantineVolumes {
+			a = append(a, v.Directory)
+		}
+		return a
+	}()...) {
+		if d != "" && !seen[d] {
+			out = append(out, d)
+			seen[d] = true
+		}
+	}
+	return out
+}
+func (p Policy) OperationTimeout() time.Duration {
+	if p.OperationTimeoutSeconds > 0 {
+		return time.Duration(p.OperationTimeoutSeconds) * time.Second
+	}
+	return 5 * time.Minute
+}
+func (p Policy) Workers() int {
+	if p.ScanConcurrency > 0 {
+		return p.ScanConcurrency
+	}
+	return 2
+}
+
 // DaemonPolicy tunes the resident process. Watching is always on; the
 // status socket, the writer sampler and the periodic sized check can be
 // turned off; acting is off unless auto_act is true.
 type DaemonPolicy struct {
+	RecoveryFailureLimit   int     `json:"recovery_failure_limit,omitempty"`
 	IntervalMinutes        float64 `json:"interval_minutes,omitempty"`          // between ticks (default 5, minimum 1)
 	Socket                 string  `json:"socket,omitempty"`                    // unix socket --status asks (default ~/.local/state/oos/oos.sock; "off" disables)
 	SizedEveryHours        float64 `json:"sized_every_hours,omitempty"`         // refresh known-entry sizes this often (default 6; negative never)
@@ -262,19 +317,43 @@ func ExpandHome(p, home string) string {
 	return filepath.Clean(p)
 }
 
-// Candidates is the lookup order when --config is not given.
+// Candidates is the lookup order when --config is not given. The working
+// directory is not searched: a config there would be picked up from
+// whatever directory oos happens to run in, and a config can mark paths
+// for deletion. --config names one explicitly.
 func Candidates(home string) []string {
 	return []string{
-		"oos.json",
 		filepath.Join(home, ".config", "oos", "oos.json"),
 	}
+}
+
+// ReadFile reads a config file after checking who can write it. A config
+// decides what gets deleted, so one that another user could have written is
+// refused rather than trusted.
+func ReadFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("config %s is not a regular file", path)
+	}
+	if err := checkOwner(path, fi); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(f)
 }
 
 // Load reads the first config found, or the embedded default.
 // It returns the config, the source it came from, and any error.
 func Load(explicit, home string) (*Config, string, error) {
 	if explicit != "" {
-		b, err := os.ReadFile(explicit)
+		b, err := ReadFile(explicit)
 		if err != nil {
 			return nil, "", fmt.Errorf("read config %s: %w", explicit, err)
 		}
@@ -282,7 +361,7 @@ func Load(explicit, home string) (*Config, string, error) {
 		return cfg, explicit, err
 	}
 	for _, c := range Candidates(home) {
-		b, err := os.ReadFile(c)
+		b, err := ReadFile(c)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -317,6 +396,10 @@ func (c *Config) expand(home string) {
 	c.Volume = ExpandHome(c.Volume, home)
 	c.Policy.LogFile = ExpandHome(c.Policy.LogFile, home)
 	c.Policy.StateFile = ExpandHome(c.Policy.StateFile, home)
+	for i := range c.Policy.QuarantineVolumes {
+		c.Policy.QuarantineVolumes[i].Volume = ExpandHome(c.Policy.QuarantineVolumes[i].Volume, home)
+		c.Policy.QuarantineVolumes[i].Directory = ExpandHome(c.Policy.QuarantineVolumes[i].Directory, home)
+	}
 	if c.Policy.QuarantineDir != "" {
 		c.Policy.QuarantineDir = ExpandHome(c.Policy.QuarantineDir, home)
 	}
@@ -361,6 +444,37 @@ func (c *Config) validate() error {
 	}
 	if p.WarnFreeGB < p.MinFreeGB {
 		add("policy.warn_free_gb (%.0f) must be >= min_free_gb (%.0f)", p.WarnFreeGB, p.MinFreeGB)
+	}
+	if p.ScanMaxEntries < 0 || p.VerificationMaxBytes < 0 {
+		add("work budgets must be nonnegative")
+	}
+	if p.OperationTimeoutSeconds < 0 {
+		add("operation_timeout_seconds must be nonnegative")
+	}
+	if p.ScanConcurrency < 0 || p.ScanConcurrency > 16 {
+		add("scan_concurrency must be between 1 and 16, or zero for default")
+	}
+	if p.Daemon.RecoveryFailureLimit < 0 {
+		add("recovery_failure_limit must be nonnegative")
+	}
+	seenVolumes := map[string]bool{}
+	for _, v := range p.QuarantineVolumes {
+		if !filepath.IsAbs(v.Volume) || !filepath.IsAbs(v.Directory) {
+			add("quarantine volume and directory must be absolute")
+		}
+		if seenVolumes[v.Volume] {
+			add("duplicate quarantine volume %s", v.Volume)
+		}
+		seenVolumes[v.Volume] = true
+		if !IsUnder(v.Directory, v.Volume) {
+			add("quarantine directory must be under its configured volume")
+		}
+		if !p.AllowOutsideHome && !IsUnder(v.Directory, c.Home) {
+			add("quarantine directory outside home requires allow_outside_home")
+		}
+		if prefix, ok := protect.Hit(v.Directory, c.Home, p.AlwaysDisallowed); ok {
+			add("quarantine directory is protected by %s", prefix)
+		}
 	}
 	if p.MaxDeleteGBPerRun <= 0 {
 		add("policy.max_delete_gb_per_run must be > 0")
@@ -496,8 +610,15 @@ func (c *Config) validate() error {
 			add("%s %q sets stale_after_hours but action is %q", kind, e.Path, e.Action)
 		}
 		if IsDestructive(e.Action) {
+			for _, dir := range p.QuarantineStores() {
+				if IsUnder(dir, e.Path) || IsUnder(e.Path, dir) {
+					add("entry %s overlaps quarantine store %s", e.Path, dir)
+				}
+			}
 			for _, f := range []struct{ name, path string }{
 				{"log_file", p.LogFile}, {"state_file", p.StateFile}, {"quarantine_dir", p.QuarantineDir},
+				{"quarantine_index", p.StateFile + ".quarantine-index.json"}, {"auto_act_state", p.StateFile + ".auto-act.json"},
+				{"mutation_lock", filepath.Join(c.Home, ".local/state/oos/mutation.lock")},
 			} {
 				if f.path != "" && (IsUnder(f.path, e.Path) || IsUnder(e.Path, f.path)) {
 					add("%s %q overlaps policy.%s %s; oos must not delete its own records", kind, e.Path, f.name, f.path)
@@ -577,4 +698,17 @@ func SplitTags(s string) []string {
 		}
 	}
 	return out
+}
+
+func (p Policy) EntryBudget() int64 {
+	if p.ScanMaxEntries > 0 {
+		return p.ScanMaxEntries
+	}
+	return 1000000
+}
+func (p Policy) VerificationBudget() int64 {
+	if p.VerificationMaxBytes > 0 {
+		return p.VerificationMaxBytes
+	}
+	return 1 << 30
 }

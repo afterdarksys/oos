@@ -30,7 +30,8 @@ oos -C -y -t cache        # only entries of type cache
 oos -C -y -n              # -n wins: still a dry-run
 oos --restore 20260908-101500   # undo one batch
 oos --purge -y            # permanently delete batches older than quarantine_days
-oos --purge-now -y        # permanently delete every batch (the emergency lever)
+oos --purge-now -y        # permanently delete every batch that is not held (the emergency lever)
+oos --purge-now -y --include-held   # also delete held batches (pending, changed, unrecorded, no manifest)
 oos --install-agent       # hourly quick check with a desktop notification under warn
 oos -i                    # write the platform default config to ~/.config/oos/oos.json
 oos -A                    # audit ~ one level deep: size, age, use case, known/unknown, hints
@@ -79,14 +80,15 @@ is met. Removals under `--ensure` are permanent, because the caller asked for
 space it can use now; they are still logged. `--warn` and `--critical`
 override the thresholds for one run so a script can hold its own standard.
 
-`--add` and `--forget` edit the config file in place (`--config`, else the
-first of `./oos.json` and `~/.config/oos/oos.json`, seeding the latter from
-the embedded default if neither exists). The result is validated exactly as
+`--add` and `--forget` edit the config file in place (`--config`, else
+`~/.config/oos/oos.json`, seeded from the embedded default if it does not
+exist). A file another user owns, or one group or others can write, is
+refused rather than edited. The result is validated exactly as
 a load would before the file is written, so a bad entry never lands.
 
 Long forms: `--check --known --cleanup --diff --show --scan DIR --audit DIR
 --types LIST --config FILE --yes --no --quick --notify --json --verbose --init
---min-mb N --version --purge --purge-now --restore BATCH --install-agent
+--min-mb N --version --purge --purge-now --include-held --restore BATCH --install-agent
 --uninstall-agent --quiet --free --ensure GB --why PATH --warn GB --critical GB
 --add PATH --type T --action A --command C --note N --stale-hours H
 --use-case U --forget PATH --log-tail N --who PATH --agent-tick --system`.
@@ -96,9 +98,12 @@ usage or config error.
 
 ## Config
 
-Lookup order: `--config`, `./oos.json`, `~/.config/oos/oos.json`, then the
-copy embedded in the binary (`oos.json` on macOS, `oos.linux.json` on Linux).
-Unknown keys are an error so a typo cannot silently weaken the policy.
+Lookup order: `--config`, `~/.config/oos/oos.json`, then the copy embedded
+in the binary (`oos.json` on macOS, `oos.linux.json` on Linux). The working
+directory is not searched; pass `--config ./oos.json` to use a local file.
+A config file (explicit or default) must be owned by the effective user and
+not writable by group or others, or oos refuses to load it. Unknown keys are
+an error so a typo cannot silently weaken the policy.
 
 `known_dirs` and `known_files` entries carry:
 
@@ -121,7 +126,7 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `require_yes` | without `--yes`, `--cleanup` and `--purge` only print the plan |
 | `max_delete_gb_per_run` | the whole run is refused before anything is touched if the plan exceeds this |
 | `allow_outside_home` | default false: paths outside `$HOME` are refused |
-| `allow_commands` | `action: command` entries are skipped when false |
+| `allow_commands` | `action: command` entries are skipped when false (the shipped default). A command entry's path must still pass the home, `never_touch` and protected-path rules, and its text is scanned for protected paths (a command naming `/` or the home itself, as in `rm -rf ~/*`, is refused), but that scan is advisory: a shell command can reach a path without naming it |
 | `never_touch` | any path equal to or under these is refused, regardless of entry; a bare `/` protects only `/` |
 | `always_disallowed` | extra paths with the same force as the hard-coded list (`--show` prints that list). Entries here are added. They do not replace `~/.ssh`, the operating system, or the other built-in paths, and deleting a built-in path from this file does not lift it |
 | `min_path_depth` | refuse shallow paths like `/Users/x` |
@@ -151,7 +156,10 @@ direct child is judged on its own:
   long argument lists are not clipped), by working directory (`lsof -d cwd`
   on macOS, `/proc/*/cwd` on Linux), or by an open file descriptor
   (`lsof -n -P`, `/proc/*/fd`)
-- kept if modified inside the `stale_after_hours` floor
+- kept if anything under it was modified (or, where the platform exposes
+  it, had its inode changed: extracted archives keep old mtimes) inside the
+  `stale_after_hours` floor. The walk does not follow symlinks or cross
+  mounts; a subtree it cannot finish within its budget is kept
 - kept if it is a symlink or a lock file
 - otherwise a delete candidate
 
@@ -167,13 +175,22 @@ batch's `manifest.json`. Space is not freed until the batch is purged, and
 the manifest records allocated blocks per file: where files share blocks
 (APFS clones, hardlinks) the volume gives back less than the recorded
 total, so `--purge` prints both the recorded figure and the volume's free
-space before and after. The plan says up front what a removal returns
-(`[shared: ~X reclaimable]` on an entry, `volume gets back about X` under
-the total) for destructive entries from 1 GB up.
+space before and after. Plans report a conservative upper estimate, not a
+promise of recovered space. Hardlinks retained outside the selected set are
+excluded; snapshot and clone retention can reduce the eventual recovery.
 `--restore BATCH` moves everything back and refuses to overwrite anything
-that has reappeared. `--purge -y` removes batches older than
-`quarantine_days`; `--purge-now -y` removes all of them. Batches with missing or incomplete manifests, pending moves, or unrecorded
-files are never auto-purged. Batch creation is exclusive; runs within the same
+that has reappeared, or anything that would land under a protected path
+(`always_disallowed`, `never_touch`, outside home without
+`allow_outside_home`); it refuses a store owned by another user and
+recreates missing parents 0700. `--purge -y` removes batches older than
+`quarantine_days`; `--purge-now -y` removes all of them except held ones.
+A batch is held when its manifest is missing or invalid, a move is pending,
+a quarantined object is missing or changed, or it contains unrecorded files;
+held batches are listed with the reason and only `--include-held` deletes
+them. A path recreated at its original location (a cache the app rebuilt)
+does not hold a batch. A purge renames each batch to a `.purging-` tombstone
+before deleting it, so an interrupted purge never leaves a half batch that
+looks restorable; the next purge finishes it. Batch creation is exclusive; runs within the same
 second receive distinct names. Each move is journaled and synced before the
 rename. Restore recovers pending moves and preserves unrecorded data for manual
 inspection rather than deleting it. Rename cannot cross filesystems, so an entry
@@ -337,8 +354,9 @@ critical and no more often than `auto_act_cooldown_minutes` (default 60),
 it runs the same path as `--ensure` toward `auto_act_target_gb` (default
 `warn_free_gb`): expired quarantine first, then entries largest first,
 inside the per-run budget, every guard re-checked, everything logged and
-announced. Each knob has a default, so an empty `daemon` block is a
-daemon that only watches. SIGHUP reloads the config; SIGTERM stops it.
+announced. Auto-act deletions are permanent, exactly as under `--ensure`:
+they never go to quarantine and there is no `--restore`. Each knob has a
+default, so an empty `daemon` block is a daemon that only watches. SIGHUP reloads the config; SIGTERM stops it, and an ensure in progress stops at a safe point. A second daemon that finds one already answering on the socket exits cleanly. An unreadable state file is reported, never overwritten, and does not crash the daemon; the auto-act cooldown survives a restart. `--install-daemon` and `--install-agent` record the stable `oos` path (not the Homebrew Cellar version), so `brew upgrade` does not break them.
 
 ## Duplicates, Downloads and snapshots
 
@@ -474,29 +492,49 @@ without a `.tool-versions`.
 
 ## Guards, in order
 
-For every destructive entry: not `never`; absolute; not `/`; not on the
+For every destructive entry (and `rm-contents` children: a child a running
+process references is kept, and a reference list that cannot be read refuses
+the entry): not `never`; absolute; not `/`; not on the
 `always_disallowed` list; no macOS upgrade payload on disk; no installer
 process running; deep enough; under home unless allowed; not under
 `never_touch`; exists; not a symlink; right kind for the action; no guard
 process running; same device as the quarantine dir. `always_disallowed`
-is hard-coded: `/`, `/System`, `/usr` except `/usr/local`, `/bin`,
-`/sbin`, `/etc`, `/boot`, `/lib`, `/lib64`, `/private/var/db`,
-`/var/db`, `/Library/Updates`, `/Library/Apple`, the package databases,
-`macOS Install Data`, and under the home directory `.ssh`, `.gnupg`,
-`.aws`, `.kube`, and `Library/Keychains`. `policy.always_disallowed` only
+is hard-coded (`--show` prints this platform's list): `/`, `/System`,
+`/usr` except `/usr/local`, `/bin`, `/sbin`, `/etc`, `/boot`, `/lib`,
+`/lib64`, `/private/var/db`, `/var/db`, `/Library/Updates`,
+`/Library/Apple`, the package databases, `macOS Install Data`, and under
+the home directory `.ssh`, `.gnupg`, `.aws`, `.kube`, `Library/Keychains`,
+`.password-store`, `.netrc`, `.git-credentials`, `.docker`,
+`.config/gcloud`, `.azure` and `.config/gh`. On macOS also `/Applications`,
+the system `/Library` subdirectories that hold state (`Keychains`,
+`LaunchDaemons`, `LaunchAgents`, `Preferences`, `Extensions`, the TCC
+database), `/private/etc`, `/private/var/{root,vm,protected}`, the Preboot
+and Recovery volumes, and in the home `Library/Mobile Documents`,
+`CloudStorage`, `Mail`, `Messages`, `Application Support/MobileSync`,
+`Accounts`, `Cookies` and any `*.photoslibrary`. `/Library` as a whole is
+not listed because `/Library/Developer/CoreSimulator` is a default entry.
+On Linux also `/efi`, `/lib32`, `/libx32`, `/proc`, `/sys`, `/dev`, `/run`,
+`/root`, `/snap`, `/nix`, `/opt`, `/var/lib`, and in the home
+`.local/share/keyrings`, `.local/share/kwalletd`, `.pki` and `.mozilla`. `policy.always_disallowed` only
 adds paths. Deleting a hard-coded path from `oos.json`, clearing
 `never_touch`, or setting `allow_outside_home` does not lift it. A
 `command` entry is refused when its path or its command text names one of
-those. `softwareupdated`, the always-on daemon, is not treated as an
-install; `osinstallersetupd`, `InstallAssistant`, `startosinstall` and
-`installer` are. Then the run as a whole must fit the byte budget. Symlinks
+those or a `never_touch` path. `softwareupdated`, `snapd` and `packagekitd`,
+which stay up on an idle machine, are not treated as installs;
+`osinstallersetupd`, `InstallAssistant`, `startosinstall`, `installer`,
+`softwareupdate`, `apt`, `apt-get`, `dpkg`, `dnf`, `yum`, `rpm`, `pacman`,
+`zypper`, `unattended-upgrade` and `flatpak` are, as is a process list that
+cannot be read. `--empty-trash` applies the same check. Then the run as a whole must fit the byte budget. Symlinks
 inside a directory are moved or unlinked as links, never followed. Symlink
 ancestors are refused, except macOS's standard `/var`, `/tmp`, and `/etc`
 aliases. Removal uses directory handles and refuses nested mount boundaries;
 on Linux mount IDs also detect bind mounts sharing the same device. A tree
 containing a protected path is refused. Stale children have their references,
 age, and identity rechecked individually before removal. The config itself refuses nested destructive entries and
-any entry that overlaps the log, state or quarantine paths.
+any entry that overlaps the log, state or quarantine paths; every removal
+also refuses, at run time and through case and inode aliases, a path equal
+to, under, or containing a quarantine store, the state, log or size-cache
+file, or the mutation lock.
 
 ## State
 
@@ -527,13 +565,68 @@ gating and agent file generation.
 
 The cleanup layer uses allocated blocks and filesystem identity on macOS and
 Linux. Linux deletion also requires `/proc/self/fdinfo` mount IDs; if those
-cannot be read it refuses to act. The regression suite includes a Linux bind
-mount test, which skips when `CAP_SYS_ADMIN` is unavailable. Cross-building
-alone does not validate runtime behavior on HFS+, ext3/4, XFS, or Btrfs; these
-need disposable-volume integration runs on the target systems.
+cannot be read it refuses to act. Mount/crash tests require an explicitly
+marked disposable Linux guest. Cross-building does not validate runtime
+behavior on HFS+, ext3/4, XFS, or Btrfs.
 
-Reclaimable bytes remain an estimate. Linux accounting deduplicates hardlinks
-within the measured set but does not detect XFS/Btrfs reflinks or snapshots;
-links outside the measured set can also retain blocks. Use the measured free
-space after cleanup to determine what was actually recovered. Deletion budgets
-use allocated bytes, never this reclaimable-space estimate.
+Accounting reports logical bytes, per-path allocated bytes, a hardlink-aware
+upper reclaimable estimate, and known shared/exclusive/unknown extent bytes. Linux
+uses read-only FIEMAP where supported; encoded or ambiguous extents remain
+unknown. APFS first-block clone inference has been removed because clones can
+share a first block while their later contents differ. Shared extents may be
+counted in multiple files; their totals are observations, not unique physical
+ownership. Only the observed free-space delta establishes recovery. Removal
+budgets always use allocated bytes.
+
+```sh
+oos --filesystem /path --json              # capabilities and free space
+oos --filesystem /path --deep --json       # bounded accounting scan
+oos --filesystem /path --filesystem-details        # optional read-only tool diagnostics
+oos --verify-quarantine --json             # manifest and identity checks
+oos --verify-quarantine --deep             # check recorded content hashes too
+oos --recover BATCH                        # preview journal reconciliation
+oos --recover BATCH --yes                  # reconcile proven journal state only
+```
+
+Verification does not change payloads. Recovery does not move or delete them.
+Deep verification checks hashes only when they were recorded at quarantine
+time; enable `policy.quarantine_hash` to record SHA-256 hashes. Hashes add read
+I/O and do not cover every ACL/xattr. New manifests have checksums, operation
+IDs, identities and durable pending states. Legacy manifests remain readable,
+but ambiguous legacy state requires manual review. Restore uses atomic
+no-overwrite moves; an unsupported rename operation fails without copying.
+
+Configure additional same-filesystem stores explicitly:
+
+```json
+"quarantine_volumes": [
+  {"volume": "/mnt/data", "directory": "/mnt/data/.oos-quarantine"}
+]
+```
+
+These mappings live under `policy`; outside-home paths also require the usual
+policy authorization. Longest matching volume path wins. The central index is
+`<state_file>.quarantine-index.json`; configured stores remain authoritative.
+Use `--quarantine-store DIRECTORY` to disambiguate identical batch IDs.
+
+Cooperating writers share a persistent per-home lock. Core cleanup scans and
+execution use `operation_timeout_seconds` (default 300), `scan_concurrency`
+(default 2 per filesystem, maximum 16), `scan_max_entries` (default 1,000,000),
+and `verification_max_bytes` (default 1 GiB). Entry/read budgets apply to each
+scan or execution context. Cancellation is cooperative; an in-progress kernel
+call cannot always be interrupted immediately. Custom shell commands can start
+independent descendants and should be reviewed separately.
+
+The daemon persists a pause after repeated cleanup errors or poor recovery
+(`policy.daemon.recovery_failure_limit`, default 2). While paused it also skips
+its scheduled expiry purge. Inspect `--status`, quarantine and diagnostics.
+To resume after resolving the cause, stop the daemon, archive
+`<state_file>.auto-act.json`, then restart it; this is an explicit operator
+reset, not an automatic retry. A separately installed hourly agent has its own
+expiry schedule; disable `agent_purge_expired` when suspending all automation.
+
+See [the isolated VM matrix](tests/vm/README.md) and
+[the release review handoff](docs/FILESYSTEM-RELEASE-REVIEW.md).
+Development on a primary workstation must not run the VM harness or live
+cleanup. Real filesystem, metadata preservation, ENOSPC and power-loss
+validation remain release gates.

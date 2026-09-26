@@ -5,14 +5,17 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/afterdarksys/oos/internal/snapshots"
@@ -29,11 +32,16 @@ import (
 	"github.com/afterdarksys/oos/internal/size"
 	"github.com/afterdarksys/oos/internal/space"
 	"github.com/afterdarksys/oos/internal/state"
+	"github.com/afterdarksys/oos/internal/worklimit"
 )
 
 const Version = "0.7.1"
 
 type opts struct {
+	ctx                                                                 context.Context
+	verifyQuarantine, deep, fsDetails                                   bool
+	recoverBatch, filesystem, quarantineStore                           string
+	includeHeld                                                         bool
 	check, known, cleanup, show, diff, quick, yes, no, jsonOut, verbose bool
 	initCfg, notify, installAgent, uninstallAgent, purge, purgeNow, ver bool
 	scan, types, config, restore, audit                                 string
@@ -71,8 +79,15 @@ type opts struct {
 	trash, emptyTrash bool
 }
 
+func (o *opts) Context() context.Context {
+	if o.ctx != nil {
+		return o.ctx
+	}
+	return context.Background()
+}
+
 func parseFlags(args []string, stderr io.Writer) (*opts, error) {
-	o := &opts{}
+	o := &opts{ctx: context.Background()}
 	fs := flag.NewFlagSet("oos", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	both := func(long, short string, set func(*flag.FlagSet, string)) {
@@ -109,6 +124,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.BoolVar(&o.uninstallAgent, "uninstall-agent", false, "remove the hourly job")
 	fs.BoolVar(&o.purge, "purge", false, "permanently delete quarantine batches older than policy.quarantine_days (needs --yes)")
 	fs.BoolVar(&o.purgeNow, "purge-now", false, "permanently delete every quarantine batch (needs --yes)")
+	fs.BoolVar(&o.includeHeld, "include-held", false, "with --purge or --purge-now: also delete held batches (pending, changed, missing, unrecorded data, or no valid manifest)")
 	fs.StringVar(&o.restore, "restore", "", "move every path in quarantine BATCH back where it came from")
 	fs.Int64Var(&o.minMB, "min-mb", 0, "minimum file size for --scan (default: policy.big_file_min_mb)")
 	fs.Int64Var(&o.minMB, "m", 0, "alias for --min-mb")
@@ -156,11 +172,17 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.BoolVar(&o.leftovers, "app-leftovers", false, "pair every ~/Library entry (Application Support, Caches, Containers, ...) with an installed app; orphans first with --add lines (--min-mb floor, default 10)")
 	fs.BoolVar(&o.trash, "trash", false, "measure the system trash (~/.Trash and per-volume .Trashes on macOS, freedesktop trash on Linux); nothing is removed")
 	fs.BoolVar(&o.emptyTrash, "empty-trash", false, "permanently empty the system trash (not quarantine, no undo; dry-run unless --yes)")
+	fs.BoolVar(&o.verifyQuarantine, "verify-quarantine", false, "verify quarantine journals without changing files")
+	fs.StringVar(&o.recoverBatch, "recover", "", "reconcile interrupted BATCH journal; dry-run unless --yes")
+	fs.BoolVar(&o.deep, "deep", false, "with verification: check recorded content hashes; with --filesystem: account the tree")
+	fs.StringVar(&o.filesystem, "filesystem", "", "report capabilities and space for DIR without modifying it")
+	fs.BoolVar(&o.fsDetails, "filesystem-details", false, "include bounded read-only filesystem diagnostic tools")
+	fs.StringVar(&o.quarantineStore, "quarantine-store", "", "select one explicitly configured quarantine directory")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
 		fmt.Fprintln(stderr, "           [-j|--json] [-v|--verbose] [-i|--init] [-m|--min-mb N] [-V|--version]")
-		fmt.Fprintln(stderr, "           [--purge] [--purge-now] [--restore BATCH] [--install-agent] [--uninstall-agent]")
+		fmt.Fprintln(stderr, "           [--purge] [--purge-now] [--include-held] [--restore BATCH] [--install-agent] [--uninstall-agent]")
 		fmt.Fprintln(stderr, "           [-Q|--quiet] [-F|--free] [-E|--ensure GB] [-W|--why PATH] [--warn GB] [--critical GB]")
 		fmt.Fprintln(stderr, "           [--add PATH --type T --action A [--command C] [--note N] [--stale-hours H] [--use-case U]] [--forget PATH] [--log-tail N]")
 		fmt.Fprintln(stderr, "           [--who PATH] [--agent-tick] [--install-agent [--system]]")
@@ -178,10 +200,19 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != "", o.daemonRun, o.statusQ, o.installDaemon, o.uninstallDaemon, o.leftovers, o.trash, o.emptyTrash} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != "", o.daemonRun, o.statusQ, o.installDaemon, o.uninstallDaemon, o.leftovers, o.trash, o.emptyTrash, o.verifyQuarantine, o.recoverBatch != "", o.filesystem != ""} {
 		if m {
 			modes++
 		}
+	}
+	if (o.verifyQuarantine || o.recoverBatch != "" || o.filesystem != "") && modes != 1 {
+		return nil, fmt.Errorf("integrity and filesystem modes cannot be combined with other modes")
+	}
+	if o.includeHeld && !o.purge && !o.purgeNow {
+		return nil, fmt.Errorf("--include-held only applies to --purge or --purge-now")
+	}
+	if o.ensure > 0 && (o.cleanup || o.purge || o.purgeNow || o.restore != "" || o.emptyTrash) {
+		return nil, fmt.Errorf("ensure cannot be combined with another mutation")
 	}
 	if modes == 0 {
 		o.check = true
@@ -202,11 +233,15 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "oos %s\n", Version)
 		return status.ExitOK
 	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	o.ctx = ctx
 	env, err := guard.Real()
 	if err != nil {
 		fmt.Fprintln(stderr, "oos:", err)
 		return status.ExitUsage
 	}
+	env.Ctx = ctx
 	if o.initCfg {
 		return doInit(env, stdout, stderr)
 	}
@@ -230,6 +265,37 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	if err := applyOverrides(cfg, o); err != nil {
 		fmt.Fprintln(stderr, "oos:", err)
 		return status.ExitUsage
+	}
+	if o.quarantineStore != "" {
+		selected := config.ExpandHome(o.quarantineStore, cfg.Home)
+		allowed := false
+		for _, dir := range cfg.Policy.QuarantineStores() {
+			if dir == selected {
+				allowed = true
+			}
+		}
+		if !allowed {
+			fmt.Fprintln(stderr, "quarantine store is not configured")
+			return status.ExitUsage
+		}
+		cfg.Policy.QuarantineDir = selected
+		cfg.Policy.QuarantineVolumes = nil
+	}
+	if o.verifyQuarantine || o.recoverBatch != "" {
+		return doIntegrity(cfg, o, stdout, stderr)
+	}
+	if o.filesystem != "" {
+		return doFilesystem(cfg, o, stdout, stderr)
+	}
+	// Ensure and scheduled operations acquire the same lock internally.
+	live := !o.no && (o.yes || !cfg.Policy.RequireYes)
+	if !o.agentTick && !o.daemonRun && ((live && (o.cleanup || o.emptyTrash)) || (o.yes && !o.no && (o.purge || o.purgeNow)) || o.restore != "") {
+		lock, err := plan.Mutation(cfg)
+		if err != nil {
+			fmt.Fprintln(stderr, "oos:", err)
+			return status.ExitCritical
+		}
+		defer lock.Close()
 	}
 	if o.quiet {
 		stdout = io.Discard
@@ -262,7 +328,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if o.show {
-		worst(doShow(cfg, src, o, stdout))
+		worst(doShow(cfg, src, o, stdout, stderr))
 	}
 	if o.agentTick {
 		return agent.Tick(cfg, o.jsonOut, now, stdout, stderr)
@@ -363,12 +429,7 @@ func doAgent(env guard.Env, o *opts, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "hourly check removed")
 		return status.ExitOK
 	}
-	exe, err := os.Executable()
-	if err == nil {
-		if r, e2 := filepath.EvalSymlinks(exe); e2 == nil {
-			exe = r
-		}
-	}
+	exe, err := agent.StableExecutable()
 	if err != nil {
 		fmt.Fprintln(stderr, "oos: cannot resolve own path:", err)
 		return status.ExitUsage
@@ -388,9 +449,12 @@ func doAgent(env guard.Env, o *opts, stdout, stderr io.Writer) int {
 	return status.ExitOK
 }
 
-func doShow(cfg *config.Config, src string, o *opts, out io.Writer) int {
-	st, _ := state.Load(cfg.Policy.StateFile)
-	batches, _ := plan.ListBatches(cfg.Policy.QuarantineDir)
+func doShow(cfg *config.Config, src string, o *opts, out, errw io.Writer) int {
+	st, err := state.Load(cfg.Policy.StateFile)
+	if err != nil {
+		fmt.Fprintf(errw, "oos: load state: %v\n", err)
+	}
+	batches, _ := plan.ListStoreBatches(cfg.Policy)
 	if o.jsonOut {
 		_ = json.NewEncoder(out).Encode(map[string]any{"config_source": src, "config": cfg, "state": st, "quarantine": batches})
 		return status.ExitOK
@@ -514,18 +578,19 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		}
 		inv = space.Collect(cfg.Volume, os.Getenv("TMPDIR"))
 	}
-	st, _ := state.Load(cfg.Policy.StateFile)
-	st.Volume = cfg.Volume
-	for _, it := range items {
-		if it.Refused == nil || it.Bytes > 0 {
-			st.Known[it.Path] = it.Bytes
+	st, err := state.Update(cfg.Policy.StateFile, func(st *state.State) {
+		st.Volume = cfg.Volume
+		for _, it := range items {
+			if it.Refused == nil || it.Bytes > 0 {
+				st.Known[it.Path] = it.Bytes
+			}
 		}
-	}
-	st.Record("check", du, now)
-	fc := st.Forecast(now, cfg.Policy.ForecastWindow(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
-	if err := state.Save(cfg.Policy.StateFile, st); err != nil {
+		st.Record("check", du, now)
+	})
+	if err != nil {
 		fmt.Fprintf(errw, "oos: save state: %v\n", err)
 	}
+	fc := st.Forecast(now, cfg.Policy.ForecastWindow(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
 	if o.notify && code != status.ExitOK {
 		msg := fmt.Sprintf("%.1f GB free of %.1f GB (%s)", du.FreeGB(), du.TotalGB(), label)
 		if err := agent.Notify("oos: disk "+label, msg); err != nil {
@@ -534,7 +599,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	}
 	qBytes := int64(0)
 	if cfg.Policy.Quarantine {
-		qBytes = plan.QuarantineBytes(cfg.Policy.QuarantineDir)
+		qBytes = plan.ConfiguredBytes(cfg.Policy)
 	}
 	if o.jsonOut {
 		j := map[string]any{
@@ -593,9 +658,9 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 			fmt.Fprintf(out, "                refused: %v\n", it.Refused)
 		}
 	}
-	fmt.Fprintf(out, "  * reclaimable by --cleanup --yes now: %s   c = via command\n", size.Human(reclaimable))
+	fmt.Fprintf(out, "  * reclaimable upper estimate (before snapshots/open files): %s   c = via command\n", size.Human(reclaimable))
 	if reclaimable < deletableSum(items) {
-		fmt.Fprintln(out, "    (entries marked shared hold clones or hardlinks; recorded size is per copy, reclaimable is what the volume gets back)")
+		fmt.Fprintln(out, "    (entries marked shared hold clones or hardlinks; recorded size is per copy, reclaimable is an upper estimate, not guaranteed recovery)")
 	}
 	if dkRan {
 		if dkErr != nil {
@@ -626,7 +691,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 func planJSON(items []plan.Item) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
 	for _, it := range items {
-		m := map[string]any{"path": it.Path, "type": it.Type, "action": it.Action, "bytes": it.Bytes, "deletable": it.Deletable, "reclaimable": it.Reclaimable}
+		m := map[string]any{"accounting": it.Accounting, "path": it.Path, "type": it.Type, "action": it.Action, "bytes": it.Bytes, "deletable": it.Deletable, "reclaimable": it.Reclaimable}
 		if it.Refused != nil {
 			m["refused"] = it.Refused.Error()
 		}
@@ -676,14 +741,15 @@ func doScan(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) int
 			hits[i].Device = info.Device
 		}
 	}
-	st, _ := state.Load(cfg.Policy.StateFile)
-	st.BigFiles = hits
-	st.ScanRoot = root
-	st.ScannedAt = now
-	if du, err := size.Disk(cfg.Volume); err == nil {
-		st.Record("scan", du, now)
-	}
-	if err := state.Save(cfg.Policy.StateFile, st); err != nil {
+	scanDU, scanDUErr := size.Disk(cfg.Volume)
+	if _, err := state.Update(cfg.Policy.StateFile, func(st *state.State) {
+		st.BigFiles = hits
+		st.ScanRoot = root
+		st.ScannedAt = now
+		if scanDUErr == nil {
+			st.Record("scan", scanDU, now)
+		}
+	}); err != nil {
 		fmt.Fprintf(errw, "oos: save state: %v\n", err)
 	}
 	if o.jsonOut {
@@ -712,17 +778,19 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	}
 	items := plan.BuildTagged(cfg, env, splitTypes(o.types), o.tag, now)
 	// Sizes are expensive; keep them even on a dry-run so --show and --diff have something to say.
-	if st, err := state.Load(cfg.Policy.StateFile); err == nil {
+	planDU, planDUErr := size.Disk(cfg.Volume)
+	if _, err := state.Update(cfg.Policy.StateFile, func(st *state.State) {
 		st.Volume = cfg.Volume
 		for _, it := range items {
 			if it.Bytes > 0 {
 				st.Known[it.Path] = it.Bytes
 			}
 		}
-		if du, err := size.Disk(cfg.Volume); err == nil {
-			st.Record("plan", du, now)
+		if planDUErr == nil {
+			st.Record("plan", planDU, now)
 		}
-		_ = state.Save(cfg.Policy.StateFile, st)
+	}); err != nil {
+		fmt.Fprintf(errw, "oos: save state: %v\n", err)
 	}
 	if o.jsonOut {
 		return doCleanupJSON(cfg, env, o, items, live, now, out, errw)
@@ -774,7 +842,7 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	}
 	fmt.Fprintf(out, "  planned removals: %s   budget: %.0f GB\n", size.Human(planned), cfg.Policy.MaxDeleteGBPerRun)
 	if r := reclaimableSum(items); r < planned {
-		fmt.Fprintf(out, "  volume gets back about %s: the rest is blocks shared with files that stay (clones, hardlinks)\n", size.Human(r))
+		fmt.Fprintf(out, "  reclaimable upper estimate %s after hardlinks; clones/snapshots may retain more\n", size.Human(r))
 	}
 	if !live {
 		fmt.Fprintln(out, "dry-run: nothing touched. Add --yes to execute.")
@@ -787,29 +855,38 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
-	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: out, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env}
+	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: out, Now: time.Now, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env, Ctx: env.Context()}
 	if cfg.Policy.Quarantine && !o.permanent {
-		q, err := plan.OpenQuarantine(cfg.Policy.QuarantineDir, now, os.Rename)
+		stores, err := plan.OpenStores(cfg, now)
 		if err != nil {
 			fmt.Fprintf(errw, "oos: cannot open quarantine %s: %v; refusing to act\n", cfg.Policy.QuarantineDir, err)
 			return status.ExitCritical
 		}
-		x.Q = q
+		x.Stores = stores
+		x.Q = stores.Primary()
+		defer stores.DiscardEmpty()
 	}
 	fmt.Fprintln(out, "executing:")
 	freed, err := x.Execute(items)
+	if x.Stores != nil {
+		for _, b := range x.Stores.Batches() {
+			fmt.Fprintf(out, "  quarantine batch %s in %s; undo with --restore %s --quarantine-store %s\n", b.Batch, b.Directory, b.Batch, b.Directory)
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(errw, "oos: refused: %v\n", err)
 		return status.ExitCritical
 	}
 	if x.Q == nil {
-		size.Sync()
+		_ = size.SyncAt(cfg.Volume)
 	}
 	after, _ := size.Disk(cfg.Volume)
-	st, _ := state.Load(cfg.Policy.StateFile)
-	st.Record("cleanup", after, now)
-	_ = state.Save(cfg.Policy.StateFile, st)
-	if x.Q != nil && x.Q.Empty() {
+	if _, err := state.Update(cfg.Policy.StateFile, func(st *state.State) { st.Record("cleanup", after, now) }); err != nil {
+		fmt.Fprintf(errw, "oos: save state: %v\n", err)
+	}
+	if x.Stores != nil && len(x.Stores.Batches()) > 0 {
+		fmt.Fprintf(out, "done: %s (recorded) moved to quarantine batches (%d); volume free %.1f GB -> %.1f GB\n", size.Human(freed), len(x.Stores.Batches()), before.FreeGB(), after.FreeGB())
+	} else if x.Q != nil && x.Q.Empty() {
 		// commands only, or every move failed: no batch to keep
 		_ = x.Q.Discard()
 		fmt.Fprintf(out, "done: nothing quarantined; volume free %.1f GB -> %.1f GB\n", before.FreeGB(), after.FreeGB())
@@ -828,7 +905,7 @@ func sharedNote(it plan.Item) string {
 	if it.Refused != nil || !config.IsDestructive(it.Action) || it.Reclaimable >= it.Deletable {
 		return ""
 	}
-	return fmt.Sprintf("  [shared: ~%s reclaimable]", size.Human(it.Reclaimable))
+	return fmt.Sprintf("  [up to %s reclaimable]", size.Human(it.Reclaimable))
 }
 
 func reclaimableSum(items []plan.Item) int64 {
@@ -862,7 +939,24 @@ func doRestore(cfg *config.Config, o *opts, out, errw io.Writer) int {
 		return status.ExitCritical
 	}
 	defer logf.Close()
-	n, skipped, err := plan.RestoreBatch(cfg.Policy.QuarantineDir, o.restore, os.Rename)
+	dir, err := plan.FindBatch(cfg.Policy, o.restore)
+	if err != nil {
+		fmt.Fprintln(errw, err)
+		return status.ExitCritical
+	}
+	if o.no {
+		v, err := plan.VerifyBatch(dir, o.restore, o.deep)
+		if err != nil {
+			fmt.Fprintln(errw, err)
+			return status.ExitCritical
+		}
+		json.NewEncoder(out).Encode(v)
+		return status.ExitOK
+	}
+	restoreCtx, cancel := context.WithTimeout(o.Context(), cfg.Policy.OperationTimeout())
+	defer cancel()
+	restoreCtx = worklimit.With(restoreCtx, cfg.Policy.EntryBudget(), cfg.Policy.VerificationBudget())
+	n, skipped, err := plan.RestoreBatchPolicyContext(restoreCtx, cfg.Policy, cfg.Home, dir, o.restore, nil)
 	fmt.Fprintf(logf, "%s restore batch=%s restored=%d skipped=%d err=%v\n", time.Now().UTC().Format(time.RFC3339), o.restore, n, len(skipped), err)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: restore %s: %v\n", o.restore, err)
@@ -882,19 +976,23 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 	}
 	live := o.yes && !o.no
 	olderThan := time.Duration(cfg.Policy.QuarantineDays) * 24 * time.Hour
-	batches, err := plan.ListBatches(cfg.Policy.QuarantineDir)
+	batches, err := plan.ListStoreBatches(cfg.Policy)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: list quarantine: %v\n", err)
 		return status.ExitUsage
 	}
 	var planned int64
 	for _, b := range batches {
-		eligible := o.purgeNow || (b.Count >= 0 && now.Sub(b.Created) >= olderThan)
-		if eligible {
+		aged := o.purgeNow || now.Sub(b.Created) >= olderThan
+		if b.Count < 0 && !o.includeHeld {
+			fmt.Fprintf(out, "  held   %9s  %s  (%s; kept, --include-held deletes it)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Held)
+			continue
+		}
+		if aged {
 			planned += b.Bytes
-			fmt.Fprintf(out, "  purge  %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
+			fmt.Fprintf(out, "  purge  %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
 		} else {
-			fmt.Fprintf(out, "  keep   %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
+			fmt.Fprintf(out, "  keep   %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
 		}
 	}
 	fmt.Fprintf(out, "  would free up to %s permanently (recorded; blocks shared with files that stay return nothing)\n", size.Human(planned))
@@ -909,10 +1007,10 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
-	freed, names, err := plan.PurgeBatches(cfg.Policy.QuarantineDir, olderThan, now, o.purgeNow)
-	size.Sync()
+	freed, names, err := plan.PurgeStores(o.Context(), cfg.Policy, olderThan, now, o.purgeNow, o.includeHeld)
+	_ = size.SyncAt(cfg.Volume)
 	after, _ := size.Disk(cfg.Volume)
-	fmt.Fprintf(logf, "%s purge all=%v recorded=%d free_before=%d free_after=%d batches=%s err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, freed, before.Free, after.Free, strings.Join(names, ","), err)
+	fmt.Fprintf(logf, "%s purge all=%v include_held=%v recorded=%d free_before=%d free_after=%d batches=%s err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, o.includeHeld, freed, before.Free, after.Free, strings.Join(names, ","), err)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: purge: %v\n", err)
 		return status.ExitCritical

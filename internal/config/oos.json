@@ -7,7 +7,7 @@
     "require_yes": true,
     "max_delete_gb_per_run": 200,
     "allow_outside_home": false,
-    "allow_commands": true,
+    "allow_commands": false,
     "always_disallowed": [],
     "never_touch": [
       "/",

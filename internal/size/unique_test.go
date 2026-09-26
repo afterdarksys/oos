@@ -32,49 +32,34 @@ func TestUniqueCountsHardlinksOnce(t *testing.T) {
 	}
 }
 
-// TestUniqueCountsClonesOnce: an APFS clone has its own inode but shares
-// every block with its origin until one of them is written. Removing both
-// returns one file's worth, which is what oos must promise. Below the probe
-// floor a clone is counted per copy; that keeps the answer an upper bound.
-func TestUniqueCountsClonesOnce(t *testing.T) {
+// A clone with a modified tail may share its first block. Whole-file sharing
+// cannot be inferred from that block, so macOS reports an allocated upper bound.
+func TestClonesUseConservativeUpperEstimate(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("clone sharing is an APFS behaviour")
+		t.Skip("APFS clone fixture")
 	}
 	home := t.TempDir()
-	dir := filepath.Join(home, "d")
-	big := filepath.Join(dir, "big")
-	testutil.Write(t, big, 400<<10)
-	if out, err := exec.Command("cp", "-c", big, filepath.Join(dir, "big-clone")).CombinedOutput(); err != nil {
-		t.Skipf("cp -c unavailable: %v %s", err, out)
+	src := filepath.Join(home, "source")
+	dst := filepath.Join(home, "clone")
+	testutil.Write(t, src, 400<<10)
+	if out, err := exec.Command("cp", "-c", src, dst).CombinedOutput(); err != nil {
+		t.Skipf("clones unavailable: %v %s", err, out)
 	}
-	small := filepath.Join(dir, "small")
-	testutil.Write(t, small, 8<<10)
-	if err := exec.Command("cp", "-c", small, filepath.Join(dir, "small-clone")).Run(); err != nil {
-		t.Fatal(err)
-	}
-	alloc, uniq, err := Unique(dir)
+	f, err := os.OpenFile(dst, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if alloc < 2*(400<<10)+2*(8<<10) {
-		t.Fatalf("allocated should count every copy: %d", alloc)
-	}
-	// one big (400K) + two small counted per copy (16K) + directory overhead
-	if uniq < (400<<10)+(16<<10) || uniq >= alloc-(400<<10)+(64<<10) {
-		t.Fatalf("unique should drop the big clone only: unique=%d allocated=%d", uniq, alloc)
-	}
-	// a clone written to diverges from its origin and is counted again
-	f, err := os.OpenFile(filepath.Join(dir, "big-clone"), os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteAt([]byte("x"), 0); err != nil {
-		t.Fatal(err)
-	}
+	_, err = f.WriteAt([]byte("different tail"), 300<<10)
 	f.Close()
-	_, uniq2, _ := Unique(dir)
-	if uniq2 <= uniq {
-		t.Errorf("a written clone must count again: before=%d after=%d", uniq, uniq2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alloc, upper, err := Unique(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upper != alloc {
+		t.Fatalf("first-block inference remained: allocated=%d upper=%d", alloc, upper)
 	}
 }
 
@@ -109,8 +94,8 @@ func TestUniqueAgainstKeptOrigin(t *testing.T) {
 		t.Skip("cp -c unavailable:", err)
 	}
 	_, uniq, _ = UniqueAgainst([]string{filepath.Join(home, "keep")}, stale)
-	if uniq >= 300<<10 {
-		t.Errorf("a clone of a kept file returns nothing: unique=%d", uniq)
+	if uniq < 300<<10 {
+		t.Errorf("clone ownership is unknown and must retain an upper estimate: %d", uniq)
 	}
 }
 

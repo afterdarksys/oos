@@ -47,6 +47,8 @@ oos -C -t cache --tag build-output                # cleanup plan narrowed by tag
 oos --scan-builds ~/development                   # build output per repo, guarded --add lines
 oos --dupes ~/Downloads -m 200                    # identical files over 200 MB, newest copy marked
 oos --downloads                                   # installed installers, extracted archives, copies, stale
+oos --trash                                     # measure ~/.Trash and per-volume .Trashes
+oos --empty-trash --yes                         # permanently empty the trash (not quarantine)
 oos --history 12                                  # readings, trend and the forecast
 oos --fleet                                       # every host in policy.fleet in one table
 oos --install-daemon && oos --status              # resident watcher; ask it any time
@@ -172,6 +174,18 @@ that has reappeared. `--purge -y` removes batches older than
 `quarantine_days`; `--purge-now -y` removes all of them. A batch without a
 manifest is never auto-purged. Rename cannot cross filesystems, so an entry
 on a different device from the quarantine dir is refused in the plan.
+
+## Trash
+
+`--trash` measures the operating system's trash and removes nothing. On
+macOS that is `~/.Trash` plus `/Volumes/<name>/.Trashes/<uid>` for each
+mounted volume. On Linux it is `~/.local/share/Trash`. A bin that is a
+symlink is reported and refused. `--empty-trash` deletes the contents
+permanently: the space comes back immediately, there is no `--restore`,
+and it is not quarantine. It is a dry-run unless `--yes`, it is refused
+when the total exceeds `max_delete_gb_per_run`, and a live run will not
+start unless the audit log can be opened. A symlink inside the bin is
+removed as a link. A child that is a mount point is left alone.
 
 ## Audit
 

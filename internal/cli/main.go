@@ -64,6 +64,9 @@ type opts struct {
 
 	// --app-leftovers
 	leftovers bool
+
+	// --trash, --empty-trash
+	trash, emptyTrash bool
 }
 
 func parseFlags(args []string, stderr io.Writer) (*opts, error) {
@@ -149,6 +152,8 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.BoolVar(&o.installDaemon, "install-daemon", false, "install and start the daemon (launchd or systemd, --system for root units); removes the hourly agent")
 	fs.BoolVar(&o.uninstallDaemon, "uninstall-daemon", false, "stop and remove the daemon")
 	fs.BoolVar(&o.leftovers, "app-leftovers", false, "pair every ~/Library entry (Application Support, Caches, Containers, ...) with an installed app; orphans first with --add lines (--min-mb floor, default 10)")
+	fs.BoolVar(&o.trash, "trash", false, "measure the system trash (~/.Trash and per-volume .Trashes on macOS, freedesktop trash on Linux); nothing is removed")
+	fs.BoolVar(&o.emptyTrash, "empty-trash", false, "permanently empty the system trash (not quarantine, no undo; dry-run unless --yes)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: oos [-c|--check] [-k|--known] [-C|--cleanup] [-d|--diff] [-s|--show] [-S|--scan DIR] [-A|--audit DIR]")
 		fmt.Fprintln(stderr, "           [-t|--types LIST] [-f|--config FILE] [-y|--yes] [-n|--no] [-q|--quick] [-N|--notify]")
@@ -171,7 +176,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	}
 	modes := 0
 	for _, m := range []bool{o.check, o.known, o.cleanup, o.show, o.diff, o.scan != "", o.initCfg,
-		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != "", o.daemonRun, o.statusQ, o.installDaemon, o.uninstallDaemon, o.leftovers} {
+		o.installAgent, o.uninstallAgent, o.purge, o.purgeNow, o.restore != "", o.audit != "", o.free, o.why != "", o.add != "", o.forget != "", o.logTail > 0, o.ensure > 0, o.who != "", o.agentTick, o.history > 0, o.ver, o.byType != "", o.scanBuilds != "", o.fleet, o.dupes != "", o.downloads != "", o.daemonRun, o.statusQ, o.installDaemon, o.uninstallDaemon, o.leftovers, o.trash, o.emptyTrash} {
 		if m {
 			modes++
 		}
@@ -310,6 +315,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if o.leftovers {
 		worst(doLeftovers(cfg, env, o, now, stdout, stderr))
+	}
+	if o.trash || o.emptyTrash {
+		worst(doTrash(cfg, env, o, now, stdout, stderr))
 	}
 	if o.restore != "" {
 		worst(doRestore(cfg, o, stdout, stderr))

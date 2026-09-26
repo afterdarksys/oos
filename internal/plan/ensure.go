@@ -83,7 +83,7 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		}
 		defer logf.Close()
 	}
-	x := &Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: ShellRun, Move: os.Rename, Refs: env.References}
+	x := &Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home}
 	var spent int64
 	maxBytes := int64(cfg.Policy.MaxDeleteGBPerRun * size.GB)
 	final := du
@@ -114,6 +114,7 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		res.Steps = append(res.Steps, fmt.Sprintf("%s %s: %s freed", it.Action, it.Path, size.Human(got)))
 	}
 	if live {
+		size.Sync()
 		final, _ = size.Disk(cfg.Volume)
 		if st, err := state.Load(cfg.Policy.StateFile); err == nil {
 			st.Record("ensure", final, now)

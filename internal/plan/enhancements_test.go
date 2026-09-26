@@ -105,8 +105,10 @@ func TestStaleFailsClosedWhenReferencesUnavailable(t *testing.T) {
 	cfg := &config.Config{Version: 1, Volume: home, Policy: testutil.PolicyFor(home), Home: home,
 		KnownDirs: []config.Entry{{Path: dir, Type: "cache", Action: config.ActionRmStaleChilds, StaleAfterHours: 24}}}
 	items := Build(cfg, env, nil, time.Now())
-	if items[0].Refused == nil || !strings.HasPrefix(items[0].Refused.Error(), "references:") {
-		t.Fatalf("expected references refusal, got %v", items[0].Refused)
+	// A process list that fails refuses the entry before the stale classifier
+	// runs: an installer we cannot see is the same failure, and nothing is deleted.
+	if items[0].Refused == nil || !strings.Contains(items[0].Refused.Error(), "ps broke") {
+		t.Fatalf("expected a refusal that names the process-list failure, got %v", items[0].Refused)
 	}
 }
 

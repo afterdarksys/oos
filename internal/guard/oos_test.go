@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/afterdarksys/oos/internal/config"
+	"github.com/afterdarksys/oos/internal/protect"
 	"github.com/afterdarksys/oos/internal/testutil"
 )
 
@@ -61,6 +62,56 @@ func TestGuardsRefuse(t *testing.T) {
 	}
 	if err := env.CheckDeletable(p, config.Entry{Path: "/", Action: config.ActionRmContents}); err == nil {
 		t.Error("root must still be refused")
+	}
+}
+
+func TestOSPathsCannotBeConfiguredAway(t *testing.T) {
+	home := t.TempDir()
+	p := testutil.PolicyFor(home)
+	p.AllowOutsideHome = true
+	p.NeverTouch = nil
+	p.MinPathDepth = 1
+	env := Env{Home: home, Procs: testutil.NoProcs}
+	err := env.CheckDeletable(p, config.Entry{Path: "/System/Library", Action: config.ActionRmContents})
+	if err == nil || !strings.HasPrefix(err.Error(), "always_disallowed:") {
+		t.Fatalf("system path: %v", err)
+	}
+	ssh := filepath.Join(home, ".ssh", "id_ed25519")
+	testutil.Write(t, ssh, 1)
+	err = env.CheckDeletable(p, config.Entry{Path: ssh, Action: config.ActionRm})
+	if err == nil || !strings.HasPrefix(err.Error(), "always_disallowed:") {
+		t.Fatalf("ssh key: %v", err)
+	}
+	p.AlwaysDisallowed = []string{filepath.Join(home, "a", "secrets")}
+	secrets := filepath.Join(home, "a", "secrets", "k")
+	testutil.Write(t, secrets, 1)
+	err = env.CheckDeletable(p, config.Entry{Path: secrets, Action: config.ActionRm})
+	if err == nil || !strings.Contains(err.Error(), "secrets") {
+		t.Fatalf("config addition: %v", err)
+	}
+	cache := filepath.Join(home, "a", "cache")
+	testutil.Write(t, filepath.Join(cache, "f"), 1)
+	err = env.CheckDeletable(p, config.Entry{Path: cache, Action: config.ActionCommand, Command: "rm -rf /System"})
+	if err == nil || !strings.HasPrefix(err.Error(), "always_disallowed:") {
+		t.Fatalf("command naming the OS: %v", err)
+	}
+	if err := env.CheckDeletable(p, config.Entry{Path: cache, Action: config.ActionCommand, Command: "xcrun simctl delete unavailable"}); err != nil {
+		t.Fatalf("harmless command: %v", err)
+	}
+	dir := t.TempDir()
+	payload := filepath.Join(dir, "macOS Install Data")
+	if err := os.MkdirAll(payload, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(payload, "x"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := protect.InstallDataDirs
+	protect.InstallDataDirs = []string{payload}
+	t.Cleanup(func() { protect.InstallDataDirs = old })
+	err = env.CheckDeletable(p, config.Entry{Path: cache, Action: config.ActionRmContents})
+	if err == nil || !strings.HasPrefix(err.Error(), "install:") {
+		t.Fatalf("staged upgrade: %v", err)
 	}
 }
 

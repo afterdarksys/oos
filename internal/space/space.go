@@ -83,7 +83,7 @@ func Collect(volume, tmpdir string) *Report {
 		r.PurgeableError = err.Error()
 	} else {
 		r.PurgeableBytes = n
-		r.PurgeableNote = "CacheDelete estimate: space available for important use, minus free space. macOS may reclaim it under pressure. oos does not delete it, and the figure is an estimate, not a pile of files."
+		r.PurgeableNote = "CacheDelete estimate of bytes df's free number may include that an app still cannot use. A program that preallocates, or that asks for space which is not purgeable, returns \"No space left on device\" while df shows this gap as free. oos does not delete it."
 	}
 	r.Places = Measure(CandidateFn(tmpdir))
 	return r

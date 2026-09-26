@@ -123,6 +123,7 @@ Unknown keys are an error so a typo cannot silently weaken the policy.
 | `allow_outside_home` | default false: paths outside `$HOME` are refused |
 | `allow_commands` | `action: command` entries are skipped when false |
 | `never_touch` | any path equal to or under these is refused, regardless of entry; a bare `/` protects only `/` |
+| `always_disallowed` | extra paths with the same force as the hard-coded list (`--show` prints that list). Entries here are added. They do not replace `~/.ssh`, the operating system, or the other built-in paths, and deleting a built-in path from this file does not lift it |
 | `min_path_depth` | refuse shallow paths like `/Users/x` |
 | `log_file` | append-only audit log; a live run refuses to start if it cannot open it |
 | `state_file` | `bigfile.json` |
@@ -464,10 +465,22 @@ without a `.tool-versions`.
 
 ## Guards, in order
 
-For every destructive entry: not `never`; absolute; not `/`; deep enough;
-under home unless allowed; not under `never_touch`; exists; not a symlink;
-right kind for the action; no guard process running; same device as the
-quarantine dir. Then the run as a whole must fit the byte budget. Symlinks
+For every destructive entry: not `never`; absolute; not `/`; not on the
+`always_disallowed` list; no macOS upgrade payload on disk; no installer
+process running; deep enough; under home unless allowed; not under
+`never_touch`; exists; not a symlink; right kind for the action; no guard
+process running; same device as the quarantine dir. `always_disallowed`
+is hard-coded: `/`, `/System`, `/usr` except `/usr/local`, `/bin`,
+`/sbin`, `/etc`, `/boot`, `/lib`, `/lib64`, `/private/var/db`,
+`/var/db`, `/Library/Updates`, `/Library/Apple`, the package databases,
+`macOS Install Data`, and under the home directory `.ssh`, `.gnupg`,
+`.aws`, `.kube`, and `Library/Keychains`. `policy.always_disallowed` only
+adds paths. Deleting a hard-coded path from `oos.json`, clearing
+`never_touch`, or setting `allow_outside_home` does not lift it. A
+`command` entry is refused when its path or its command text names one of
+those. `softwareupdated`, the always-on daemon, is not treated as an
+install; `osinstallersetupd`, `InstallAssistant`, `startosinstall` and
+`installer` are. Then the run as a whole must fit the byte budget. Symlinks
 inside a directory are moved or unlinked as links, never followed. Sizes
 never cross onto another device, so a mounted volume inside a tree is not
 counted or touched. The config itself refuses nested destructive entries and
@@ -483,7 +496,11 @@ file is moved aside, not fatal.
 ## Threats
 
 The tool deletes files, so the failure modes that matter are deleting the
-wrong thing and deleting too much. Controls: home-only by default, an explicit
+wrong thing and deleting too much, including damaging an OS that is
+installed or an upgrade that is still being written. Controls: a hard
+operating-system path list that config cannot lift, a refusal of the whole
+change while a macOS upgrade payload or an installer process is present,
+home-only by default, an explicit
 never-touch list, minimum depth, no symlink following, per-run byte budget
 checked before the first removal, process references and an age floor for
 shared caches with a re-check at removal time, quarantine with manifests and

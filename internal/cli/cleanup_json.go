@@ -41,7 +41,7 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
-	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References}
+	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home}
 	if cfg.Policy.Quarantine && !o.permanent {
 		q, err := plan.OpenQuarantine(cfg.Policy.QuarantineDir, now, os.Rename)
 		if err != nil {

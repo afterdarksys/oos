@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/afterdarksys/oos/internal/config"
+	"github.com/afterdarksys/oos/internal/protect"
 )
 
 // Env is what the guards need from the outside world. Tests inject it.
@@ -73,14 +74,28 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 	if ent.Action == config.ActionNever {
 		return Refuse("action", "entry is marked never")
 	}
-	if ent.Action == config.ActionCommand {
-		return nil // commands are guarded by AllowCommands in the executor, not by path rules
-	}
 	if !filepath.IsAbs(path) {
 		return Refuse("absolute", "path %q is not absolute", path)
 	}
 	if path == string(filepath.Separator) {
 		return Refuse("root", "refusing to operate on /")
+	}
+	// always_disallowed is hard-coded. Dropping never_touch or setting
+	// allow_outside_home does not lift it. policy.always_disallowed only adds.
+	if prefix, ok := protect.Hit(path, e.Home, p.AlwaysDisallowed); ok {
+		return Refuse("always_disallowed", "%s is under %s, which cannot be removed", path, prefix)
+	}
+	if why, ok := protect.StagedInstall(); ok {
+		return Refuse("install", "macOS upgrade payload at %s; refusing to change the disk until that directory is gone", why)
+	}
+	if ent.Action == config.ActionCommand {
+		if prefix, ok := protect.CommandHits(ent.Command, e.Home, p.AlwaysDisallowed); ok {
+			return Refuse("always_disallowed", "command mentions %s, which cannot be removed", prefix)
+		}
+		if err := e.installRunning(); err != nil {
+			return err
+		}
+		return nil // other path rules do not apply; AllowCommands gates the run
 	}
 	if config.PathDepth(path) < p.MinPathDepth {
 		return Refuse("depth", "%s has depth %d, policy requires >= %d", path, config.PathDepth(path), p.MinPathDepth)
@@ -132,6 +147,28 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 				return Refuse("processes", "%d running process(es) match %q; stop them first", n, g)
 			}
 		}
+	}
+	if err := e.installRunning(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// installRunning refuses the disk change while an OS installer is executing.
+// A process list that fails is a refusal: guessing that no installer is
+// running is how an upgrade gets files pulled out from under it. A nil
+// lister means the caller already opted out (tests); staged payloads are
+// still checked separately.
+func (e Env) installRunning() error {
+	if e.Procs == nil {
+		return nil
+	}
+	procs, err := e.Procs()
+	if err != nil {
+		return Refuse("install", "cannot list processes to see if an OS install is running: %v", err)
+	}
+	if cmd, ok := protect.InstallerRunning(procs); ok {
+		return Refuse("install", "installer is running (%s); refusing to change the disk", cmd)
 	}
 	return nil
 }

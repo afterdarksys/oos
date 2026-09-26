@@ -14,6 +14,7 @@ import (
 
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/guard"
+	"github.com/afterdarksys/oos/internal/protect"
 	"github.com/afterdarksys/oos/internal/size"
 )
 
@@ -208,6 +209,7 @@ type Executor struct {
 	Move   func(src, dst string) error // rename; injectable for tests
 	Refs   func() ([]string, error)    // live process references, re-checked before each stale delete
 	Q      *Quarantine                 // nil means permanent delete
+	Home   string                      // expands ~/.ssh and the other home-relative always_disallowed entries
 }
 
 func (x *Executor) logf(f string, a ...any) {
@@ -240,6 +242,9 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 	mode := "delete"
 	if x.Q != nil {
 		mode = "quarantine " + x.Q.Batch
+	}
+	if why, ok := protect.StagedInstall(); ok {
+		return 0, guard.Refuse("install", "macOS upgrade payload at %s; refusing to change the disk until that directory is gone", why)
 	}
 	x.logf("run start mode=%s budget=%d max=%d items=%d", mode, budget, maxBytes, len(items))
 	var freed int64
@@ -279,6 +284,16 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 			x.logf("rm %s freed=%d", it.Path, n)
 			x.outf("  %s: %s %s\n", it.Path, size.Human(n), x.verb())
 		case config.ActionCommand:
+			if prefix, ok := protect.Hit(it.Path, x.Home, x.Policy.AlwaysDisallowed); ok {
+				x.logf("command %s refused always_disallowed %s", it.Path, prefix)
+				x.outf("  %s: refused, %s is always disallowed\n", it.Path, prefix)
+				continue
+			}
+			if prefix, ok := protect.CommandHits(it.Command, x.Home, x.Policy.AlwaysDisallowed); ok {
+				x.logf("command %s refused mentions %s", it.Path, prefix)
+				x.outf("  %s: refused, command mentions %s\n", it.Path, prefix)
+				continue
+			}
 			if !x.Policy.AllowCommands {
 				x.logf("command %s skipped allow_commands=false", it.Path)
 				x.outf("  %s: skipped, allow_commands is false\n", it.Path)
@@ -307,6 +322,9 @@ func (x *Executor) verb() string {
 // dispose removes one path: into quarantine when enabled, else permanently.
 // Symlinks are moved or unlinked as links; targets are never touched.
 func (x *Executor) dispose(path string, bytes int64) (int64, error) {
+	if prefix, ok := protect.Hit(path, x.Home, x.Policy.AlwaysDisallowed); ok {
+		return 0, guard.Refuse("always_disallowed", "refusing %s: %s cannot be removed", path, prefix)
+	}
 	if x.Q != nil {
 		dst, err := x.Q.take(path, bytes, x.Now())
 		if err != nil {
@@ -327,6 +345,9 @@ func (x *Executor) dispose(path string, bytes int64) (int64, error) {
 
 // rmContents disposes of every direct child of dir but keeps dir itself.
 func (x *Executor) rmContents(dir string) (int64, error) {
+	if prefix, ok := protect.Hit(dir, x.Home, x.Policy.AlwaysDisallowed); ok {
+		return 0, guard.Refuse("always_disallowed", "refusing %s: %s cannot be removed", dir, prefix)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, err

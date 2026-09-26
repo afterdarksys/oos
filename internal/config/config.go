@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/afterdarksys/oos/internal/protect"
 )
 
 //go:embed oos.json
@@ -49,11 +51,14 @@ type Policy struct {
 	AllowOutsideHome  bool     `json:"allow_outside_home"`
 	AllowCommands     bool     `json:"allow_commands"`
 	NeverTouch        []string `json:"never_touch"`
-	MinPathDepth      int      `json:"min_path_depth"`
-	LogFile           string   `json:"log_file"`
-	StateFile         string   `json:"state_file"`
-	BigFileMinMB      int64    `json:"big_file_min_mb"`
-	ScanTopN          int      `json:"scan_top_n"`
+	// AlwaysDisallowed adds paths on top of protect.Builtin. It cannot
+	// replace that list. An empty value leaves the hard-coded paths in force.
+	AlwaysDisallowed []string `json:"always_disallowed,omitempty"`
+	MinPathDepth     int      `json:"min_path_depth"`
+	LogFile          string   `json:"log_file"`
+	StateFile        string   `json:"state_file"`
+	BigFileMinMB     int64    `json:"big_file_min_mb"`
+	ScanTopN         int      `json:"scan_top_n"`
 
 	// Size cache: per-directory sizes keyed by mtime, reused within SizeCacheHours.
 	// Empty file disables it; --fresh ignores stored entries for one run and
@@ -324,6 +329,9 @@ func (c *Config) expand(home string) {
 	for i := range c.Policy.NeverTouch {
 		c.Policy.NeverTouch[i] = ExpandHome(c.Policy.NeverTouch[i], home)
 	}
+	for i := range c.Policy.AlwaysDisallowed {
+		c.Policy.AlwaysDisallowed[i] = ExpandHome(c.Policy.AlwaysDisallowed[i], home)
+	}
 	for i := range c.Policy.Owners {
 		c.Policy.Owners[i].Match = ExpandHome(c.Policy.Owners[i].Match, home)
 	}
@@ -409,6 +417,11 @@ func (c *Config) validate() error {
 			add("policy.never_touch entry %q must be absolute after ~ expansion", nt)
 		}
 	}
+	for _, ad := range p.AlwaysDisallowed {
+		if !filepath.IsAbs(ad) {
+			add("policy.always_disallowed entry %q must be absolute after ~ expansion", ad)
+		}
+	}
 	for i, o := range p.Owners {
 		if !filepath.IsAbs(o.Match) {
 			add("policy.owners[%d].match %q must be absolute after ~ expansion", i, o.Match)
@@ -456,6 +469,16 @@ func (c *Config) validate() error {
 		}
 		if e.Action == ActionCommand && strings.TrimSpace(e.Command) == "" {
 			add("%s %q has action command but no command", kind, e.Path)
+		}
+		if e.Action != ActionNever {
+			if prefix, ok := protect.Hit(e.Path, c.Home, p.AlwaysDisallowed); ok {
+				add("%s %q is under %s, which is always_disallowed; this cannot be configured away", kind, e.Path, prefix)
+			}
+		}
+		if e.Action == ActionCommand {
+			if prefix, ok := protect.CommandHits(e.Command, c.Home, p.AlwaysDisallowed); ok {
+				add("%s %q command mentions %s, which is always_disallowed", kind, e.Path, prefix)
+			}
 		}
 		if e.Action != ActionCommand && e.Command != "" {
 			add("%s %q has a command but action is %q", kind, e.Path, e.Action)

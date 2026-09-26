@@ -8,6 +8,7 @@
     "max_delete_gb_per_run": 200,
     "allow_outside_home": false,
     "allow_commands": true,
+    "always_disallowed": [],
     "never_touch": [
       "/",
       "/System",

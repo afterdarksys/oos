@@ -12,10 +12,16 @@ import (
 
 const GB = 1024 * 1024 * 1024
 
-// DiskUsage is the volume's free and total bytes.
+// DiskUsage is the volume's free and total bytes, plus inodes when the
+// filesystem reports them. An app's "no space left on device" with df
+// showing free bytes is often an empty inode table (df -i), a different
+// volume than the one df was pointed at, or space df counts that the app
+// is not allowed to use.
 type DiskUsage struct {
-	Free  uint64
-	Total uint64
+	Free        uint64
+	Total       uint64
+	InodesFree  uint64
+	InodesTotal uint64
 }
 
 func (d DiskUsage) FreeGB() float64  { return float64(d.Free) / GB }
@@ -33,8 +39,23 @@ func Disk(path string) (DiskUsage, error) {
 		return DiskUsage{}, err
 	}
 	bs := uint64(st.Bsize)
-	return DiskUsage{Free: st.Bavail * bs, Total: st.Blocks * bs}, nil
+	return DiskUsage{Free: st.Bavail * bs, Total: st.Blocks * bs, InodesFree: st.Ffree, InodesTotal: st.Files}, nil
 }
+
+// InodesScarce reports when creating a file can fail with ENOSPC while
+// byte-free still looks comfortable. APFS reports a huge inode pool, so
+// this stays quiet there. ext4 does not.
+func (d DiskUsage) InodesScarce() bool {
+	if d.InodesTotal == 0 {
+		return false
+	}
+	return d.InodesFree < 1000 || d.InodesFree*100 < d.InodesTotal
+}
+
+// Sync commits filesystem transactions so a following statfs matches what
+// df will print. It does not free blocks held by a snapshot, by a process
+// that still has a deleted file open, or by a rename into quarantine.
+func Sync() { syscall.Sync() }
 
 // Allocated returns the on-disk bytes for a file (blocks*512), falling back
 // to the apparent size. Sparse files like Docker.raw report far less than Size.

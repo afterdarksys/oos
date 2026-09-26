@@ -25,12 +25,13 @@ import (
 	"github.com/afterdarksys/oos/internal/guard"
 	"github.com/afterdarksys/oos/internal/media"
 	"github.com/afterdarksys/oos/internal/plan"
+	"github.com/afterdarksys/oos/internal/protect"
 	"github.com/afterdarksys/oos/internal/size"
 	"github.com/afterdarksys/oos/internal/space"
 	"github.com/afterdarksys/oos/internal/state"
 )
 
-const Version = "0.7.0"
+const Version = "0.7.1"
 
 type opts struct {
 	check, known, cleanup, show, diff, quick, yes, no, jsonOut, verbose bool
@@ -415,6 +416,16 @@ func doShow(cfg *config.Config, src string, o *opts, out io.Writer) int {
 	for _, nt := range p.NeverTouch {
 		fmt.Fprintf(out, "    %s\n", nt)
 	}
+	fmt.Fprintf(out, "  always disallowed (hard-coded; deleting these from oos.json does not lift them):\n")
+	for _, ad := range protect.Builtin {
+		fmt.Fprintf(out, "    %s\n", ad)
+	}
+	if len(p.AlwaysDisallowed) > 0 {
+		fmt.Fprintf(out, "  always disallowed (added in this config):\n")
+		for _, ad := range p.AlwaysDisallowed {
+			fmt.Fprintf(out, "    %s\n", ad)
+		}
+	}
 	fmt.Fprintf(out, "known dirs (%d):\n", len(cfg.KnownDirs))
 	for _, e := range cfg.KnownDirs {
 		printEntry(out, e)
@@ -550,6 +561,9 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	fmt.Fprintf(out, "oos %s  %s\n", strings.ToLower(label), cfg.Volume)
 	fmt.Fprintf(out, "  free %.1f GB of %.1f GB (%.1f%%)   warn < %.0f GB   critical < %.0f GB\n",
 		du.FreeGB(), du.TotalGB(), du.FreePct(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
+	if du.InodesScarce() {
+		fmt.Fprintf(out, "  inodes nearly exhausted: %d free of %d. df without -i still shows bytes; creating a file fails with \"No space left on device\".\n", du.InodesFree, du.InodesTotal)
+	}
 	if qBytes > 0 {
 		fmt.Fprintf(out, "  quarantine holds %s (recorded); --purge --yes frees expired batches, --purge-now --yes frees all\n", size.Human(qBytes))
 	}
@@ -773,7 +787,7 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
-	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: out, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References}
+	x := &plan.Executor{Policy: cfg.Policy, Log: logf, Out: out, Now: time.Now, Run: plan.ShellRun, Move: os.Rename, Refs: env.References, Home: cfg.Home}
 	if cfg.Policy.Quarantine && !o.permanent {
 		q, err := plan.OpenQuarantine(cfg.Policy.QuarantineDir, now, os.Rename)
 		if err != nil {
@@ -787,6 +801,9 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	if err != nil {
 		fmt.Fprintf(errw, "oos: refused: %v\n", err)
 		return status.ExitCritical
+	}
+	if x.Q == nil {
+		size.Sync()
 	}
 	after, _ := size.Disk(cfg.Volume)
 	st, _ := state.Load(cfg.Policy.StateFile)
@@ -893,6 +910,7 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
 	freed, names, err := plan.PurgeBatches(cfg.Policy.QuarantineDir, olderThan, now, o.purgeNow)
+	size.Sync()
 	after, _ := size.Disk(cfg.Volume)
 	fmt.Fprintf(logf, "%s purge all=%v recorded=%d free_before=%d free_after=%d batches=%s err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, freed, before.Free, after.Free, strings.Join(names, ","), err)
 	if err != nil {

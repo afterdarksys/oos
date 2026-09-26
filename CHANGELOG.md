@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.1] - 2026-09-26
+
+### Added
+- `always_disallowed` is the hard-coded refusal list: the operating system (`/System`, `/usr` except `/usr/local`, `/bin`, `/sbin`, `/etc`, `/boot`, the package databases, `macOS Install Data`, and the rest in `protect.Builtin`) plus `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, and `~/Library/Keychains`. `policy.always_disallowed` only adds paths. Clearing it, clearing `never_touch`, or setting `allow_outside_home` does not lift a hard-coded path. A command whose text names one of them is refused. `--show` prints the hard-coded list. A non-empty macOS upgrade payload, or a running `osinstallersetupd`, `InstallAssistant`, `startosinstall` or `installer`, refuses the disk change. `softwareupdated` does not, because it is always running. If the process list cannot be read, the change is refused.
+- A check says when inodes are nearly exhausted, which is the usual reason an app reports "No space left on device" while `df` still shows free bytes. The purgeable line says the same about space `df` counts that an app is not allowed to spend. After a permanent delete or a purge, oos calls `sync` before it measures free space again so that number matches a following `df`. `sync` does not free snapshot blocks, files a process still has open, or anything that was only renamed into quarantine.
+
 ## [0.7.0] - 2026-09-26
 
 ### Added

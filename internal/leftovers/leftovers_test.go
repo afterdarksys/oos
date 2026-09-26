@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/afterdarksys/oos/internal/appsafety"
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/size"
 	"github.com/afterdarksys/oos/internal/testutil"
@@ -76,8 +77,24 @@ func TestScanPairsLibraryWithApps(t *testing.T) {
 		t.Errorf("orphans first and totalled: %+v %v", res.Rows[0], res.ByVerdict)
 	}
 	line := AddLine(got["com.gone.forever"], home)
-	if !strings.HasPrefix(line, `oos --add "~/Library/Application Support/com.gone.forever" --type leftover --action rm-contents`) {
-		t.Errorf("add line: %s", line)
+	if !strings.HasPrefix(line, `oos --add "~/Library/Application Support/com.gone.forever" --type data --action never`) || !strings.Contains(line, "bookmarks") {
+		t.Errorf("keep orphan must be suggested as never: %s", line)
+	}
+	if got["com.gone.forever"].Safety != "keep" || got["com.apple.Safari"].Safety != "disposable" {
+		t.Errorf("safety: support %q safari %q", got["com.gone.forever"].Safety, got["com.apple.Safari"].Safety)
+	}
+	stateLine := AddLine(got["com.old.app.savedState"], home)
+	if !strings.Contains(stateLine, "--action rm-contents") || !strings.Contains(stateLine, "--tags leftover,cache") {
+		t.Errorf("saved state is disposable: %s", stateLine)
+	}
+	if safari := AddLine(got["com.apple.Safari"], home); !strings.Contains(safari, "--action rm-contents") {
+		t.Errorf("Safari cache is disposable even though the app is installed: %s", safari)
+	}
+	if AddLine(got["Homebrew"], home) != "" {
+		t.Error("a known entry is not suggested again")
+	}
+	if AddLine(got["Docker"], home) != "" {
+		t.Error("installed Application Support is not offered for removal")
 	}
 	only, _ := Scan(cfg, home, found, 1<<20, size.Filter{Tag: "orphan"}, now)
 	if len(only.Rows) != 2 {
@@ -86,4 +103,51 @@ func TestScanPairsLibraryWithApps(t *testing.T) {
 	if _, err := Scan(cfg, filepath.Join(home, "nolib"), found, 1, size.Filter{}, now); err == nil {
 		t.Error("no ~/Library must be an error")
 	}
+}
+
+func TestScanFindsCacheInsideSupport(t *testing.T) {
+	home := t.TempDir()
+	oldDirs, oldID := AppDirs, BundleID
+	AppDirs = []string{filepath.Join(home, "apps")}
+	BundleID = func(string) string { return "" }
+	t.Cleanup(func() { AppDirs, BundleID = oldDirs, oldID })
+
+	chrome := filepath.Join(home, "Library", "Application Support", "Google", "Chrome", "Default")
+	testutil.Write(t, filepath.Join(chrome, "Cache", "data"), 2<<20)
+	testutil.Write(t, filepath.Join(chrome, "Bookmarks"), 100)
+	testutil.Write(t, filepath.Join(chrome, "Login Data"), 100)
+	p := testutil.PolicyFor(home)
+	cfg := &config.Config{Version: 1, Volume: home, Policy: p, Home: home}
+	res, err := Scan(cfg, home, nil, 1<<20, size.Filter{}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row Row
+	for _, r := range res.Rows {
+		if r.Name == "Google" {
+			row = r
+		}
+	}
+	if row.Name == "" || row.Safety != "keep" || len(row.Safe) != 1 {
+		t.Fatalf("chrome row: %+v", row)
+	}
+	if filepath.Base(row.Safe[0].Path) != "Cache" {
+		t.Errorf("safe child: %+v", row.Safe[0])
+	}
+	line := SafeAddLine(row.Safe[0], home)
+	if !strings.Contains(line, `--action rm-contents`) || !strings.Contains(line, "Default/Cache") {
+		t.Errorf("cache add line: %s", line)
+	}
+	if SafeAddLine(appsafetyHitKeep(), home) != "" {
+		t.Error("a keep file must not get an add line")
+	}
+	for _, k := range row.Kept {
+		if filepath.Base(k.Path) == "Bookmarks" && SafeAddLine(k, home) != "" {
+			t.Errorf("bookmarks add line: %s", SafeAddLine(k, home))
+		}
+	}
+}
+
+func appsafetyHitKeep() appsafety.Hit {
+	return appsafety.Hit{Class: "keep", Reason: "bookmarks", Path: "/tmp/Bookmarks"}
 }

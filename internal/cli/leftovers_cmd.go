@@ -38,10 +38,22 @@ func doLeftovers(cfg *config.Config, env guard.Env, o *opts, now time.Time, out,
 		return status.ExitOK
 	}
 	fmt.Fprintf(out, "app leftovers under ~/Library (%d apps seen, entries over %s, %s%s):\n", res.Apps, size.Human(minBytes), res.Elapsed.Round(100*time.Millisecond), f.Describe())
-	shown := 0
 	var lines []string
 	for _, r := range res.Rows {
-		if r.Verdict == "installed" && !o.verbose {
+		if line := leftovers.AddLine(r, env.Home); line != "" {
+			lines = append(lines, line)
+		}
+		for _, h := range r.Safe {
+			if line := leftovers.SafeAddLine(h, env.Home); line != "" {
+				lines = append(lines, line)
+			}
+		}
+	}
+	shown := 0
+	for _, r := range res.Rows {
+		// Installed apps stay quiet unless -v, except when a keep folder
+		// contains a cache worth showing on its own.
+		if r.Verdict == "installed" && !o.verbose && len(r.Safe) == 0 {
 			continue
 		}
 		if f.Top > 0 && shown >= f.Top {
@@ -56,15 +68,20 @@ func doLeftovers(cfg *config.Config, env guard.Env, o *opts, now time.Time, out,
 				app = r.Reason
 			}
 		}
-		fmt.Fprintf(out, "  %9s  %4dd  %-10s %-26s %-36s %s\n", size.Human(r.Bytes), int(now.Sub(r.ModTime).Hours()/24), r.Verdict, r.Area, r.Name, app)
-		if r.Verdict == "orphan" {
-			lines = append(lines, leftovers.AddLine(r, env.Home))
+		fmt.Fprintf(out, "  %9s  %4dd  %-10s %-12s %-26s %-36s %s\n", size.Human(r.Bytes), int(now.Sub(r.ModTime).Hours()/24), r.Verdict, r.Safety, r.Area, r.Name, app)
+		for _, h := range r.Safe {
+			fmt.Fprintf(out, "             safe  %9s  %s  %s\n", size.Human(h.Bytes), h.Path, h.Reason)
+		}
+		if o.verbose {
+			for _, h := range r.Kept {
+				fmt.Fprintf(out, "             keep  %9s  %s  %s\n", size.Human(h.Bytes), h.Path, h.Reason)
+			}
 		}
 	}
 	fmt.Fprintf(out, "by verdict: orphan %s, unmatched %s, known %s, installed %s (-v lists installed)\n",
 		size.Human(res.ByVerdict["orphan"]), size.Human(res.ByVerdict["unmatched"]), size.Human(res.ByVerdict["known"]), size.Human(res.ByVerdict["installed"]))
 	if len(lines) > 0 {
-		fmt.Fprintln(out, "orphans as --add lines (suggestions; nothing was removed):")
+		fmt.Fprintln(out, "suggestions (nothing was removed; keep means do not delete):")
 		for _, l := range lines {
 			fmt.Fprintf(out, "    %s\n", l)
 		}

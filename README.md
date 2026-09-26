@@ -340,15 +340,27 @@ and the exact `tmutil thinlocalsnapshots` command that releases them.
 Application State, Logs, WebKit, HTTPStorages, LaunchAgents, Preferences)
 and pairs every entry over `--min-mb` (default 10) with an installed app:
 by bundle identifier, including helpers such as `com.vendor.app.ShipIt`,
-then by name, loosely. An identifier no installed app owns is an `orphan`
-and comes out as an `--add` line tagged `leftover`; a plain name nothing
-matches is `unmatched`, which on a developer machine is usually a tool
-cache (Cypress, pnpm, aws) rather than a leftover; anything under
-`com.apple` is never judged. `--tag orphan` narrows, `-v` also lists what
-is installed, which is the per-app size of ~/Library/Caches. The macOS
-default config also knows Xcode simulators (`xcrun simctl delete
-unavailable`), iOS DeviceSupport, Archives and MobileSync backups, the
-last two as `never` so they show up and stay.
+then by name, loosely. An identifier no installed app owns is an `orphan`;
+a plain name nothing matches is `unmatched`, which on a developer machine
+is usually a tool cache (Cypress, pnpm, aws) rather than a leftover;
+anything under `com.apple` is never judged an orphan. `--tag orphan`
+narrows, `-v` also lists what is installed.
+
+Each area has a safety class. Caches, Logs, Saved Application State,
+WebKit and HTTPStorages are `disposable`: they regenerate, and a
+suggestion is `--add --action rm-contents`. Application Support,
+Containers, Group Containers, Preferences and LaunchAgents are `keep`:
+bookmarks, cookies, passwords, mail and settings live there, so an orphan
+is suggested as `--action never` and an installed app's folder is not
+offered for removal at all. Inside a keep folder, directories named
+Cache, Code Cache, GPUCache, cache2, CacheStorage and the other cache
+names are still disposable and get their own `--add` line; files named
+Bookmarks, Cookies, Login Data, places.sqlite, logins.json and the rest
+are reported as keep and never suggested. `--who` prints the same class
+for a path under ~/Library. The macOS default config also knows Xcode
+simulators (`xcrun simctl delete unavailable`), iOS DeviceSupport,
+Archives and MobileSync backups, the last two as `never` so they show up
+and stay.
 
 ## Forecast
 

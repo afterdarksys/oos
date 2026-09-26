@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/afterdarksys/oos/internal/appsafety"
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/guard"
 	"github.com/afterdarksys/oos/internal/size"
@@ -25,6 +26,8 @@ type whoResult struct {
 	ProcessN    int                `json:"process_count"`
 	NewestFile  string             `json:"newest_file,omitempty"`
 	NewestAt    time.Time          `json:"newest_at,omitempty"`
+	Safety      appsafety.Class    `json:"safety,omitempty"`
+	SafetyWhy   string             `json:"safety_why,omitempty"`
 }
 
 // processHead trims a command line to something a human can scan.
@@ -66,6 +69,7 @@ func doWho(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, errw 
 		}
 	}
 	r.NewestFile, r.NewestAt = size.NewestFile(p, 50000)
+	r.Safety, r.SafetyWhy = appsafety.Classify(p, env.Home)
 	if o.jsonOut {
 		_ = json.NewEncoder(out).Encode(r)
 		return status.ExitOK
@@ -78,6 +82,9 @@ func doWho(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, errw 
 		fmt.Fprintf(out, "  use case    %s  (from %s)\n", r.UseCase, r.Source)
 	} else {
 		fmt.Fprintln(out, "  use case    unknown; add an owners pattern or --add it with --use-case")
+	}
+	if r.Safety != "" {
+		fmt.Fprintf(out, "  safety      %s  %s\n", r.Safety, r.SafetyWhy)
 	}
 	if r.Attribution.Repo != "" {
 		fmt.Fprintf(out, "  repo        %s\n", r.Attribution.Repo)

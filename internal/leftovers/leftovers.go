@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/afterdarksys/oos/internal/appsafety"
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/size"
 )
@@ -41,14 +42,18 @@ var BundleID = func(app string) string {
 
 // Row is one Library entry.
 type Row struct {
-	Path    string    `json:"path"`
-	Area    string    `json:"area"`
-	Name    string    `json:"name"`
-	Bytes   int64     `json:"bytes"`
-	ModTime time.Time `json:"mtime"`
-	Verdict string    `json:"verdict"` // orphan | unmatched | installed | known
-	App     string    `json:"app,omitempty"`
-	Reason  string    `json:"reason,omitempty"`
+	Path      string          `json:"path"`
+	Area      string          `json:"area"`
+	Name      string          `json:"name"`
+	Bytes     int64           `json:"bytes"`
+	ModTime   time.Time       `json:"mtime"`
+	Verdict   string          `json:"verdict"` // orphan | unmatched | installed | known
+	App       string          `json:"app,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
+	Safety    appsafety.Class `json:"safety,omitempty"` // disposable | keep
+	SafetyWhy string          `json:"safety_why,omitempty"`
+	Safe      []appsafety.Hit `json:"safe,omitempty"` // disposable children inside a keep tree
+	Kept      []appsafety.Hit `json:"kept,omitempty"` // bookmarks, cookies, passwords seen on the way
 }
 
 // Result is the whole report.
@@ -202,6 +207,10 @@ func Scan(cfg *config.Config, home string, apps []App, minBytes int64, f size.Fi
 			}
 			r := Row{Path: p, Area: area, Name: e.Name(), Bytes: bytes, ModTime: fi.ModTime()}
 			r.Verdict, r.App, r.Reason = ix.judge(e.Name())
+			r.Safety, r.SafetyWhy = appsafety.Area(area)
+			if r.Safety == appsafety.Keep && fi.IsDir() {
+				r.Safe, r.Kept = appsafety.Find(p, minBytes)
+			}
 			for _, ent := range cfg.Entries(nil) {
 				if config.IsUnder(p, ent.Path) || config.IsUnder(ent.Path, p) {
 					r.Verdict, r.Reason = "known", ent.Action+" in oos.json"
@@ -226,15 +235,55 @@ func Scan(cfg *config.Config, home string, apps []App, minBytes int64, f size.Fi
 	return res, nil
 }
 
-// AddLine is the --add command that would register an orphan for cleanup.
+// AddLine is the --add command for one library entry. A disposable orphan
+// (a cache, logs, saved state) is offered as rm-contents. A keep orphan
+// (Application Support, a container, preferences) is offered as never:
+// the folder holds bookmarks, mail and settings, and removing it as a
+// whole is not safe. Known entries are not suggested.
 func AddLine(r Row, home string) string {
-	p := r.Path
-	if config.IsUnder(p, home) {
-		p = "~" + strings.TrimPrefix(p, home)
+	if r.Verdict == "known" || r.Safety == "" {
+		return ""
 	}
+	// A keep folder is suggested only when its app is gone, and then as
+	// never. An installed app's container is left alone; its caches are
+	// suggested separately.
+	if r.Safety == appsafety.Keep && r.Verdict != "orphan" {
+		return ""
+	}
+	p := displayPath(r.Path, home)
 	action := config.ActionRmContents
-	if fi, err := os.Lstat(r.Path); err == nil && !fi.IsDir() {
+	kind := "cache"
+	note := r.SafetyWhy
+	tags := "leftover,cache"
+	if r.Safety == appsafety.Keep {
+		action = config.ActionNever
+		kind = "data"
+		tags = "leftover,keep"
+		if r.Reason != "" {
+			note = r.Reason + "; " + r.SafetyWhy
+		}
+	} else if fi, err := os.Lstat(r.Path); err == nil && !fi.IsDir() {
 		action = config.ActionRm
 	}
-	return "oos --add \"" + p + "\" --type leftover --action " + action + " --use-case \"leftover: " + r.Name + "\" --tags leftover --note \"" + r.Reason + "\""
+	if note == "" {
+		note = r.Reason
+	}
+	return "oos --add \"" + p + "\" --type " + kind + " --action " + action + " --use-case \"leftover: " + r.Name + "\" --tags " + tags + " --note \"" + note + "\""
+}
+
+// SafeAddLine is the --add command for one disposable directory found
+// inside a keep tree (Chrome's Cache, Firefox's cache2). The keep files
+// beside it are never given a line.
+func SafeAddLine(h appsafety.Hit, home string) string {
+	if h.Class != appsafety.Disposable {
+		return ""
+	}
+	return "oos --add \"" + displayPath(h.Path, home) + "\" --type cache --action rm-contents --use-case \"app cache\" --tags cache,safe --note \"" + h.Reason + "\""
+}
+
+func displayPath(p, home string) string {
+	if home != "" && config.IsUnder(p, home) {
+		return "~" + strings.TrimPrefix(p, home)
+	}
+	return p
 }

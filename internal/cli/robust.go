@@ -44,8 +44,9 @@ const kindRefused = "refused"
 
 // ranExit maps the error of a mutation that ran to its exit code and JSON
 // "error_kind": busy 4, partial 5 (some items were done), an unwritable
-// audit log 6, and anything else, given fallback ExitCritical, a refusal
-// where nothing was done: 2 "refused". Other fallbacks keep their own kind.
+// audit log or an unusable store lock 6, and anything else, given fallback
+// ExitCritical, a refusal where nothing was done: 2 "refused". Other
+// fallbacks keep their own kind.
 func ranExit(err error, fallback int) (int, string) {
 	switch {
 	case err == nil:
@@ -54,13 +55,36 @@ func ranExit(err error, fallback int) (int, string) {
 		return status.ExitBusy, status.Kind(status.ExitBusy)
 	case errors.Is(err, plan.ErrPartial):
 		return status.ExitPartial, status.Kind(status.ExitPartial)
-	case errors.Is(err, plan.ErrAudit):
+	case errors.Is(err, plan.ErrAudit), errors.Is(err, plan.ErrStoreLock):
 		return status.ExitIO, status.Kind(status.ExitIO)
 	case fallback == status.ExitCritical:
 		return status.ExitCritical, kindRefused
 	}
 	return fallback, status.Kind(fallback)
 }
+
+// planRefusedOnly reports whether a live cleanup had work entries and every
+// one was refused by policy at plan time, so nothing could be executed
+// (exit 7). Entries marked never are declarations, not work, and a missing
+// path is nothing to do rather than a refusal; neither counts.
+func planRefusedOnly(items []plan.Item) bool {
+	n := 0
+	for _, it := range items {
+		if it.Action == config.ActionNever {
+			continue
+		}
+		var r *guard.Refusal
+		if it.Refused == nil || errors.As(it.Refused, &r) && r.Rule == "missing" {
+			return false
+		}
+		n++
+	}
+	return n > 0
+}
+
+// nothingActionable is the message and exit of a live cleanup whose every
+// entry was refused by policy.
+const nothingActionable = "nothing actionable: every entry was refused by policy"
 
 // otherUserProcesses is guard.OtherUserProcessesNotInspected; a variable
 // for package tests.

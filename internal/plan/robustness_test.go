@@ -406,7 +406,7 @@ func TestImplausibleBatchTimeIsHeld(t *testing.T) {
 		q.Discard()
 	}
 	bs, _ := ListBatches(dir)
-	if len(bs) != 2 || bs[0].Held != clockHold || bs[1].Held != clockHold {
+	if len(bs) != 2 || bs[0].Held != ClockHold || bs[1].Held != ClockHold {
 		t.Fatalf("implausible times not held: %+v", bs)
 	}
 	if _, names, _ := PurgeBatches(dir, 0, now, true, false); len(names) != 0 {

@@ -22,6 +22,11 @@ import (
 // reference counted; the mutation lock already serializes that process.
 const storeLockName = ".oos-store.lock"
 
+// ErrStoreLock is wrapped into a store lock failure that is not a busy
+// lock: the lock file is hardlinked, a symlink, foreign-owned or cannot be
+// opened. The CLI maps it to exit 6 "io" whichever mutation hit it.
+var ErrStoreLock = errors.New("quarantine store lock unusable")
+
 // storeLockWait bounds the non-blocking retries; a variable for tests only.
 var storeLockWait = 2 * time.Second
 
@@ -46,12 +51,12 @@ func lockStore(dir string) (release func(), err error) {
 	}
 	r, err := safefs.OpenDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrStoreLock, err)
 	}
 	defer r.Close()
 	d, err := r.Open(".")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrStoreLock, err)
 	}
 	defer d.Close()
 	// Root creating the lock in a store owned by someone else hands it over,
@@ -68,7 +73,7 @@ func lockStore(dir string) (release func(), err error) {
 	// (root's daemon purging a user's store) still works.
 	f, err := mutation.OpenLockFileAt(int(d.Fd()), dir, storeLockName, unix.O_RDONLY, 0o600, chownTo)
 	if err != nil {
-		return nil, fmt.Errorf("quarantine store lock: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrStoreLock, err)
 	}
 	deadline := time.Now().Add(storeLockWait)
 	for {
@@ -81,7 +86,7 @@ func lockStore(dir string) (release func(), err error) {
 			if errors.Is(err, unix.EWOULDBLOCK) {
 				return nil, fmt.Errorf("quarantine store %s is in use by another oos process (restore, purge or cleanup); try again when it finishes: %w", dir, mutation.ErrBusy)
 			}
-			return nil, fmt.Errorf("quarantine store lock %s: %w", dir, err)
+			return nil, fmt.Errorf("%w: %s: %w", ErrStoreLock, dir, err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

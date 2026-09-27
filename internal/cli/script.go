@@ -204,7 +204,7 @@ func doEnsure(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, er
 			verb = "did not reach"
 		}
 	}
-	fmt.Fprintf(out, "ensure %.0f GB: %s; free %.1f GB -> %.1f GB\n", res.TargetGB, verb, res.StartFreeGB, res.FreeGB)
+	fmt.Fprintf(out, "ensure %g GB: %s; free %.1f GB -> %.1f GB\n", res.TargetGB, verb, res.StartFreeGB, res.FreeGB)
 	return code
 }
 

@@ -99,21 +99,29 @@ Exit codes:
 |---|---|---|
 | 0 | ok | |
 | 1 | free space below warn (check modes) | |
-| 2 | below critical, or `--ensure` did not reach its target, or nothing was done because every item was refused | `critical`, `refused` |
+| 2 | below critical, or `--ensure` did not reach its target, or nothing was done because every item was refused while executing | `critical`, `refused` |
 | 3 | usage error or rejected config | `usage` |
 | 4 | busy: another oos mutation holds the lock; nothing was tried; safe to retry | `busy` |
 | 5 | partial: some items were done, others refused or failed | `partial` |
-| 6 | I/O: the audit log, quarantine or a record could not be written | `io` |
+| 6 | I/O: the audit log, quarantine, a record or a store lock could not be opened or written | `io` |
+| 7 | nothing actionable: a live cleanup whose every entry is refused by policy, or a purge that removed nothing because every batch is held | `nothing_actionable` |
 
-Before this release a busy lock and a refusal also exited 2. With `-j` every
+Before this release a busy lock and a refusal also exited 2. Exit 7 is
+decided before anything runs: entries marked `never` and paths that do not
+exist do not count, so a cleanup with some entries refused (the macOS default
+always has some) and the rest done exits 0, and so does a purge that removed
+some batches beside held ones (held batches are listed). Dry runs and
+`--ensure` never exit 7. A hardlinked, symlinked or foreign-owned lock file
+is 6 for every mutation. With `-j` every
 mode prints one JSON document per line with a top-level `kind` (`check`,
 `cleanup`, `ensure`, `purge`, `restore`, `status`, `agent-tick`, `fleet`, ...);
 combining modes prints one line per mode. `--scan`, `--log-tail` and
 `--history` keep their bare arrays. Errors never go to stdout under `-j`.
 Cleanup and ensure JSON carry `refused` as a list of `{path, reason}`; a path
-that is not valid UTF-8 also carries `path_b64`. Cleanup JSON carries
-`other_user_processes_not_inspected` when a non-root run could not read
-other users' processes. `--verify-quarantine -j` lists stuck tombstones
+that is not valid UTF-8 also carries `path_b64`. Live cleanup output (text and JSON
+`other_user_processes_not_inspected`) notes when a non-root run could not
+read other users' processes; the count is only known after execution, so a
+dry run never shows it. `--verify-quarantine -j` lists stuck tombstones
 under `held`, and `--purge -j` marks them `tombstone: true`.
 
 ## Config

@@ -126,7 +126,7 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 					if !sameVolume(dir, cfg.Volume) {
 						continue
 					}
-					n, ns, e := purgeBatchesContext(pctx, dir, olderThan, now, false, false, &remaining)
+					n, ns, e := purgeBatchesContext(pctx, dir, olderThan, now, false, false, &remaining, nil)
 					freed += n
 					res.RemovedBytes += n
 					names = append(names, ns...)

@@ -7,7 +7,8 @@ import (
 
 // Exit codes. 0-3 are the check-mode meanings (disk status, or a usage or
 // config error); 4-6 say why a mutation did not finish, so monitoring can
-// tell a retryable collision from a partial run from a broken disk.
+// tell a retryable collision from a partial run from a broken disk; 7 says
+// a live mutation had nothing it was allowed to do.
 const (
 	ExitOK       = 0
 	ExitWarn     = 1
@@ -16,6 +17,7 @@ const (
 	ExitBusy     = 4 // another oos mutation holds the lock; nothing was tried; retry later
 	ExitPartial  = 5 // some items were refused or failed, others may have been done
 	ExitIO       = 6 // the audit log, quarantine or a record could not be opened or written
+	ExitNothing  = 7 // nothing actionable: every cleanup entry refused by policy, or every purgeable batch held
 )
 
 // Kind names an exit code for the "error_kind" field of JSON documents.
@@ -31,6 +33,8 @@ func Kind(code int) string {
 		return "usage"
 	case ExitCritical:
 		return "critical"
+	case ExitNothing:
+		return "nothing_actionable"
 	}
 	return ""
 }

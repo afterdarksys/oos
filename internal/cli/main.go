@@ -558,8 +558,13 @@ func doShow(cfg *config.Config, src string, o *opts, out, errw io.Writer) int {
 				switch {
 				case b.Tombstone:
 					expiry = "purge incomplete (retried by every purge): " + strings.TrimPrefix(b.Held, "purge incomplete: ")
+				case b.Count < 0 && b.Held == plan.ClockHold:
+					expiry = "held: " + b.Held + ", never auto-purged"
 				case b.Count < 0:
 					expiry = "no manifest, never auto-purged"
+					if _, err := os.Lstat(filepath.Join(b.Store, b.Name, "manifest.json")); err == nil {
+						expiry = "manifest invalid: " + strings.TrimPrefix(b.Held, "manifest: ") + "; never auto-purged"
+					}
 				}
 				fmt.Fprintf(out, "  %s  %9s  %3d paths  %s\n", b.Name, size.Human(b.Bytes), b.Count, expiry)
 			}
@@ -888,9 +893,6 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 		fmt.Fprintf(out, "  reclaimable upper estimate %s after hardlinks; clones/snapshots may retain more\n", size.Human(r))
 	}
 	if !live {
-		if note := uninspectedNote(); note != "" {
-			fmt.Fprintln(out, note)
-		}
 		fmt.Fprintln(out, "dry-run: nothing touched. Add --yes to execute.")
 		return status.ExitOK
 	}
@@ -945,6 +947,10 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 		fmt.Fprintf(out, "      space returns on --purge --yes after %d days, or --purge-now --yes; undo with --restore %s\n", cfg.Policy.QuarantineDays, x.Q.Batch)
 	} else {
 		fmt.Fprintf(out, "done: %s (recorded) removed; volume free %.1f GB -> %.1f GB\n", size.Human(freed), before.FreeGB(), after.FreeGB())
+	}
+	if planRefusedOnly(items) {
+		fmt.Fprintln(errw, "oos:", nothingActionable)
+		return status.ExitNothing
 	}
 	_, code := status.Of(cfg.Policy, after)
 	return code
@@ -1061,10 +1067,15 @@ func restoreExit(restored, skipped int, err error) (int, string) {
 }
 
 // purgeExit maps a live purge's outcome: some batches removed and others
-// held or failed is partial (5); nothing removed is a refusal (2
-// "refused").
-func purgeExit(purged int, err error) (int, string) {
+// failed is partial (5); nothing removed because of a failure is a refusal
+// (2 "refused"); nothing removed, no failure, and at least one batch held is
+// nothing actionable (7). Held batches beside purged ones are a standing
+// state (listed), not a failure.
+func purgeExit(purged, held int, err error) (int, string) {
 	if err == nil {
+		if purged == 0 && held > 0 {
+			return status.ExitNothing, status.Kind(status.ExitNothing)
+		}
 		return status.ExitOK, ""
 	}
 	code, kind := ranExit(err, status.ExitCritical)
@@ -1128,11 +1139,11 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
-	freed, names, err := plan.PurgeStores(o.Context(), cfg.Policy, olderThan, now, o.purgeNow, o.includeHeld)
+	freed, names, held, err := plan.PurgeStoresHeld(o.Context(), cfg.Policy, olderThan, now, o.purgeNow, o.includeHeld)
 	_ = size.SyncAt(cfg.Volume)
 	after, _ := size.Disk(cfg.Volume)
 	fmt.Fprintf(logf, "%s purge all=%v include_held=%v recorded=%d free_before=%d free_after=%d batches=%q err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, o.includeHeld, freed, before.Free, after.Free, names, err)
-	code, errKind := purgeExit(len(names), err)
+	code, errKind := purgeExit(len(names), held, err)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: purge: %v\n", err)
 	}
@@ -1144,6 +1155,8 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 		doc["free_gb_before"], doc["free_gb_after"] = before.FreeGB(), after.FreeGB()
 		if err != nil {
 			doc["error"], doc["error_kind"] = err.Error(), errKind
+		} else if code == status.ExitNothing {
+			doc["error"], doc["error_kind"] = nothingPurgeable, errKind
 		}
 		_ = json.NewEncoder(out).Encode(doc)
 		return code
@@ -1152,8 +1165,15 @@ func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) in
 		return code
 	}
 	fmt.Fprintf(out, "purged %d batches: recorded %s; volume free %.1f GB -> %.1f GB\n", len(names), size.Human(freed), before.FreeGB(), after.FreeGB())
-	return status.ExitOK
+	if code == status.ExitNothing {
+		fmt.Fprintln(errw, "oos:", nothingPurgeable)
+	}
+	return code
 }
+
+// nothingPurgeable is the message of a purge that removed nothing because
+// every batch it could have removed is held.
+const nothingPurgeable = "nothing actionable: every purgeable batch is held"
 
 // mutationKind names the JSON "kind" of the mutation a lock failure stops.
 func mutationKind(o *opts) string {

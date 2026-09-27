@@ -407,7 +407,7 @@ func ListBatchesContext(ctx context.Context, dir string) ([]Batch, error) {
 			hold("manifest: " + err.Error())
 		}
 		if implausibleTime(b.Created, now) {
-			hold(clockHold)
+			hold(ClockHold)
 		}
 		out = append(out, b)
 	}
@@ -591,8 +591,8 @@ func restoreTarget(p config.Policy, home, from string) error {
 	return nil
 }
 
-// clockHold is the Held reason for a batch whose time cannot be trusted.
-const clockHold = "batch time implausible (clock)"
+// ClockHold is the Held reason for a batch whose time cannot be trusted.
+const ClockHold = "batch time implausible (clock)"
 
 // implausibleTime is a batch time in the future (beyond an hour of skew) or
 // before oos existed. Expiry must not trust it: a clock that jumped would
@@ -643,11 +643,11 @@ var purgeCheckpoint func(stage string) error
 // older than olderThan go. Held batches (Count < 0) are skipped unless
 // includeHeld is set.
 func PurgeBatches(dir string, olderThan time.Duration, now time.Time, all, includeHeld bool) (freed int64, names []string, err error) {
-	return purgeBatchesContext(context.Background(), dir, olderThan, now, all, includeHeld, nil)
+	return purgeBatchesContext(context.Background(), dir, olderThan, now, all, includeHeld, nil, nil)
 }
 
 func purgeBatches(dir string, olderThan time.Duration, now time.Time, all bool, remaining *int64) (freed int64, names []string, err error) {
-	return purgeBatchesContext(context.Background(), dir, olderThan, now, all, false, remaining)
+	return purgeBatchesContext(context.Background(), dir, olderThan, now, all, false, remaining, nil)
 }
 
 // finishTombstones deletes batches an earlier purge renamed but did not
@@ -679,7 +679,8 @@ func finishTombstones(ctx context.Context, dir string) (freed int64, names []str
 	return freed, names, err
 }
 
-func purgeBatchesContext(ctx context.Context, dir string, olderThan time.Duration, now time.Time, all, includeHeld bool, remaining *int64) (freed int64, names []string, err error) {
+// held, when not nil, is increased by each batch skipped as held.
+func purgeBatchesContext(ctx context.Context, dir string, olderThan time.Duration, now time.Time, all, includeHeld bool, remaining *int64, held *int) (freed int64, names []string, err error) {
 	if fi, statErr := os.Lstat(dir); errors.Is(statErr, os.ErrNotExist) {
 		return 0, nil, nil
 	} else if statErr == nil && fi.IsDir() {
@@ -699,10 +700,10 @@ func purgeBatchesContext(ctx context.Context, dir string, olderThan time.Duratio
 		if b.Tombstone {
 			continue // finishTombstones owns these
 		}
-		if b.Count < 0 && !includeHeld {
-			continue
-		}
-		if !includeHeld && implausibleTime(b.Created, now) {
+		if !includeHeld && (b.Count < 0 || implausibleTime(b.Created, now)) {
+			if held != nil {
+				*held++
+			}
 			continue
 		}
 		if !all && now.Sub(b.Created) < olderThan {

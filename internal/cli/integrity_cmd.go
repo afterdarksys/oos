@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/plan"
@@ -90,6 +91,9 @@ func doIntegrity(cfg *config.Config, o *opts, out, errw io.Writer) int {
 			if err != nil {
 				r.Error = err.Error()
 				code = status.ExitCritical
+				if errors.Is(err, plan.ErrStoreLock) {
+					code = status.ExitIO // an unsafe lock file, as on cleanup and purge
+				}
 			}
 			if len(v.Issues) > 0 {
 				code = status.ExitCritical

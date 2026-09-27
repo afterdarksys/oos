@@ -30,7 +30,7 @@ func TestPurgeNowSkipsHeldBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errw bytes.Buffer
-	if code := doPurge(cfg, &opts{purgeNow: true, yes: true}, now, &out, &errw); code != status.ExitOK {
+	if code := doPurge(cfg, &opts{purgeNow: true, yes: true}, now, &out, &errw); code != status.ExitNothing {
 		t.Fatalf("purge code=%d %s", code, errw.String())
 	}
 	s := out.String()

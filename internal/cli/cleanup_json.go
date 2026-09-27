@@ -31,9 +31,6 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 		"planned_bytes": planned, "reclaimable_bytes": reclaimable, "budget_gb": cfg.Policy.MaxDeleteGBPerRun,
 	}
 	if !live {
-		if n := otherUserProcesses(); n > 0 {
-			doc["other_user_processes_not_inspected"] = n
-		}
 		_ = json.NewEncoder(out).Encode(doc)
 		return status.ExitOK
 	}
@@ -90,8 +87,12 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 	if _, e := state.Update(cfg.Policy.StateFile, func(st *state.State) { st.Record("cleanup", after, now) }); e != nil {
 		fmt.Fprintf(errw, "oos: save state: %v\n", e)
 	}
+	if err == nil && planRefusedOnly(items) {
+		code = status.ExitNothing
+		doc["error"], doc["error_kind"] = nothingActionable, status.Kind(code)
+	}
 	_ = json.NewEncoder(out).Encode(doc)
-	if err != nil {
+	if err != nil || code == status.ExitNothing {
 		return code
 	}
 	_, code = status.Of(cfg.Policy, after)

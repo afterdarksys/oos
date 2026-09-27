@@ -31,6 +31,7 @@ Fixed:
 - Linux process listing reads `/proc` (no `ps` needed, so busybox and slim images work). Unreadable processes and container PID namespaces make the reference check refuse, but other users' processes are counted, not fatal, for non-root runs. `ps`/`lsof` calls have a 30 s limit and `lsof` uses `-b -w`. The daemon's open-file sampling has a deadline. Reference paths match across `/private` aliases and case on macOS.
 - 32-bit builds compile. Linux free space uses `f_frsize`. systemd units tolerate a missing `/home`. The sized check no longer lists empty directories on ext4.
 - The full suite was run in Linux containers as a user and as root; five Linux-only test failures were fixed (one was a real bug in the space report).
+- Exit 7 `nothing_actionable`: a live cleanup whose every work entry is refused by policy at plan time, or a live purge that removed nothing because every batch is held, exits 7 instead of 0. Execution-time refusals and failed deletes keep 2 and 5. Some refused or held beside work done is still 0. An unsafe store lock is now 6 `io` on purge, restore and recover, as on cleanup. The dry-run "other users' processes" note, never filled before execution, is gone; `--ensure 0.1` prints its target as 0.1 GB; `-s` labels a batch whose manifest exists but fails to verify `manifest invalid: <reason>` instead of `no manifest`.
 
 Safety review: every path a cleanup, restore, purge or the daemon can take
 was reviewed for data loss, OS/boot damage and integrity, and fixed below.

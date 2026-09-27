@@ -188,19 +188,28 @@ func ListStoreBatchesContext(ctx context.Context, p config.Policy) ([]Batch, err
 // PurgeStores purges every configured store. all ignores age; held batches
 // (Count < 0) are only deleted when includeHeld is also set.
 func PurgeStores(ctx context.Context, p config.Policy, age time.Duration, now time.Time, all, includeHeld bool) (int64, []string, error) {
+	n, names, _, err := PurgeStoresHeld(ctx, p, age, now, all, includeHeld)
+	return n, names, err
+}
+
+// PurgeStoresHeld is PurgeStores that also counts the batches it skipped
+// as held (no valid manifest, or an untrustworthy time), so a caller can
+// tell "nothing to purge" from "nothing purgeable".
+func PurgeStoresHeld(ctx context.Context, p config.Policy, age time.Duration, now time.Time, all, includeHeld bool) (int64, []string, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	var total int64
 	var names []string
 	var errs error
+	held := 0
 	for _, dir := range p.QuarantineStores() {
-		n, ns, err := purgeBatchesContext(ctx, dir, age, now, all, includeHeld, nil)
+		n, ns, err := purgeBatchesContext(ctx, dir, age, now, all, includeHeld, nil, &held)
 		total += n
 		for _, name := range ns {
 			names = append(names, filepath.Join(dir, name))
 		}
 		errs = errors.Join(errs, err)
 	}
-	return total, names, partial(len(names) > 0, errs)
+	return total, names, held, partial(len(names) > 0, errs)
 }

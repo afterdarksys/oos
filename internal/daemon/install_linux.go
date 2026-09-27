@@ -21,13 +21,15 @@ func unitDir(home string, system bool) string {
 
 // Files returns the systemd service that keeps the daemon running. It is
 // restarted only after a failure, and gives up after five failures in ten
-// minutes so a permanent error does not loop forever.
+// minutes so a permanent error does not loop forever. ReadWritePaths
+// entries carry "-" so a host without /home does not fail the unit with
+// 226/NAMESPACE (see agent.agentUnits).
 func Files(home, exe string, system bool) map[string]string {
 	hardening := ""
 	if system {
 		hardening = `User=root
 ProtectSystem=strict
-ReadWritePaths=/root /var /tmp /home
+ReadWritePaths=-/root -/var -/tmp -/home
 PrivateTmp=no
 NoNewPrivileges=yes
 `

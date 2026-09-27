@@ -35,10 +35,10 @@ func doFleet(cfg *config.Config, o *opts, out, errw io.Writer) int {
 		timeout = time.Duration(cfg.Policy.FleetTimeoutSeconds) * time.Second
 	}
 	start := time.Now()
-	hosts := fleet.Collect(targets, timeout)
+	hosts := fleet.CollectN(targets, timeout, o.fleetParallel)
 	code := fleet.Worst(hosts)
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"hosts": hosts, "worst": code, "elapsed_ms": time.Since(start).Milliseconds()})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "fleet", "hosts": hosts, "worst": code, "elapsed_ms": time.Since(start).Milliseconds()})
 		return code
 	}
 	reach := 0

@@ -47,7 +47,7 @@ func doAudit(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 		fmt.Fprintf(errw, "oos: save state: %v\n", err)
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "rows": rows, "by_use_case": audit.GroupByUseCaseDeep(cfg, rows)})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "audit", "root": root, "rows": rows, "by_use_case": audit.GroupByUseCaseDeep(cfg, rows)})
 		return status.ExitOK
 	}
 	var total, unknown int64

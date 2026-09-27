@@ -2,6 +2,8 @@ package worklimit
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,5 +35,17 @@ func TestCancellation(t *testing.T) {
 	cancel()
 	if Step(With(ctx, 100, 100)) != context.Canceled {
 		t.Fatal("cancellation not propagated")
+	}
+}
+
+func TestExhaustionNamesSetting(t *testing.T) {
+	ctx := With(context.Background(), 1, 1)
+	_ = Step(ctx)
+	err := Step(ctx)
+	if !errors.Is(err, ErrExhausted) || !strings.Contains(err.Error(), "policy.scan_max_entries") {
+		t.Fatalf("entry refusal not actionable: %v", err)
+	}
+	if err := Read(ctx, 2); !errors.Is(err, ErrExhausted) || !strings.Contains(err.Error(), "policy.verification_max_bytes") {
+		t.Fatalf("byte refusal not actionable: %v", err)
 	}
 }

@@ -38,7 +38,7 @@ func Disk(path string) (DiskUsage, error) {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return DiskUsage{}, err
 	}
-	bs := uint64(st.Bsize)
+	bs := blockSize(&st)
 	return DiskUsage{Free: st.Bavail * bs, Total: st.Blocks * bs, InodesFree: st.Ffree, InodesTotal: st.Files}, nil
 }
 

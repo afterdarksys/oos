@@ -57,7 +57,9 @@ func TestPlatformBuiltins(t *testing.T) {
 	lhome := "/home/ryan"
 	for _, p := range []string{
 		"/efi/EFI", "/lib32/x", "/libx32/x", "/proc/1", "/sys/kernel", "/dev/sda", "/run/user/1000",
-		"/root/.bashrc", "/snap/core", "/nix/store/x", "/opt/app", "/var/lib/postgresql",
+		"/root/.ssh/authorized_keys", "/root/.gnupg/x", "/root/.config/gcloud/x", "/snap/core", "/nix/store/x", "/opt/app",
+		"/var/lib/postgresql", "/var/lib/mysql/ibdata1", "/var/lib/dpkg/status", "/var/lib/docker/volumes/db/_data",
+		"/var/lib/docker/overlay2/abc", "/var/lib/containerd/io.containerd.content.v1.content",
 		lhome + "/.local/share/keyrings/login.keyring", lhome + "/.local/share/kwalletd/x",
 		lhome + "/.pki/nssdb", lhome + "/.mozilla/firefox", lhome + "/.netrc", lhome + "/.password-store/x",
 		lhome + "/.config/gcloud/credentials.db", lhome + "/.azure/x",
@@ -66,7 +68,7 @@ func TestPlatformBuiltins(t *testing.T) {
 			t.Errorf("linux: %s should be protected", p)
 		}
 	}
-	for _, p := range []string{lhome + "/.cache/pip", lhome + "/.cache/uv/archive-v0", lhome + "/.npm/_cacache", "/usr/local/share"} {
+	for _, p := range []string{lhome + "/.cache/pip", lhome + "/.cache/uv/archive-v0", lhome + "/.npm/_cacache", "/usr/local/share", "/root/.cache/pip", "/root/.npm/_cacache", "/var/lib/docker", "/var/cache/apt"} {
 		if hit, ok := Hit(p, lhome, nil); ok {
 			t.Errorf("linux: %s must stay cleanable, hit %s", p, hit)
 		}

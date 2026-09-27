@@ -3,9 +3,14 @@ package worklimit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 )
+
+// ErrExhausted is wrapped by every budget refusal; the message names the
+// policy setting that raises the limit.
+var ErrExhausted = errors.New("filesystem work budget exhausted")
 
 type key struct{}
 type limits struct {
@@ -39,7 +44,10 @@ func consume(ctx context.Context, n int64, read bool) error {
 	for {
 		old := c.Load()
 		if n < 0 || old > max-n {
-			return fmt.Errorf("filesystem work budget exhausted")
+			if read {
+				return fmt.Errorf("%w: more than %d bytes to verify (raise policy.verification_max_bytes or narrow the entry)", ErrExhausted, max)
+			}
+			return fmt.Errorf("%w: more than %d filesystem entries (raise policy.scan_max_entries or narrow the entry)", ErrExhausted, max)
 		}
 		if c.CompareAndSwap(old, old+n) {
 			return nil

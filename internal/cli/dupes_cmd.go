@@ -34,7 +34,7 @@ func doDupes(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	}
 	groups := res.Groups[:size.CapRows(len(res.Groups), f.Top, 0)]
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "dupes",
 			"root": root, "files_scanned": res.Scanned, "groups": groups, "wasted_bytes": res.Wasted, "elapsed_ms": res.Elapsed.Milliseconds(),
 		})
 		return status.ExitOK

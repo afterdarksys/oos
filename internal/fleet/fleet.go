@@ -23,6 +23,37 @@ import (
 
 const DefaultTimeout = 20 * time.Second
 
+// DefaultParallel and MaxParallel bound how many ssh sessions run at once.
+const (
+	DefaultParallel = 8
+	MaxParallel     = 256
+)
+
+// waitDelay is how long ssh may hold its pipes after it is killed (a
+// ControlMaster or a stuck child can keep stdout open forever).
+const waitDelay = 5 * time.Second
+
+// hardSlack is how far past its ssh timeout a host may run before its row
+// is written off; tests shrink it.
+var hardSlack = waitDelay + 5*time.Second
+
+// ValidTarget refuses a target ssh could read as an option (leading '-',
+// e.g. "-oProxyCommand=...") or that holds whitespace or control characters.
+func ValidTarget(t string) error {
+	if t == "" {
+		return errors.New("empty target")
+	}
+	if strings.HasPrefix(t, "-") {
+		return fmt.Errorf("invalid target %q: must not start with '-'", t)
+	}
+	for _, r := range t {
+		if r <= ' ' || r == 0x7f {
+			return fmt.Errorf("invalid target %q: whitespace or control character", t)
+		}
+	}
+	return nil
+}
+
 // Host is one fleet member's answer.
 type Host struct {
 	Target          string         `json:"target"`
@@ -41,11 +72,16 @@ type Host struct {
 // SSH runs oos on a remote target and returns its stdout. Tests replace it.
 // The target is whatever ssh accepts: an alias, user@host, or a bare host.
 var SSH = func(target string, timeout time.Duration, args ...string) ([]byte, error) {
+	if err := ValidTarget(target); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	sshArgs := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new", target, "oos"}
+	// "--" ends ssh's options: the target can never be parsed as one
+	sshArgs := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new", "--", target, "oos"}
 	sshArgs = append(sshArgs, args...)
 	c := exec.CommandContext(ctx, "ssh", sshArgs...)
+	c.WaitDelay = waitDelay
 	var stderr bytes.Buffer
 	c.Stderr = &stderr
 	out, err := c.Output()
@@ -98,30 +134,64 @@ func parse(target string, out []byte) Host {
 	return h
 }
 
-// Collect asks every target in parallel. Order of the result follows the
-// input; an unreachable host is a row with Err, never a missing row.
+// Collect asks every target, DefaultParallel at a time.
 func Collect(targets []string, timeout time.Duration) []Host {
+	return CollectN(targets, timeout, DefaultParallel)
+}
+
+// CollectN asks every target, at most parallel at once (clamped to
+// 1..MaxParallel). Order of the result follows the input; an unreachable,
+// invalid or hung host is a row with Err, never a missing row. Each host
+// has a hard deadline beyond the ssh timeout, so one host whose ssh never
+// returns cannot hold up the table.
+func CollectN(targets []string, timeout time.Duration, parallel int) []Host {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	if parallel <= 0 {
+		parallel = DefaultParallel
+	}
+	if parallel > MaxParallel {
+		parallel = MaxParallel
+	}
+	hard := timeout + hardSlack
 	hosts := make([]Host, len(targets))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8)
+	sem := make(chan struct{}, parallel)
 	for i, t := range targets {
+		if err := ValidTarget(t); err != nil {
+			hosts[i] = Host{Target: t, Status: "?", Err: err.Error()}
+			continue
+		}
 		wg.Add(1)
 		go func(i int, t string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			start := time.Now()
-			out, err := SSH(t, timeout, "-c", "-q", "-j")
-			if err != nil {
-				hosts[i] = Host{Target: t, Status: "?", Err: err.Error()}
-			} else {
-				hosts[i] = parse(t, out)
+			type answer struct {
+				out []byte
+				err error
 			}
-			hosts[i].Elapsed = time.Since(start)
-			hosts[i].ElapsedMS = hosts[i].Elapsed.Milliseconds()
+			ch := make(chan answer, 1) // buffered: an abandoned SSH call never blocks
+			go func() {
+				out, err := SSH(t, timeout, "-c", "-q", "-j")
+				ch <- answer{out, err}
+			}()
+			var h Host
+			select {
+			case a := <-ch:
+				if a.err != nil {
+					h = Host{Target: t, Status: "?", Err: a.err.Error()}
+				} else {
+					h = parse(t, a.out)
+				}
+			case <-time.After(hard):
+				h = Host{Target: t, Status: "?", Err: fmt.Sprintf("no answer within %s", hard)}
+			}
+			h.Elapsed = time.Since(start)
+			h.ElapsedMS = h.Elapsed.Milliseconds()
+			hosts[i] = h
 		}(i, t)
 	}
 	wg.Wait()

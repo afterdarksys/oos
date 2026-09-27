@@ -37,7 +37,8 @@ func (w *fakeWorld) deps() Deps {
 			w.free = target + 1
 			return plan.EnsureResult{TargetGB: target, StartFreeGB: 2, FreeGB: w.free, Reached: true, Live: live, Steps: []string{"purged 1 batch"}}, nil
 		},
-		Log: &bytes.Buffer{},
+		Log:    &bytes.Buffer{},
+		Jitter: func(time.Duration) time.Duration { return 0 },
 	}
 }
 

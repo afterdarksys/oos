@@ -71,7 +71,7 @@ func doWho(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, errw 
 	r.NewestFile, r.NewestAt = size.NewestFile(p, 50000)
 	r.Safety, r.SafetyWhy = appsafety.Classify(p, env.Home)
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(r)
+		_ = json.NewEncoder(out).Encode(withKind("who", r))
 		return status.ExitOK
 	}
 	fmt.Fprintln(out, p)

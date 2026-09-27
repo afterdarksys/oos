@@ -28,3 +28,11 @@ func TestDaemonUnitQuotesAndStopsOnPermanentFailure(t *testing.T) {
 		}
 	}
 }
+
+func TestDaemonSystemUnitToleratesMissingPaths(t *testing.T) {
+	for _, c := range Files(t.TempDir(), "/usr/local/bin/oos", true) {
+		if !strings.Contains(c, "ProtectSystem=strict\n") || !strings.Contains(c, "ReadWritePaths=-/root -/var -/tmp -/home\n") {
+			t.Errorf("system unit must keep ProtectSystem=strict with '-' prefixed paths:\n%s", c)
+		}
+	}
+}

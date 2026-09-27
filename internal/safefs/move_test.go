@@ -2,6 +2,11 @@ package safefs
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,5 +44,20 @@ func TestCancelledRemovalPreservesTree(t *testing.T) {
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNoReplaceUnsupportedIsNamed(t *testing.T) {
+	for _, e := range []error{unix.EINVAL, unix.ENOSYS, unix.ENOTSUP, unix.EOPNOTSUPP} {
+		if !noReplaceUnsupported(e) {
+			t.Errorf("%v not mapped", e)
+		}
+	}
+	if noReplaceUnsupported(unix.EEXIST) {
+		t.Error("EEXIST must stay a plain conflict")
+	}
+	err := fmt.Errorf("rename a -> b: %w (%w)", ErrNoReplaceUnsupported, unix.EINVAL)
+	if !errors.Is(err, ErrNoReplaceUnsupported) || !strings.Contains(err.Error(), "quarantine unavailable on this volume") {
+		t.Fatalf("message: %v", err)
 	}
 }

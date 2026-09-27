@@ -5,7 +5,7 @@ package cli
 // JSON form.
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,7 +46,7 @@ func doFree(cfg *config.Config, o *opts, out, errw io.Writer) int {
 	}
 	label, code := status.Of(cfg.Policy, du)
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"free_gb": du.FreeGB(), "total_gb": du.TotalGB(), "status": label})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "free", "free_gb": du.FreeGB(), "total_gb": du.TotalGB(), "status": label})
 		return code
 	}
 	fmt.Fprintf(out, "%d\n", int64(du.FreeGB()))
@@ -143,7 +143,7 @@ func doWhy(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) int 
 		}
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(r)
+		_ = json.NewEncoder(out).Encode(withKind("why", r))
 		return r.ExitCode
 	}
 	fmt.Fprintf(out, "%s\n", p)
@@ -167,32 +167,56 @@ func doWhy(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) int 
 func doEnsure(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, errw io.Writer) int {
 	live := o.yes && !o.no
 	res, err := plan.Ensure(cfg, env, o.ensure, splitTypes(o.types), live, now)
+	code, errKind := ensureExit(err)
 	if err != nil {
 		fmt.Fprintln(errw, "oos:", err)
-		return status.ExitCritical
+	} else if !res.Reached {
+		code = status.ExitCritical
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(res)
-	} else {
-		for _, s := range res.Steps {
-			fmt.Fprintln(out, "  "+s)
+		doc, _ := withKind("ensure", res).(map[string]any)
+		if doc == nil {
+			doc = map[string]any{"kind": "ensure"}
 		}
-		verb := "would reach"
+		if _, ok := doc["refused"]; !ok || doc["refused"] == nil {
+			doc["refused"] = []any{}
+		}
+		if err != nil {
+			doc["error"] = err.Error()
+			doc["error_kind"] = errKind
+		}
+		_ = json.NewEncoder(out).Encode(doc)
+		return code
+	}
+	if err != nil && code != status.ExitPartial && code != status.ExitCritical {
+		return code
+	}
+	for _, s := range res.Steps {
+		fmt.Fprintln(out, "  "+s)
+	}
+	verb := "would reach"
+	if live {
+		verb = "reached"
+	}
+	if !res.Reached {
+		verb = "cannot reach"
 		if live {
-			verb = "reached"
+			verb = "did not reach"
 		}
-		if !res.Reached {
-			verb = "cannot reach"
-			if live {
-				verb = "did not reach"
-			}
-		}
-		fmt.Fprintf(out, "ensure %.0f GB: %s; free %.1f GB -> %.1f GB\n", res.TargetGB, verb, res.StartFreeGB, res.FreeGB)
 	}
-	if res.Reached {
-		return status.ExitOK
+	fmt.Fprintf(out, "ensure %.0f GB: %s; free %.1f GB -> %.1f GB\n", res.TargetGB, verb, res.StartFreeGB, res.FreeGB)
+	return code
+}
+
+// ensureExit maps an --ensure error: busy 4, partial 5, a refusal where
+// nothing was done 2 "refused"; any other failure before acting (statfs,
+// the audit log) is I/O.
+func ensureExit(err error) (int, string) {
+	fallback := status.ExitIO
+	if errors.Is(err, plan.ErrRefused) {
+		fallback = status.ExitCritical
 	}
-	return status.ExitCritical
+	return ranExit(err, fallback)
 }
 
 // configFileForEdit returns the config path --add/--forget should modify:
@@ -301,7 +325,7 @@ func doAdd(env guard.Env, o *opts, out, errw io.Writer) int {
 		return status.ExitUsage
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"config": path, "list": list, "entry": entry})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "add", "config": path, "list": list, "entry": entry})
 	} else {
 		fmt.Fprintf(out, "added %s to %s in %s (%s, %s)\n", stored, list, path, o.addType, o.addAction)
 	}
@@ -345,7 +369,7 @@ func doForget(env guard.Env, o *opts, out, errw io.Writer) int {
 		return status.ExitUsage
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"config": path, "list": removed, "path": target})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "forget", "config": path, "list": removed, "path": target})
 	} else {
 		fmt.Fprintf(out, "removed %s from %s in %s\n", target, removed, path)
 	}
@@ -365,14 +389,10 @@ func doLogTail(cfg *config.Config, o *opts, out, errw io.Writer) int {
 		return status.ExitUsage
 	}
 	defer f.Close()
-	ring := make([]string, 0, o.logTail)
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	for sc.Scan() {
-		if len(ring) == o.logTail {
-			ring = ring[1:]
-		}
-		ring = append(ring, sc.Text())
+	ring, err := tailLines(f, o.logTail)
+	if err != nil {
+		fmt.Fprintln(errw, "oos:", err)
+		return status.ExitUsage
 	}
 	if o.jsonOut {
 		_ = json.NewEncoder(out).Encode(ring)
@@ -382,4 +402,43 @@ func doLogTail(cfg *config.Config, o *opts, out, errw io.Writer) int {
 		fmt.Fprintln(out, l)
 	}
 	return status.ExitOK
+}
+
+// tailLines returns the last n lines of f, reading backwards from the end
+// in chunks: a multi-gigabyte log costs a few reads, not a full scan. The
+// read is bounded at maxTailBytes; a file with fewer lines than that holds
+// yields every line it has.
+func tailLines(f *os.File, n int) ([]string, error) {
+	const chunk = 64 << 10
+	const maxTailBytes = 64 << 20
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	off := fi.Size()
+	var buf []byte
+	for off > 0 && bytes.Count(buf, []byte{'\n'}) <= n && len(buf) < maxTailBytes {
+		step := int64(chunk)
+		if off < step {
+			step = off
+		}
+		off -= step
+		b := make([]byte, step)
+		if _, err := f.ReadAt(b, off); err != nil && err != io.EOF {
+			return nil, err
+		}
+		buf = append(b, buf...)
+	}
+	buf = bytes.TrimSuffix(buf, []byte{'\n'})
+	if len(buf) == 0 {
+		return []string{}, nil
+	}
+	lines := strings.Split(string(buf), "\n")
+	if off > 0 && len(lines) > 0 {
+		lines = lines[1:] // the first piece started mid-line
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines, nil
 }

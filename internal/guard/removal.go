@@ -21,7 +21,12 @@ func CheckRemovalPath(p config.Policy, path, home string) error {
 	if prefix, ok := protect.Hit(path, home, p.AlwaysDisallowed); ok {
 		return Refuse("always_disallowed", "%s is protected by %s", path, prefix)
 	}
-	for _, raw := range append(append([]string{}, protect.Builtin...), p.AlwaysDisallowed...) {
+	for i, raw := range append(append([]string{}, protect.Builtin...), p.AlwaysDisallowed...) {
+		// Built-in cache anchors (/root/.cache, /var/lib/docker, ...) are carved
+		// out of their protected parent; a config-added entry is never lifted.
+		if i < len(protect.Builtin) && protect.Excepted(path, raw) {
+			continue
+		}
 		if strings.HasPrefix(raw, "~/") {
 			if home == "." || home == "" {
 				continue

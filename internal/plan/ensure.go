@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/guard"
+	"github.com/afterdarksys/oos/internal/reserve"
 	"github.com/afterdarksys/oos/internal/size"
 	"github.com/afterdarksys/oos/internal/state"
 )
@@ -28,12 +30,28 @@ type EnsureResult struct {
 	Steps         []string `json:"steps"`
 }
 
+// Phase budgets for Ensure, as shares of policy.operation_timeout: the
+// expired-quarantine purge and plan-building each get a slice, execution
+// the remainder. Variables for package tests.
+var (
+	ensurePurgeShare = 0.2
+	ensureBuildShare = 0.4
+	// PoorRecovery polls statfs this long (ZFS/btrfs free asynchronously).
+	recoveryPollWindow   = 5 * time.Second
+	recoveryPollInterval = time.Second
+)
+
+func share(total time.Duration, f float64) time.Duration { return time.Duration(float64(total) * f) }
+
 // Ensure makes at least target GB free: expired quarantine first, then the
 // plan's entries largest first, permanent removals, inside the per-run
 // budget, every guard re-checked by the executor. live=false only
-// projects. The audit log must open before anything is touched.
+// projects. The audit log must open before anything is touched; on a full
+// disk the audit falls back to the space reserve, then to stderr.
 func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, live bool, now time.Time) (EnsureResult, error) {
-	ctx, cancel := context.WithTimeout(env.Context(), cfg.Policy.OperationTimeout())
+	parent := env.Context()
+	total := cfg.Policy.OperationTimeout()
+	ctx, cancel := context.WithTimeout(parent, total)
 	defer cancel()
 	env.Ctx = ctx
 	if live {
@@ -57,33 +75,45 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 	var projected int64
 	maxBytes := int64(cfg.Policy.MaxDeleteGBPerRun * size.GB)
 	remaining := maxBytes
+	ts := func() string { return now.UTC().Format(time.RFC3339) }
 
 	var logf *os.File
+	var audit *auditLog
 	if live {
+		reservePath := reserve.Path(cfg.Policy.StateFile)
+		_ = reserve.Ensure(reservePath) // best effort, only with room to spare
 		logf, err = state.OpenLog(cfg.Policy.LogFile)
 		if err != nil {
 			return res, fmt.Errorf("cannot open log %s: %v; refusing to act without an audit log", cfg.Policy.LogFile, err)
 		}
 		defer logf.Close()
-	}
-	if live {
+		audit = &auditLog{w: logf, reserve: reservePath, permanent: true}
 		if err := env.CheckInstall(); err != nil {
-			return res, err
+			return res, sentinelErr{err, ErrRefused}
 		}
-		if _, err := fmt.Fprintf(logf, "%s ensure start target_gb=%g removals=permanent\n", now.UTC().Format(time.RFC3339), target); err != nil {
-			return res, err
-		}
-		if err := logf.Sync(); err != nil {
+		if err := audit.line(fmt.Sprintf("%s ensure start target_gb=%g removals=permanent", ts(), target), true); err != nil {
 			return res, err
 		}
 	}
+	timedOut := ""
+	var purgeErr error
 	if cfg.Policy.Quarantine {
 		olderThan := time.Duration(cfg.Policy.QuarantineDays) * 24 * time.Hour
-		bs, _ := ListStoreBatches(cfg.Policy)
+		pctx, pcancel := context.WithTimeout(ctx, share(total, ensurePurgeShare))
+		bs, listErr := ListStoreBatchesContext(pctx, cfg.Policy)
+		if listErr != nil {
+			res.Steps = append(res.Steps, fmt.Sprintf("quarantine listing incomplete: %v", listErr))
+		}
 		var expired int64
 		var expiredCount int
 		for _, b := range bs {
-			if b.Count >= 0 && now.Sub(b.Created) >= olderThan && sameDevice(b.Store, cfg.Volume) == nil {
+			switch {
+			case b.Count < 0:
+				res.Steps = append(res.Steps, fmt.Sprintf("skip quarantine batch %q: held (%s)", filepath.Join(b.Store, b.Name), b.Held))
+			case now.Sub(b.Created) < olderThan:
+			case !sameVolume(b.Store, cfg.Volume):
+				res.Steps = append(res.Steps, fmt.Sprintf("skip quarantine batch %q: on a different volume than %q", filepath.Join(b.Store, b.Name), cfg.Volume))
+			default:
 				expired += b.Bytes
 				expiredCount++
 			}
@@ -92,27 +122,36 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 			if live {
 				var freed int64
 				var names []string
-				var err error
 				for _, dir := range cfg.Policy.QuarantineStores() {
-					if sameDevice(dir, cfg.Volume) != nil {
+					if !sameVolume(dir, cfg.Volume) {
 						continue
 					}
-					n, ns, e := purgeBatchesContext(ctx, dir, olderThan, now, false, false, &remaining)
+					n, ns, e := purgeBatchesContext(pctx, dir, olderThan, now, false, false, &remaining)
 					freed += n
 					res.RemovedBytes += n
 					names = append(names, ns...)
-					err = errors.Join(err, e)
+					purgeErr = errors.Join(purgeErr, e)
 				}
-				res.Steps = append(res.Steps, fmt.Sprintf("permanently deleted %d expired quarantine batches, %s (err=%v)", len(names), size.Human(freed), err))
-				if _, logErr := fmt.Fprintf(logf, "%s ensure purge batches=%v recorded_bytes=%d err=%v\n", now.UTC().Format(time.RFC3339), names, freed, err); logErr != nil {
-					return res, logErr
+				res.Steps = append(res.Steps, fmt.Sprintf("permanently deleted %d expired quarantine batches, %s", len(names), size.Human(freed)))
+				errText := "<nil>"
+				if purgeErr != nil {
+					errText = purgeErr.Error()
+					// A stuck batch or tombstone must not stop the cleanup
+					// that follows: record it and carry on.
+					res.Steps = append(res.Steps, fmt.Sprintf("quarantine purge incomplete, continuing with plan entries: %v", purgeErr))
+					res.Diagnostics = append(res.Diagnostics, "quarantine purge: "+purgeErr.Error())
 				}
-				if err != nil {
+				if errors.Is(pctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+					res.Steps = append(res.Steps, fmt.Sprintf("the quarantine purge phase ran out of time (budget %s); continuing", share(total, ensurePurgeShare).Round(time.Second)))
+				}
+				if err := audit.line(fmt.Sprintf("%s ensure purge batches=%q recorded_bytes=%d err=%q", ts(), names, freed, errText), true); err != nil {
+					pcancel()
 					return res, err
 				}
 				_ = size.SyncAt(cfg.Volume)
 				after, diskErr := size.Disk(cfg.Volume)
 				if diskErr != nil {
+					pcancel()
 					return res, diskErr
 				}
 				projected = int64(after.Free) - int64(du.Free)
@@ -121,27 +160,49 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 				projected += expired
 			}
 		}
+		pcancel()
 	}
 
 	// Ensure deletes permanently, so a quarantine filesystem mismatch must not
 	// exclude otherwise safe candidates.
 	planning := *cfg
 	planning.Policy.Quarantine = false
-	items := Build(&planning, env, types, now)
+	buildBudget := share(total, ensureBuildShare)
+	bctx, bcancel := context.WithTimeout(ctx, buildBudget)
+	benv := env
+	benv.Ctx = bctx
+	items := Build(&planning, benv, types, now)
+	if errors.Is(bctx.Err(), context.DeadlineExceeded) {
+		timedOut = "plan-building"
+		res.Steps = append(res.Steps, fmt.Sprintf("the plan-building phase ran out of time (budget %s); entries not measured in time are skipped", buildBudget.Round(time.Second)))
+	}
+	bcancel()
 	var rm, cmds []Item
+	var missing int
 	for _, it := range items {
-		if it.Refused != nil || (config.IsDestructive(it.Action) && sameDevice(it.Path, cfg.Volume) != nil) {
-			continue
-		}
-		if config.IsDestructive(it.Action) && it.Deletable > 0 {
+		destructive := config.IsDestructive(it.Action)
+		var r *guard.Refusal
+		switch {
+		case errors.As(it.Refused, &r) && r.Rule == "missing":
+			missing++
+		case it.Refused != nil:
+			res.Steps = append(res.Steps, fmt.Sprintf("skip %q: refused: %v", it.Path, it.Refused))
+		case destructive && !sameVolume(it.Path, cfg.Volume):
+			res.Steps = append(res.Steps, fmt.Sprintf("skip %q: on a different volume than %q; deleting it frees nothing there", it.Path, cfg.Volume))
+		case destructive && it.Deletable > 0:
 			rm = append(rm, it)
-		} else if it.Action == config.ActionCommand {
+		case it.Action == config.ActionCommand:
 			cmds = append(cmds, it)
+		case destructive:
+			res.Steps = append(res.Steps, fmt.Sprintf("skip %q: nothing to delete", it.Path))
 		}
+	}
+	if missing > 0 {
+		res.Steps = append(res.Steps, fmt.Sprintf("skip %d entries whose path does not exist", missing))
 	}
 	ordered := append(rm, cmds...)
 
-	x := &Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env, Ctx: env.Context()}
+	x := &Executor{Policy: cfg.Policy, Log: logf, Out: io.Discard, Now: time.Now, Move: os.Rename, Refs: env.References, Home: cfg.Home, Env: &env, Ctx: ctx, audit: audit}
 	spent := maxBytes - remaining
 	final := du
 	var runErrs error
@@ -149,14 +210,21 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		if projected >= need {
 			break
 		}
+		if live && ctx.Err() != nil {
+			if timedOut == "" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				timedOut = "execution"
+			}
+			runErrs = errors.Join(runErrs, ctx.Err())
+			break
+		}
 		if config.IsDestructive(it.Action) && spent+it.Deletable > maxBytes {
-			res.Steps = append(res.Steps, fmt.Sprintf("skip %s: would exceed the %.0f GB per-run budget", it.Path, cfg.Policy.MaxDeleteGBPerRun))
+			res.Steps = append(res.Steps, fmt.Sprintf("skip %q: would exceed the %.0f GB per-run budget (policy.max_delete_gb_per_run)", it.Path, cfg.Policy.MaxDeleteGBPerRun))
 			continue
 		}
 		if !live {
-			step := fmt.Sprintf("%s %s (%s)", it.Action, it.Path, size.Human(it.Deletable))
+			step := fmt.Sprintf("%s %q (%s)", it.Action, it.Path, size.Human(it.Deletable))
 			if config.IsDestructive(it.Action) {
-				step = fmt.Sprintf("%s %s (%s, would be permanently deleted)", it.Action, it.Path, size.Human(it.Deletable))
+				step = fmt.Sprintf("%s %q (%s, would be permanently deleted)", it.Action, it.Path, size.Human(it.Deletable))
 			}
 			res.Steps = append(res.Steps, step)
 			projected += it.Deletable
@@ -169,7 +237,10 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		spent += x.budgetUsed
 		res.RemovedBytes += x.budgetUsed
 		if err := runErr; err != nil {
-			res.Steps = append(res.Steps, fmt.Sprintf("%s %s: %v", it.Action, it.Path, err))
+			res.Steps = append(res.Steps, fmt.Sprintf("%s %q: %v", it.Action, it.Path, err))
+			if errors.Is(err, context.DeadlineExceeded) && timedOut == "" {
+				timedOut = "execution"
+			}
 			runErrs = errors.Join(runErrs, err)
 			break
 		}
@@ -178,14 +249,53 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		projected += got
 		final = after
 		if config.IsDestructive(it.Action) {
-			res.Steps = append(res.Steps, fmt.Sprintf("%s %s: permanently deleted, %s freed", it.Action, it.Path, size.Human(got)))
+			res.Steps = append(res.Steps, fmt.Sprintf("%s %q: permanently deleted, %s freed", it.Action, it.Path, size.Human(got)))
 		} else {
-			res.Steps = append(res.Steps, fmt.Sprintf("%s %s: %s freed", it.Action, it.Path, size.Human(got)))
+			res.Steps = append(res.Steps, fmt.Sprintf("%s %q: %s freed", it.Action, it.Path, size.Human(got)))
 		}
+	}
+	if timedOut != "" {
+		res.Steps = append(res.Steps, fmt.Sprintf("stopped early: the %s phase ran out of time (policy.operation_timeout_seconds)", timedOut))
+	}
+	// finish wraps what went wrong; a reached target with a stuck quarantine
+	// batch is a diagnostic, not a failure.
+	finish := func() error {
+		err := runErrs
+		if timedOut != "" && !res.Reached {
+			err = errors.Join(err, fmt.Errorf("ensure %s phase ran out of time: %w", timedOut, context.DeadlineExceeded))
+		}
+		if purgeErr != nil && !res.Reached {
+			err = errors.Join(err, purgeErr)
+		}
+		if err != nil && (timedOut != "" || res.RemovedBytes > 0 || projected > 0) && !errors.Is(err, ErrPartial) {
+			err = fmt.Errorf("%w: %w", ErrPartial, err)
+		}
+		if err != nil && !errors.Is(err, ErrPartial) {
+			err = sentinelErr{err, ErrRefused} // nothing was done
+		}
+		return err
 	}
 	if live {
 		_ = size.SyncAt(cfg.Volume)
-		final, _ = size.Disk(cfg.Volume)
+		if d, err := size.Disk(cfg.Volume); err == nil {
+			final = d
+		}
+		// ZFS and btrfs return freed blocks asynchronously: poll briefly and
+		// keep the best reading before calling the recovery poor.
+		if res.RemovedBytes > 0 {
+			deadline := time.Now().Add(recoveryPollWindow)
+		poll:
+			for int64(final.Free)-int64(du.Free) < res.RemovedBytes/10 && time.Now().Before(deadline) {
+				select {
+				case <-parent.Done():
+					break poll
+				case <-time.After(recoveryPollInterval):
+				}
+				if d, err := size.Disk(cfg.Volume); err == nil && d.Free > final.Free {
+					final = d
+				}
+			}
+		}
 		if _, err := state.Update(cfg.Policy.StateFile, func(st *state.State) { st.Record("ensure", final, now) }); err != nil {
 			res.Diagnostics = append(res.Diagnostics, "state not saved: "+err.Error())
 		}
@@ -196,12 +306,12 @@ func Ensure(cfg *config.Config, env guard.Env, target float64, types []string, l
 		}
 		res.FreeGB = final.FreeGB()
 		res.Reached = final.FreeGB() >= target
-		return res, runErrs
+		return res, finish()
 	}
 	if projected < need {
 		res.Steps = append(res.Steps, fmt.Sprintf("short by %s even after every allowed action", size.Human(need-projected)))
 	}
 	res.FreeGB = size.DiskUsage{Free: du.Free + uint64(projected), Total: du.Total}.FreeGB()
 	res.Reached = projected >= need
-	return res, nil
+	return res, finish()
 }

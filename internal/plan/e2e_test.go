@@ -3,6 +3,7 @@
 package plan
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,16 +45,31 @@ func TestStaleKeepsChildrenOfRealProcesses(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cwd.Process.Kill(); _, _ = cwd.Process.Wait() })
 	start("tail", "-f", filepath.Join(dir, "byfd", "f"))
-	time.Sleep(300 * time.Millisecond)
 
 	env, err := guard.Real()
 	if err != nil {
 		t.Fatal(err)
 	}
 	env.Home = home
-	refs, err := env.References()
-	if err != nil {
-		t.Fatal(err)
+	// Poll until every process is visible (cwd set, file open) instead of
+	// sleeping a fixed time that a loaded machine can overrun.
+	var refs []string
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		refs, err = env.References()
+		var unreadable *guard.UnreadableProcessesError
+		if errors.Is(err, guard.ErrPIDNamespace) || errors.As(err, &unreadable) {
+			t.Skip("process references cannot be verified here:", err)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if guard.Referenced(filepath.Join(dir, "bycmd"), refs) && guard.Referenced(filepath.Join(dir, "bycwd"), refs) && guard.Referenced(filepath.Join(dir, "byfd"), refs) {
+			break
+		}
+		if time.Now().After(deadline) {
+			break // the assertions below report which one is missing
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	kids, err := guard.ClassifyChildren(dir, 24*time.Hour, refs, time.Now())
 	if err != nil {

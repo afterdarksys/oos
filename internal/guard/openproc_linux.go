@@ -5,32 +5,28 @@ package guard
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
 // OpenFilesByProcess reads /proc/<pid>/fd/* with /proc/<pid>/comm for every
-// process we may inspect.
+// process we may inspect. It only names writers for the daemon's report, so
+// unreadable processes are skipped; a missing /proc is still an error.
 func OpenFilesByProcess() ([]OpenFile, error) {
-	pids, err := filepath.Glob("/proc/[0-9]*")
+	pids, err := procPIDs()
 	if err != nil {
 		return nil, err
 	}
 	var files []OpenFile
-	for _, dir := range pids {
-		pid, err := strconv.Atoi(filepath.Base(dir))
+	for _, pid := range pids {
+		dir := procDir(pid)
+		fds, err := readFDs(dir)
 		if err != nil {
 			continue
 		}
 		comm, _ := os.ReadFile(filepath.Join(dir, "comm"))
 		cmd := strings.TrimSpace(string(comm))
-		fds, err := os.ReadDir(filepath.Join(dir, "fd"))
-		if err != nil {
-			continue
-		}
-		for _, fd := range fds {
-			target, err := os.Readlink(filepath.Join(dir, "fd", fd.Name()))
-			if err != nil || !strings.HasPrefix(target, "/") || strings.HasPrefix(target, "/dev/") || strings.HasPrefix(target, "/proc/") {
+		for _, target := range fds {
+			if strings.HasPrefix(target, "/dev/") || strings.HasPrefix(target, "/proc/") {
 				continue
 			}
 			files = append(files, OpenFile{PID: pid, Command: cmd, Path: target})

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Robustness for fleets (second review round)
+
+Read before upgrading:
+- Exit codes changed: 4 = busy (lock held, retry), 5 = partial (some done, some refused or failed), 6 = I/O. A busy lock and a partial cleanup used to exit 2; a run that did nothing because everything was refused still exits 2 (`error_kind: refused`). JSON outputs gained `kind` and `error_kind`; cleanup `refused` is now a list of `{path, reason}`.
+- The Linux timer is `OnCalendar=hourly` with up to 15 minutes' random delay.
+- On Linux, `rm-stale-children` and `rm-contents` refuse inside containers and on `hidepid` hosts, where other processes cannot be seen.
+- Rolling back to 0.7.x while quarantine batches are held is unsafe: older releases may purge them.
+
+Fixed:
+- 782631b protected all of `/root` and `/var/lib` on Linux without exceptions, so `deploy/oos.server.json` was rejected and root could clean nothing under `~`. Both stay protected as wholes, with a short list of cache anchors carved out on path boundaries (`/root/.cache`, `.npm`, `.cargo/registry`, `go/pkg/mod`, `.gradle/caches`, `.m2/repository`, and `/var/lib/docker` as an exact command anchor that can never be emptied). A test loads the shipped server config.
+- Security: running as root no longer chowns an existing lock file. A user could hardlink `mutation.lock` or a store's `.oos-store.lock` to a system file and have a root run hand it to them. Lock files are created exclusively and only a freshly created one is handed to the home or store owner; a hardlinked, symlinked or foreign-owned lock is refused. The lock directory is created and chowned by descriptor, closing a swap race.
+- A full disk no longer stops oos from freeing space: an 8 MiB `.oos-reserve` is released to write the audit line, and permanent removals fall back to auditing on stderr. Quarantine moves still refuse.
+- `--ensure` has separate plan and execution time budgets, reports the phase that timed out, and returns a partial result. Scan budgets are per entry and name `policy.scan_max_entries`. Every skipped or refused entry is a step. btrfs subvolumes and ZFS datasets count as the same volume.
+- A tombstone that cannot be deleted no longer blocks `--ensure` or later purges; purge checks deletability first and holds the batch instead.
+- A failed intent write, or a move that is proven complete, no longer pins a batch forever. An empty batch left by a crash is removed.
+- Batches roll over at 500 entries or an 8 MiB manifest; each take syncs only the batch and store directories. Content checks use a map instead of a nested scan.
+- Batches with implausible timestamps (clock errors) are held instead of expired. Non-UTF-8 paths are refused for quarantine.
+- A per-store flock (`.oos-store.lock`) stops a root daemon and a user CLI sharing a store from purging a batch mid-restore. Lock files created by root in another user's home are chowned to that user.
+- A panic in a planning worker is a refusal, not a daemon crash. Commands run in their own process group, killed whole on timeout. Audit log paths are quoted so a newline in a file name cannot forge a line.
+- A rejected config at daemon startup runs the daemon alert-only (embedded thresholds, auto-act off) with `config_error` in `--status`, instead of exiting into a systemd start-limit. The agent notifies once a day. Unknown-key errors say the binary may be older than the config.
+- `-j` is honoured by every mode, including purge, restore and quarantine verification; errors never go to stdout. Non-UTF-8 paths also carry `path_b64`.
+- The auto-act brake no longer treats any EAGAIN as a busy lock, or a failed `.auto-act.json` write as a reason to pause. A timed-out run is judged by what it recovered. Unsupported no-replace rename is a refusal, alerted once.
+- The daemon purges quarantine at most hourly, interruptibly, and not at all when there are no batches. Ticks and the sized walk are jittered; the macOS agent waits up to 10 minutes at random before acting.
+- Logs are RFC3339 UTC, rotate at 50 MiB (three kept), and are no longer written twice on macOS. `--log-tail` reads from the end. Old temp files and extra `.corrupt-*` copies are swept.
+- The state lock waits at most 10 seconds. The daemon holds `<socket>.lock`, so two daemons cannot both run, and it never removes a successor's socket.
+- `--fleet` validates targets, has a hard per-host deadline and `--fleet-parallel N`. `deploy.sh` builds per host architecture.
+- Linux process listing reads `/proc` (no `ps` needed, so busybox and slim images work). Unreadable processes and container PID namespaces make the reference check refuse, but other users' processes are counted, not fatal, for non-root runs. `ps`/`lsof` calls have a 30 s limit and `lsof` uses `-b -w`. The daemon's open-file sampling has a deadline. Reference paths match across `/private` aliases and case on macOS.
+- 32-bit builds compile. Linux free space uses `f_frsize`. systemd units tolerate a missing `/home`. The sized check no longer lists empty directories on ext4.
+- The full suite was run in Linux containers as a user and as root; five Linux-only test failures were fixed (one was a real bug in the space report).
+
 Safety review: every path a cleanup, restore, purge or the daemon can take
 was reviewed for data loss, OS/boot damage and integrity, and fixed below.
 
@@ -14,7 +44,7 @@ was reviewed for data loss, OS/boot damage and integrity, and fixed below.
 ### Security
 - A config file (explicit or default) must be owned by the effective user and not group/other-writable; the check is made on the opened file. `--add`/`--forget` refuse such files too.
 - Command entries must pass the home, `never_touch` and protected-path rules. The command-text scan is case-insensitive, drops quotes, expands `$HOME`/`${HOME}`/`~`/`~user`, cleans `.`, `..` and `//`, reads `/private/...` and `/System/Volumes/Data/...` spellings, checks `never_touch`, and refuses a command naming `/` or the home itself (`rm -rf /`, `find / -delete`, `rm -rf ~/*`). It remains advisory.
-- The built-in protected list grew and is per-platform: macOS `/Library` system state (Keychains, LaunchDaemons, LaunchAgents, Preferences, Extensions, TCC), `/Applications`, `/private/etc`, `/private/var/{db,root,vm,protected}`, Preboot/Recovery, iCloud Drive, CloudStorage, Mail, Messages, MobileSync backups, Photos libraries; Linux `/efi`, `/var/lib`, `/opt`, `/proc`, `/sys`, `/dev`, `/run`, `/root`, `/snap`, `/nix`, keyrings; credential stores (`.netrc`, `.git-credentials`, `.docker`, `.password-store`, gcloud, azure, gh) on both.
+- The built-in protected list grew and is per-platform: macOS `/Library` system state (Keychains, LaunchDaemons, LaunchAgents, Preferences, Extensions, TCC), `/Applications`, `/private/etc`, `/private/var/{db,root,vm,protected}`, Preboot/Recovery, iCloud Drive, CloudStorage, Mail, Messages, MobileSync backups, Photos libraries; Linux `/efi`, `/var/lib`, `/root`, `/opt`, `/proc`, `/sys`, `/dev`, `/run`, `/snap`, `/nix`, keyrings; credential stores (`.netrc`, `.git-credentials`, `.docker`, `.password-store`, gcloud, azure, gh) on both.
 - Restore re-applies removal-time protections (always_disallowed, never_touch, home/allow_outside_home) to every manifest target before writing anything, refuses stores owned by another uid, and recreates missing parents 0700.
 - Every removal refuses paths that overlap oos's own quarantine stores, state, log, size cache or mutation lock, through case and inode aliases.
 - Daemon alerts pass their text to `osascript` as arguments, so a file name can no longer inject AppleScript.

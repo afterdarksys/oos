@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# oos fleet deploy. Builds linux/amd64, ships the binary, seeds a server config
+# oos fleet deploy. Builds a static linux binary for each host's architecture
+# (uname -m: amd64, arm64, armv6/7, 386), ships it, seeds a server config
 # if none exists (never overwrites one), installs the system timer, and runs a
 # quick check. Dry-run unless --yes: the dry-run still builds and probes each
 # host read-only (kernel, free space, installed version, config, timer) so a
@@ -19,7 +20,7 @@ while [ $# -gt 0 ]; do
     --config) CONFIG="$2"; shift ;;
     --user) USER_="$2"; shift ;;
     --force|--break-glass) echo "deploy.sh: $1 is not a thing here" >&2; exit 2 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     -*) echo "deploy.sh: unknown flag $1" >&2; exit 2 ;;
     *) HOSTS+=("$1") ;;
   esac
@@ -30,19 +31,47 @@ done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="$(sed -n 's/^const Version = "\(.*\)"/\1/p' "$ROOT/internal/cli/main.go")"
-BIN="$ROOT/dist/oos-linux-amd64"
 mkdir -p "$ROOT/dist"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
 
+# target maps `uname -m` to a Go target: "GOARCH" or "GOARCH GOARM".
+# An architecture not listed stops the run; guessing ships a binary that
+# cannot execute.
+target() {
+  case "$1" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64|armv8l) echo "arm64" ;;
+    armv7l|armv7*) echo "arm 7" ;;
+    armv6l|armv6*) echo "arm 6" ;;
+    i386|i486|i586|i686) echo "386" ;;
+    *) return 1 ;;
+  esac
+}
+
+# build compiles one target once per run and sets BIN to the binary.
+BUILT=""
+build() {
+  local goarch="$1" goarm="${2:-}"
+  BIN="$ROOT/dist/oos-linux-$goarch${goarm:+v$goarm}"
+  case " $BUILT " in *" $BIN "*) return 0 ;; esac
+  echo "building $BIN"
+  ( cd "$ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" go build -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/oos )
+  BUILT="$BUILT $BIN"
+}
+
 echo "oos $VERSION -> ${HOSTS[*]} (user $USER_, config $CONFIG)"
-echo "building $BIN"
-( cd "$ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/oos )
 
 # probe: read-only look at each host. Runs in both modes; a host that cannot
-# be reached stops the run before anything is shipped anywhere.
+# be reached, or whose architecture has no build, stops the run before
+# anything is shipped anywhere. The probe reports the machine type on a
+# marked line so a noisy login shell cannot be mistaken for it.
+BINS=()
+PROBE_OUT="$(mktemp)"
+trap 'rm -f "$PROBE_OUT"' EXIT
 for h in "${HOSTS[@]}"; do
   echo "== $h (probe)"
-  if ! "${SSH[@]}" "$USER_@$h" bash -s <<'PROBE'
+  if ! "${SSH[@]}" "$USER_@$h" bash -s >"$PROBE_OUT" <<'PROBE'
+echo "OOS_MACHINE=$(uname -m)"
 printf '  %s, %s\n' "$(uname -srm)" "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
 printf '  root fs: %s\n' "$(df -h / | awk 'NR==2{print $4" free of "$2" ("$5" used)"}')"
 if command -v oos >/dev/null 2>&1; then printf '  oos: %s at %s\n' "$(oos -V)" "$(command -v oos)"; else echo "  oos: not installed"; fi
@@ -59,6 +88,15 @@ PROBE
     echo "deploy.sh: cannot probe $h; nothing shipped" >&2
     exit 1
   fi
+  MACHINE="$(sed -n 's/^OOS_MACHINE=//p' "$PROBE_OUT" | head -n 1)"
+  grep -v '^OOS_MACHINE=' "$PROBE_OUT" || true
+  if ! T="$(target "$MACHINE")"; then
+    echo "deploy.sh: $h is ${MACHINE:-unknown}, which has no linux build here; nothing shipped" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2086 # T is "GOARCH" or "GOARCH GOARM"
+  build $T
+  BINS+=("$BIN")
 done
 
 if [ "$YES" -ne 1 ]; then
@@ -69,8 +107,10 @@ if [ "$YES" -ne 1 ]; then
   exit 0
 fi
 
-for h in "${HOSTS[@]}"; do
-  echo "== $h"
+for i in "${!HOSTS[@]}"; do
+  h="${HOSTS[$i]}"
+  BIN="${BINS[$i]}"
+  echo "== $h ($(basename "$BIN"))"
   T="$USER_@$h"
   scp -q "$BIN" "$T:/usr/local/bin/oos.new"
   scp -q "$CONFIG" "$T:/tmp/oos.server.json"

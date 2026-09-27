@@ -2,27 +2,20 @@
 
 package guard
 
-import (
-	"os/exec"
-	"strings"
-)
+import "strings"
 
 // ListProcessCwds asks lsof for every process's working directory. The -F n
-// form prints one "n<path>" line per cwd.
+// form prints one "n<path>" line per cwd; -b keeps lsof off calls that block
+// on a dead network mount and -w drops warnings so stderr means failure.
 func ListProcessCwds() ([]string, error) {
-	out, err := exec.Command("lsof", "-a", "-d", "cwd", "-F", "n", "-w", "-n", "-P").Output()
-	if err != nil {
-		// lsof exits 1 when some processes could not be inspected but still
-		// prints the rest; treat output as the answer when there is any.
-		if len(out) == 0 {
-			return nil, err
-		}
-	}
 	var cwds []string
-	for _, line := range strings.Split(string(out), "\n") {
+	err := runLines("lsof", []string{"-b", "-w", "-a", "-d", "cwd", "-F", "n", "-n", "-P"}, true, func(line string) {
 		if strings.HasPrefix(line, "n/") {
 			cwds = append(cwds, line[1:])
 		}
+	})
+	if err != nil {
+		return nil, err
 	}
 	return cwds, nil
 }

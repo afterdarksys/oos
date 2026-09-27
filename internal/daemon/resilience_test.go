@@ -13,6 +13,7 @@ import (
 
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/guard"
+	"github.com/afterdarksys/oos/internal/mutation"
 	"github.com/afterdarksys/oos/internal/plan"
 	"github.com/afterdarksys/oos/internal/size"
 )
@@ -80,7 +81,7 @@ func TestLockBusyIsNotAFailure(t *testing.T) {
 	calls := 0
 	d.deps.Ensure = func(*config.Config, guard.Env, float64, bool, time.Time) (plan.EnsureResult, error) {
 		calls++
-		return plan.EnsureResult{}, fmt.Errorf("another oos mutation is running: %w", syscall.EWOULDBLOCK)
+		return plan.EnsureResult{}, fmt.Errorf("%w (lock x): %w", mutation.ErrBusy, syscall.EWOULDBLOCK)
 	}
 	for i := 0; i < 3; i++ {
 		d.Tick(w.now)

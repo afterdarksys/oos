@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -140,7 +141,7 @@ func TestQuarantineTakeRestorePurge(t *testing.T) {
 	if err != nil || len(bs) != 1 || bs[0].Count != 2 {
 		t.Fatalf("batches: %+v %v", bs, err)
 	}
-	if !strings.Contains(log.String(), "quarantine "+filepath.Join(dir, "f2")) {
+	if !strings.Contains(log.String(), "quarantine "+strconv.Quote(filepath.Join(dir, "f2"))) {
 		t.Error("audit log should record the quarantine move")
 	}
 

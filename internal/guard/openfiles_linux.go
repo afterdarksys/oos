@@ -2,22 +2,20 @@
 
 package guard
 
-import (
-	"os"
-	"path/filepath"
-)
-
-// ListOpenFiles reads /proc/<pid>/fd/* for every process we may inspect.
+// ListOpenFiles reads /proc/<pid>/fd/* for every process, failing like
+// ListProcessCwds when the answer could be incomplete.
 func ListOpenFiles() ([]string, error) {
-	fds, err := filepath.Glob("/proc/[0-9]*/fd/*")
+	var files []string
+	err := walkProcs("open files", true, func(_ int, dir string) error {
+		fds, err := readFDs(dir)
+		if err != nil {
+			return err
+		}
+		files = append(files, fds...)
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	var files []string
-	for _, fd := range fds {
-		if target, err := os.Readlink(fd); err == nil && len(target) > 0 && target[0] == '/' {
-			files = append(files, target)
-		}
 	}
 	return files, nil
 }

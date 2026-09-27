@@ -48,7 +48,7 @@ func doByType(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, er
 	}
 	rows = rows[:size.CapRows(len(rows), f.Top, 0)]
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "total_bytes": total, "types": rows})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "by-type", "root": root, "total_bytes": total, "types": rows})
 		return status.ExitOK
 	}
 	var files int

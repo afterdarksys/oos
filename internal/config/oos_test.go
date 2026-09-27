@@ -1,6 +1,7 @@
 package config
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -10,8 +11,13 @@ func TestEmbeddedDefaultConfigIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embedded default must validate: %v", err)
 	}
-	if len(cfg.KnownDirs) == 0 || len(cfg.KnownFiles) == 0 {
-		t.Fatal("default config should list known dirs and files")
+	if len(cfg.KnownDirs) == 0 {
+		t.Fatal("default config should list known dirs")
+	}
+	// The Linux default cleans cache directories only; the macOS one also
+	// names single files.
+	if runtime.GOOS == "darwin" && len(cfg.KnownFiles) == 0 {
+		t.Fatal("macOS default config should list known files")
 	}
 	for _, e := range cfg.Entries(nil) {
 		if strings.HasPrefix(e.Path, "~") {

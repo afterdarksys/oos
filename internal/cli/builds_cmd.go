@@ -82,7 +82,7 @@ func doScanBuilds(cfg *config.Config, env guard.Env, o *opts, now time.Time, out
 		func(i int) string { return rows[i].Path }))
 	shown := rows[:size.CapRows(len(rows), f.Top, 0)]
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"root": root, "idle": idle.String(), "repos": shown})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "scan-builds", "root": root, "idle": idle.String(), "repos": shown})
 		return status.ExitOK
 	}
 	var src, git, build, suggestBytes int64

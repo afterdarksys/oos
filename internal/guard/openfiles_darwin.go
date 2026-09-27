@@ -2,24 +2,21 @@
 
 package guard
 
-import (
-	"os/exec"
-	"strings"
-)
+import "strings"
 
 // ListOpenFiles returns the path of every open file of every process lsof
-// can see. lsof exits non-zero when some processes are off limits but still
-// prints the rest, so non-empty output is the answer.
+// can see. Names are kept as lsof prints them (Referenced also tries the
+// unescaped form). Exit status 1 without stderr is "nothing more to report";
+// a timeout or any reported error fails the listing.
 func ListOpenFiles() ([]string, error) {
-	out, err := exec.Command("lsof", "-F", "n", "-w", "-n", "-P").Output()
-	if err != nil && len(out) == 0 {
-		return nil, err
-	}
 	var files []string
-	for _, line := range strings.Split(string(out), "\n") {
+	err := runLines("lsof", []string{"-b", "-w", "-F", "n", "-n", "-P"}, true, func(line string) {
 		if strings.HasPrefix(line, "n/") {
 			files = append(files, line[1:])
 		}
+	})
+	if err != nil {
+		return nil, err
 	}
 	return files, nil
 }

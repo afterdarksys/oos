@@ -9,7 +9,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Serve answers /status and /health on a unix socket until ctx ends. A live
@@ -25,28 +28,81 @@ func Serve(ctx context.Context, sock string, d *Daemon) error {
 // ErrRunning is returned by Listen when a live daemon already answers.
 var ErrRunning = errors.New("another oos daemon is running")
 
-// Listen claims the socket. It fails when another daemon answers on it, or
-// when the path holds something that is not a socket (which is never
-// removed). An empty sock means no socket: a nil listener and no error.
+// Listen claims the socket. It first takes an exclusive, non-blocking flock
+// on <sock>.lock, held for the daemon's lifetime: two daemons started
+// together cannot both pass the check-remove-listen sequence, and the loser
+// gets ErrRunning. It also fails when a daemon (an older one without the
+// lock) answers on the socket, or when the path holds something that is not
+// a socket (which is never removed). An empty sock means no socket: a nil
+// listener and no error. Closing the returned listener removes the socket
+// only while it is still the one this daemon created, then drops the lock.
 func Listen(sock string) (net.Listener, error) {
 	if sock == "" {
 		return nil, nil
 	}
-	if _, err := Query(sock, time.Second); err == nil {
-		return nil, fmt.Errorf("%w: it answers on %s", ErrRunning, sock)
-	}
-	if err := removeSocket(sock); err != nil {
-		return nil, err
-	}
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
 		return nil, err
 	}
-	ln, err := net.Listen("unix", sock)
+	lock, err := os.OpenFile(sock+".lock", os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err
 	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		lock.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w: it holds %s", ErrRunning, sock+".lock")
+		}
+		return nil, fmt.Errorf("lock %s: %w", sock+".lock", err)
+	}
+	fail := func(err error) (net.Listener, error) {
+		lock.Close()
+		return nil, err
+	}
+	if _, err := Query(sock, time.Second); err == nil {
+		return fail(fmt.Errorf("%w: it answers on %s", ErrRunning, sock))
+	}
+	if err := removeSocket(sock); err != nil {
+		return fail(err)
+	}
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		return fail(err)
+	}
+	if ul, ok := ln.(*net.UnixListener); ok {
+		// Go unlinks the path on Close; ours decides whether that is safe
+		ul.SetUnlinkOnClose(false)
+	}
 	_ = os.Chmod(sock, 0o600)
-	return ln, nil
+	fi, err := os.Lstat(sock)
+	if err != nil {
+		ln.Close()
+		return fail(err)
+	}
+	return &ownedListener{Listener: ln, sock: sock, fi: fi, lock: lock}, nil
+}
+
+// ownedListener ties the socket file to the lifetime lock. Close stops
+// listening, removes the socket only if it is still the inode this daemon
+// created (a successor's socket is never unlinked), and only then releases
+// the lock, so no successor can start listening in between.
+type ownedListener struct {
+	net.Listener
+	sock string
+	fi   os.FileInfo
+	lock *os.File
+	once sync.Once
+	err  error
+}
+
+func (l *ownedListener) Close() error {
+	l.once.Do(func() {
+		l.err = l.Listener.Close()
+		if cur, err := os.Lstat(l.sock); err == nil && os.SameFile(cur, l.fi) {
+			_ = os.Remove(l.sock)
+		}
+		l.lock.Close()
+	})
+	return l.err
 }
 
 // removeSocket removes sock only when Lstat says it is a socket; a missing
@@ -88,9 +144,15 @@ func ServeOn(ctx context.Context, ln net.Listener, sock string, d *Daemon) error
 		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(c)
-		_ = removeSocket(sock)
+		// an owned listener removes its own socket on Close; a bare one
+		// (not from Listen) is cleaned up as before
+		if _, owned := ln.(*ownedListener); !owned {
+			_ = removeSocket(sock)
+		} else {
+			_ = ln.Close()
+		}
 	}()
-	d.logf("listening on %s", sock)
+	d.logf("listening on %q", sock)
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

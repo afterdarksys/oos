@@ -334,8 +334,9 @@ func TestInterruptedPurgeLeavesTombstone(t *testing.T) {
 		t.Fatalf("interrupted purge reported success: %v %v", names, err)
 	}
 	purgeCheckpoint = nil
-	if bs, err := ListBatches(dir); err != nil || len(bs) != 0 {
-		t.Fatalf("half-deleted batch still listed: %+v %v", bs, err)
+	// Listed only as a stuck tombstone: held, never a restorable batch.
+	if bs, err := ListBatches(dir); err != nil || len(bs) != 1 || !bs[0].Tombstone || bs[0].Count != -1 || !strings.HasPrefix(bs[0].Held, "purge incomplete: ") {
+		t.Fatalf("half-deleted batch listed as a batch: %+v %v", bs, err)
 	}
 	if _, _, err := RestoreBatch(dir, q.Batch, nil); err == nil {
 		t.Fatal("half-deleted batch restorable")

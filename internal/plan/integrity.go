@@ -201,7 +201,19 @@ func verifyEntryContext(ctx context.Context, e QEntry, deep bool) EntryVerificat
 // recreate their caches at once, and holding the batch would fill the disk.
 func purgeBlocker(e QEntry) string {
 	if e.Pending {
-		return "pending journal entry"
+		// RecoverBatch's rules, applied without rewriting the manifest: a
+		// move proven complete (source gone, destination is the recorded
+		// object) is an ordinary entry; an intent never executed (source is
+		// the recorded object, destination absent) holds nothing here.
+		_, srcErr := os.Lstat(e.From)
+		_, dstErr := os.Lstat(e.To)
+		switch {
+		case e.Identity != nil && os.IsNotExist(srcErr) && dstErr == nil && e.Identity.matches(e.To):
+		case e.Identity != nil && srcErr == nil && os.IsNotExist(dstErr) && e.Identity.matches(e.From):
+			return ""
+		default:
+			return "pending journal entry"
+		}
 	}
 	if _, err := os.Lstat(e.To); err != nil {
 		if os.IsNotExist(err) {
@@ -248,6 +260,13 @@ func RecoverBatch(dir, name string, live bool) (Verification, error) {
 	return RecoverBatchContext(context.Background(), dir, name, live)
 }
 func RecoverBatchContext(ctx context.Context, dir, name string, live bool) (Verification, error) {
+	if live {
+		release, err := lockStore(dir)
+		if err != nil {
+			return Verification{Batch: name, Issues: []string{}, Entries: []EntryVerification{}}, err
+		}
+		defer release()
+	}
 	v, err := VerifyBatchContext(ctx, dir, name, true)
 	if err != nil {
 		return v, err

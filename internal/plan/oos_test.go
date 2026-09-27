@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,7 +49,7 @@ func TestExecuteRmContentsKeepsDirAndDoesNotFollowSymlinks(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(target, "t")); err != nil {
 		t.Error("symlink target must be untouched")
 	}
-	if !strings.Contains(log.String(), "rm-contents "+dir) {
+	if !strings.Contains(log.String(), "rm-contents "+strconv.Quote(dir)) {
 		t.Error("audit log missing rm-contents line")
 	}
 }

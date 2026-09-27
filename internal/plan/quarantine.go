@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/guard"
@@ -49,9 +50,28 @@ type Quarantine struct {
 	Dir        string
 	Batch      string
 	man        Manifest
+	manSize    int                // bytes of the last manifest written
 	Hash       bool               // opt-in payload hashing
 	checkpoint func(string) error // fault injection in package tests only
 	move       func(src, dst string) error
+	release    func() // store lock, dropped by Discard
+}
+
+// maxBatchEntries caps a batch so its manifest stays small enough to rewrite
+// on every take and to read back (readManifest caps at manifestMaxBytes).
+// Each take rewrites and fsyncs the whole manifest, so a batch costs
+// O(entries^2): 500 keeps an rm-contents of thousands of entries well inside
+// the operation timeout. A batch also rolls over at manifestMaxBytes/2
+// (8 MiB). The executor rolls over to a new batch transparently. Variables
+// for tests.
+var (
+	maxBatchEntries  = 500
+	manifestMaxBytes = 16 << 20
+)
+
+// full reports whether the next take belongs in a new batch.
+func (q *Quarantine) full() bool {
+	return len(q.man.Entries) >= maxBatchEntries || q.manSize >= manifestMaxBytes/2
 }
 
 func OpenQuarantine(dir string, now time.Time, move func(src, dst string) error) (*Quarantine, error) {
@@ -64,24 +84,38 @@ func OpenQuarantine(dir string, now time.Time, move func(src, dst string) error)
 	if _, err := safefs.ReadDir(dir); err != nil {
 		return nil, err
 	}
+	release, err := lockStore(dir)
+	if err != nil {
+		return nil, err
+	}
 	batch := now.Format(BatchLayout)
 	if err := os.Mkdir(filepath.Join(dir, batch), 0o700); err != nil {
 		if !os.IsExist(err) {
+			release()
 			return nil, err
 		}
 		unique, err := os.MkdirTemp(dir, batch+"-")
 		if err != nil {
+			release()
 			return nil, err
 		}
 		batch = filepath.Base(unique)
 	}
-	q := &Quarantine{Dir: dir, Batch: batch, move: move}
+	q := &Quarantine{Dir: dir, Batch: batch, move: move, release: release}
 	id, err := operationID()
 	if err != nil {
+		_ = os.Remove(q.batchDir())
+		release()
 		return nil, err
 	}
 	q.man = Manifest{Version: 2, Operation: id, Batch: batch, Created: now}
-	return q, q.writeManifest()
+	if err := q.writeManifest(); err != nil {
+		// An empty directory without a manifest is scaffolding either way.
+		_ = os.Remove(q.batchDir())
+		release()
+		return nil, err
+	}
+	return q, nil
 }
 
 func (q *Quarantine) batchDir() string     { return filepath.Join(q.Dir, q.Batch) }
@@ -97,6 +131,12 @@ func (q *Quarantine) dest(src string) string {
 func (q *Quarantine) take(src string, bytes int64, now time.Time) (string, error) {
 	if q.Ctx == nil {
 		q.Ctx = context.Background()
+	}
+	// JSON would replace invalid bytes with U+FFFD: the manifest could not
+	// name the original path and restore would fail. Permanent deletes do not
+	// journal paths and are unaffected.
+	if !utf8.ValidString(src) {
+		return "", guard.Refuse("quarantine", "path %q is not valid UTF-8; the quarantine manifest cannot record it for restore (rename it, or use --permanent)", src)
 	}
 	dst := q.dest(src)
 	if err := safefs.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
@@ -137,6 +177,9 @@ func (q *Quarantine) take(src string, bytes int64, now time.Time) (string, error
 	}
 	q.man.Entries = append(q.man.Entries, entry)
 	if err := q.writeManifest(); err != nil {
+		// Nothing moved; a failed intent must not be persisted by the next
+		// take and pin the batch as pending forever.
+		q.man.Entries = q.man.Entries[:len(q.man.Entries)-1]
 		return "", err
 	}
 	if err := q.checkpointAt("intent-durable"); err != nil {
@@ -155,10 +198,12 @@ func (q *Quarantine) take(src string, bytes int64, now time.Time) (string, error
 	if err := q.checkpointAt("payload-moved"); err != nil {
 		return "", err
 	}
-	if err := syncParents(filepath.Dir(src)); err != nil {
+	if err := syncDir(filepath.Dir(src)); err != nil {
 		return "", err
 	}
-	if err := syncParents(filepath.Dir(dst)); err != nil {
+	// Mirror directories were created from the batch down; the batch and its
+	// store are the only ancestors whose entries changed.
+	if err := syncUpTo(filepath.Dir(dst), q.Dir); err != nil {
 		return "", err
 	}
 	if !id.matches(dst) {
@@ -181,10 +226,18 @@ func (q *Quarantine) Empty() bool { return len(q.man.Entries) == 0 }
 // a run that only executed commands, or whose every move failed, leaves no
 // empty batch behind. A batch holding entries is left exactly as it is.
 func (q *Quarantine) Discard() error {
+	defer q.unlock()
 	if !q.Empty() {
 		return nil
 	}
 	return q.removeEmptyBatch()
+}
+
+func (q *Quarantine) unlock() {
+	if q.release != nil {
+		q.release()
+		q.release = nil
+	}
 }
 
 func (q *Quarantine) writeManifest() error {
@@ -194,6 +247,9 @@ func (q *Quarantine) writeManifest() error {
 	b, err := json.MarshalIndent(q.man, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(b) > manifestMaxBytes {
+		return fmt.Errorf("batch %s manifest would be %d bytes, over the %d byte limit readers accept", q.Batch, len(b), manifestMaxBytes)
 	}
 	if err := safefs.CheckAncestors(q.manifestPath()); err != nil {
 		return err
@@ -218,7 +274,8 @@ func (q *Quarantine) writeManifest() error {
 	if err = os.Rename(tmp, q.manifestPath()); err != nil {
 		return err
 	}
-	return syncParents(q.batchDir())
+	q.manSize = len(b)
+	return syncUpTo(q.batchDir(), q.Dir)
 }
 
 // Batch is a summary of one quarantine batch on disk.
@@ -229,6 +286,9 @@ type Batch struct {
 	Count   int       `json:"count"`
 	Bytes   int64     `json:"bytes"`
 	Held    string    `json:"held,omitempty"` // why Count is -1
+	// Tombstone marks a batch an earlier purge committed to deletion but
+	// could not finish; Name is the tombstone directory's name.
+	Tombstone bool `json:"tombstone,omitempty"`
 }
 
 func readManifest(dir, name string) (*Manifest, error) {
@@ -253,9 +313,12 @@ func readManifest(dir, name string) (*Manifest, error) {
 	if err != nil || !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("manifest is not a regular file")
 	}
-	b, err := io.ReadAll(io.LimitReader(file, 16<<20))
+	b, err := io.ReadAll(io.LimitReader(file, int64(manifestMaxBytes)+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(b) > manifestMaxBytes {
+		return nil, fmt.Errorf("batch %s manifest is over %d bytes", name, manifestMaxBytes)
 	}
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
@@ -277,6 +340,17 @@ func readManifest(dir, name string) (*Manifest, error) {
 // path recreated after quarantine does not hold a batch: it only matters to
 // restore, which refuses to overwrite it.
 func ListBatches(dir string) ([]Batch, error) {
+	return ListBatchesContext(context.Background(), dir)
+}
+
+// ListBatchesContext is ListBatches bounded by ctx. It also reports stuck
+// tombstones (Held "purge incomplete: ...") and holds batches whose time is
+// implausible, which points at a wrong clock rather than an old batch.
+func ListBatchesContext(ctx context.Context, dir string) ([]Batch, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now := time.Now()
 	ents, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -287,6 +361,15 @@ func ListBatches(dir string) ([]Batch, error) {
 	var out []Batch
 	for _, de := range ents {
 		if !de.IsDir() {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		if name, ok := strings.CutPrefix(de.Name(), tombstonePrefix); ok {
+			if created, err := batchTime(name); err == nil {
+				out = append(out, stuckTombstone(ctx, dir, de.Name(), created))
+			}
 			continue
 		}
 		created, err := batchTime(de.Name())
@@ -308,7 +391,7 @@ func ListBatches(dir string) ([]Batch, error) {
 				b.Created = m.Created
 			}
 			q := &Quarantine{Dir: dir, Batch: de.Name(), man: *m}
-			if err := q.checkContents(); err != nil {
+			if err := q.checkContentsContext(ctx); err != nil {
 				hold(err.Error())
 			}
 			for _, e := range m.Entries {
@@ -316,8 +399,15 @@ func ListBatches(dir string) ([]Batch, error) {
 					hold(e.From + ": " + why)
 				}
 			}
+		} else if errors.Is(err, os.ErrNotExist) && emptyScaffold(ctx, filepath.Join(dir, de.Name())) {
+			// A crash between creating the batch and its first manifest
+			// leaves an empty directory: removable scaffolding, not data.
+			b.Count = 0
 		} else {
 			hold("manifest: " + err.Error())
+		}
+		if implausibleTime(b.Created, now) {
+			hold(clockHold)
 		}
 		out = append(out, b)
 	}
@@ -363,6 +453,11 @@ func RestoreBatchPolicyContext(ctx context.Context, p config.Policy, home, dir, 
 	if err := checkStoreOwner(dir); err != nil {
 		return 0, nil, err
 	}
+	release, err := lockStore(dir)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer release()
 	m, err := readManifest(dir, name)
 	if err != nil {
 		return 0, nil, err
@@ -430,7 +525,7 @@ func RestoreBatchPolicyContext(ctx context.Context, p config.Policy, home, dir, 
 		if err := syncParents(filepath.Dir(e.From)); err != nil {
 			return restored, skipped, err
 		}
-		if err := syncParents(filepath.Dir(e.To)); err != nil {
+		if err := syncDir(filepath.Dir(e.To)); err != nil {
 			return restored, skipped, err
 		}
 		restored++
@@ -496,6 +591,47 @@ func restoreTarget(p config.Policy, home, from string) error {
 	return nil
 }
 
+// clockHold is the Held reason for a batch whose time cannot be trusted.
+const clockHold = "batch time implausible (clock)"
+
+// implausibleTime is a batch time in the future (beyond an hour of skew) or
+// before oos existed. Expiry must not trust it: a clock that jumped would
+// otherwise purge every batch at once.
+func implausibleTime(t, now time.Time) bool {
+	return t.After(now.Add(time.Hour)) || t.Before(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+}
+
+// emptyScaffold reports a batch directory holding only directories and
+// interrupted manifest temps.
+func emptyScaffold(ctx context.Context, batchDir string) bool {
+	q := &Quarantine{Dir: filepath.Dir(batchDir), Batch: filepath.Base(batchDir)}
+	err := filepath.WalkDir(batchDir, func(p string, d os.DirEntry, err error) error {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || q.manifestTemp(p, d) {
+			return nil
+		}
+		return errors.New("data")
+	})
+	return err == nil
+}
+
+// stuckTombstone describes a tombstone an earlier purge could not remove.
+func stuckTombstone(ctx context.Context, dir, name string, created time.Time) Batch {
+	p := filepath.Join(dir, name)
+	why := "interrupted; the next purge finishes it"
+	if err := safefs.CheckRemovable(ctx, p); err != nil {
+		why = err.Error()
+	}
+	b := Batch{Name: name, Created: created, Count: -1, Held: "purge incomplete: " + why, Tombstone: true}
+	b.Bytes, _ = safefs.MeasureContext(ctx, p)
+	return b
+}
+
 // tombstonePrefix marks a batch committed to deletion. ListBatches, FindBatch
 // and restore do not recognise the name; the next purge finishes it.
 const tombstonePrefix = ".purging-"
@@ -534,7 +670,7 @@ func finishTombstones(ctx context.Context, dir string) (freed int64, names []str
 		}
 		n, e := safefs.RemoveContext(ctx, filepath.Join(dir, de.Name()), nil)
 		if e != nil {
-			err = errors.Join(err, e)
+			err = errors.Join(err, fmt.Errorf("stuck tombstone %s (purge incomplete): %w", filepath.Join(dir, de.Name()), e))
 			continue
 		}
 		freed += n
@@ -544,13 +680,29 @@ func finishTombstones(ctx context.Context, dir string) (freed int64, names []str
 }
 
 func purgeBatchesContext(ctx context.Context, dir string, olderThan time.Duration, now time.Time, all, includeHeld bool, remaining *int64) (freed int64, names []string, err error) {
+	if fi, statErr := os.Lstat(dir); errors.Is(statErr, os.ErrNotExist) {
+		return 0, nil, nil
+	} else if statErr == nil && fi.IsDir() {
+		release, lockErr := lockStore(dir)
+		if lockErr != nil {
+			return 0, nil, lockErr
+		}
+		defer release()
+	}
+	defer func() { err = partial(len(names) > 0, err) }()
 	freed, names, err = finishTombstones(ctx, dir)
-	bs, listErr := ListBatches(dir)
+	bs, listErr := ListBatchesContext(ctx, dir)
 	if listErr != nil {
 		return freed, names, errors.Join(err, listErr)
 	}
 	for _, b := range bs {
+		if b.Tombstone {
+			continue // finishTombstones owns these
+		}
 		if b.Count < 0 && !includeHeld {
+			continue
+		}
+		if !includeHeld && implausibleTime(b.Created, now) {
 			continue
 		}
 		if !all && now.Sub(b.Created) < olderThan {
@@ -566,6 +718,13 @@ func purgeBatchesContext(ctx context.Context, dir string, olderThan time.Duratio
 		if remaining != nil && bytes > *remaining {
 			continue
 		}
+		// A batch that cannot be deleted completely (root-owned leftovers,
+		// immutable flags) stays a batch instead of becoming a stuck
+		// tombstone that fails every later purge.
+		if rmErr := safefs.CheckRemovable(ctx, p); rmErr != nil {
+			err = errors.Join(err, fmt.Errorf("batch %s held: cannot be deleted completely: %w", p, rmErr))
+			continue
+		}
 		// Rename first so an interrupted delete never leaves a half batch that
 		// is still listed or restorable.
 		tomb := filepath.Join(dir, tombstonePrefix+b.Name)
@@ -573,7 +732,7 @@ func purgeBatchesContext(ctx context.Context, dir string, olderThan time.Duratio
 			err = errors.Join(err, mvErr)
 			continue
 		}
-		if syncErr := syncParents(dir); syncErr != nil {
+		if syncErr := syncDir(dir); syncErr != nil {
 			err = errors.Join(err, syncErr)
 		}
 		if purgeCheckpoint != nil {
@@ -609,6 +768,31 @@ func batchTime(name string) (time.Time, error) {
 		}
 	}
 	return time.ParseInLocation(BatchLayout, name[:len(BatchLayout)], time.Local)
+}
+
+// syncDir flushes one directory's entries.
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+// syncUpTo flushes path and its ancestors up to and including stop. A path
+// outside stop syncs only itself.
+func syncUpTo(path, stop string) error {
+	path, stop = filepath.Clean(path), filepath.Clean(stop)
+	for {
+		if err := syncDir(path); err != nil {
+			return err
+		}
+		if path == stop || !strings.HasPrefix(path, stop+string(filepath.Separator)) {
+			return nil
+		}
+		path = filepath.Dir(path)
+	}
 }
 
 func syncParents(path string) error {
@@ -680,10 +864,16 @@ func (q *Quarantine) checkContents() error {
 	return q.checkContentsContext(context.Background())
 }
 func (q *Quarantine) checkContentsContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// A map keeps the walk O(files) instead of O(files×entries).
+	targets := make(map[string]bool, len(q.man.Entries))
 	for _, e := range q.man.Entries {
 		if !filepath.IsAbs(e.From) || filepath.Clean(e.To) != q.dest(e.From) {
 			return fmt.Errorf("invalid quarantine entry %q", e.To)
 		}
+		targets[e.To] = true
 	}
 	return filepath.WalkDir(q.batchDir(), func(path string, d os.DirEntry, err error) error {
 		if e := ctx.Err(); e != nil {
@@ -698,16 +888,11 @@ func (q *Quarantine) checkContentsContext(ctx context.Context) error {
 		if path == q.manifestPath() && d.Type().IsRegular() {
 			return nil
 		}
-		for _, e := range q.man.Entries {
-			if path == e.To {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
+		if targets[path] {
+			if d.IsDir() {
+				return filepath.SkipDir
 			}
-			if d.IsDir() && strings.HasPrefix(e.To, path+string(filepath.Separator)) {
-				return nil
-			}
+			return nil
 		}
 		if d.IsDir() {
 			return nil

@@ -65,7 +65,7 @@ func doDiff(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, errw
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Delta > rows[j].Delta })
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "diff",
 			"since": prevAt, "prev_free_gb": prevFree, "free_gb": du.FreeGB(), "rows": rows,
 		})
 		return status.ExitOK

@@ -20,12 +20,23 @@ func SystemFiles(exe string) map[string]string {
 
 // agentUnits renders the service and timer into dir. System units run as
 // root and carry a hardening block; user units rely on the user's own scope.
+//
+// ProtectSystem=strict leaves only ReadWritePaths writable. The "-" prefix
+// makes a path that does not exist on this host (no /home) skipped
+// instead of failing the unit with 226/NAMESPACE. A config entry outside
+// these roots (under /opt or /srv, say) is read-only to the unit.
+//
+// The timer is calendar-based so Persistent=true catches up a tick missed
+// while the host was down; Persistent has no effect on monotonic timers.
+// RandomizedDelaySec spreads a fleet's ticks over 15 minutes so thousands
+// of hosts do not walk their disks, or hit shared storage, in the same
+// second.
 func agentUnits(dir, exe string, system bool) map[string]string {
 	hardening := ""
 	if system {
 		hardening = `User=root
 ProtectSystem=strict
-ReadWritePaths=/root /var /tmp /home
+ReadWritePaths=-/root -/var -/tmp -/home
 PrivateTmp=no
 NoNewPrivileges=yes
 `
@@ -41,9 +52,10 @@ ExecStart=%s --agent-tick
 Description=oos hourly disk headroom check
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=1h
+OnCalendar=hourly
 Persistent=true
+RandomizedDelaySec=15m
+AccuracySec=1m
 
 [Install]
 WantedBy=timers.target

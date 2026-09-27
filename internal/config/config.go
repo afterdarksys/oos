@@ -382,6 +382,12 @@ func Parse(b []byte, home string) (*Config, error) {
 	dec.DisallowUnknownFields()
 	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
+		// encoding/json says `json: unknown field "x"`; name the key and the
+		// likely cause, since a pushed config can be newer than this binary
+		if msg := err.Error(); strings.HasPrefix(msg, "json: unknown field ") {
+			return nil, fmt.Errorf("parse config: unknown key %s: a typo, or this oos binary is older than the config (upgrade oos or remove the key): %w",
+				strings.TrimPrefix(msg, "json: unknown field "), err)
+		}
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.Home = filepath.Clean(home)
@@ -390,6 +396,18 @@ func Parse(b []byte, home string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// Degraded is what the daemon runs on when the config on disk is rejected:
+// the embedded default thresholds with auto_act forced off, so a bad push
+// leaves an alert-only watcher instead of a dead service.
+func Degraded(home string) (*Config, error) {
+	cfg, err := Parse(Default, home)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Policy.Daemon.AutoAct = false
+	return cfg, nil
 }
 
 func (c *Config) expand(home string) {

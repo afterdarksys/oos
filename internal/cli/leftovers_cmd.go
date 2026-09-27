@@ -34,7 +34,7 @@ func doLeftovers(cfg *config.Config, env guard.Env, o *opts, now time.Time, out,
 		return status.ExitUsage
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"apps_seen": res.Apps, "rows": res.Rows, "bytes_by_verdict": res.ByVerdict, "elapsed_ms": res.Elapsed.Milliseconds()})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "app-leftovers", "apps_seen": res.Apps, "rows": res.Rows, "bytes_by_verdict": res.ByVerdict, "elapsed_ms": res.Elapsed.Milliseconds()})
 		return status.ExitOK
 	}
 	fmt.Fprintf(out, "app leftovers under ~/Library (%d apps seen, entries over %s, %s%s):\n", res.Apps, size.Human(minBytes), res.Elapsed.Round(100*time.Millisecond), f.Describe())

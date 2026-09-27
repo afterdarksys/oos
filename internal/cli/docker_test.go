@@ -13,7 +13,6 @@ import (
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/docker"
 	"github.com/afterdarksys/oos/internal/guard"
-	"github.com/afterdarksys/oos/internal/status"
 	"github.com/afterdarksys/oos/internal/testutil"
 )
 
@@ -103,13 +102,18 @@ func TestCheckDockerSection(t *testing.T) {
 
 func TestCheckDockerSkippedOnError(t *testing.T) {
 	home := t.TempDir()
-	on := true
+	on, off := true, false
 	cfg := checkCfg(home, &on)
 	stubDocker(t, func(args ...string) ([]byte, error) { return nil, errors.New("timed out after 2m0s") })
 	var out, errw bytes.Buffer
+	// The disk status comes from the real volume the temp dir is on, which
+	// can be nearly full (a CI container); compare with docker off.
+	want := doCheck(checkCfg(home, &off), guard.Env{Home: home, Procs: testutil.NoProcs}, &opts{check: true}, time.Now(), &out, &errw)
+	out.Reset()
+	errw.Reset()
 	code := doCheck(cfg, guard.Env{Home: home, Procs: testutil.NoProcs}, &opts{check: true}, time.Now(), &out, &errw)
-	if code != status.ExitOK {
-		t.Errorf("a docker failure must not change the disk status: exit %d", code)
+	if code != want {
+		t.Errorf("a docker failure must not change the disk status: exit %d, without docker %d", code, want)
 	}
 	if !strings.Contains(out.String(), "docker: skipped (docker system df: timed out after 2m0s)") {
 		t.Errorf("skip reason missing:\n%s", out.String())

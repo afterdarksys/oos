@@ -27,17 +27,25 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 		}
 	}
 	doc := map[string]any{
-		"live": live, "quarantine": cfg.Policy.Quarantine && !o.permanent, "plan": planJSON(items),
+		"kind": "cleanup", "refused": refusedRows(items), "live": live, "quarantine": cfg.Policy.Quarantine && !o.permanent, "plan": planJSON(items),
 		"planned_bytes": planned, "reclaimable_bytes": reclaimable, "budget_gb": cfg.Policy.MaxDeleteGBPerRun,
 	}
 	if !live {
+		if n := otherUserProcesses(); n > 0 {
+			doc["other_user_processes_not_inspected"] = n
+		}
 		_ = json.NewEncoder(out).Encode(doc)
 		return status.ExitOK
 	}
+	fail := func(code int, err error) int {
+		doc["error"], doc["error_kind"] = err.Error(), status.Kind(code)
+		_ = json.NewEncoder(out).Encode(doc)
+		return code
+	}
 	logf, err := state.OpenLog(cfg.Policy.LogFile)
 	if err != nil {
-		fmt.Fprintf(errw, "oos: cannot open log %s: %v; refusing to act without an audit log\n", cfg.Policy.LogFile, err)
-		return status.ExitCritical
+		fmt.Fprintf(errw, "oos: cannot open log %q: %v; refusing to act without an audit log\n", cfg.Policy.LogFile, err)
+		return fail(status.ExitIO, fmt.Errorf("cannot open log: %w", err))
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
@@ -46,7 +54,7 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 		stores, err := plan.OpenStores(cfg, now)
 		if err != nil {
 			fmt.Fprintf(errw, "oos: cannot open quarantine: %v\n", err)
-			return status.ExitCritical
+			return fail(exitFor(err, status.ExitIO), fmt.Errorf("cannot open quarantine: %w", err)) // a busy store lock is 4
 		}
 		x.Stores = stores
 		x.Q = stores.Primary()
@@ -66,16 +74,37 @@ func doCleanupJSON(cfg *config.Config, env guard.Env, o *opts, items []plan.Item
 	doc["freed_bytes"] = freed // kept for readers of 0.6; the honest number is free_gb_after - free_gb_before
 	doc["free_gb_before"] = before.FreeGB()
 	doc["free_gb_after"] = after.FreeGB()
+	code := status.ExitOK
 	if err != nil {
-		doc["refused"] = err.Error()
+		// kept a string for readers of 0.7: the run-level refusal; the
+		// per-item refusals are in "refused"
+		// 5 only when some items were done; nothing done is 2 "refused"
+		var kind string
+		code, kind = ranExit(err, status.ExitCritical)
+		doc["error"], doc["error_kind"] = err.Error(), kind
+		doc["refused"] = append(doc["refused"].([]map[string]any), map[string]any{"path": "", "reason": err.Error()})
+	}
+	if n := otherUserProcesses(); n > 0 {
+		doc["other_user_processes_not_inspected"] = n
 	}
 	if _, e := state.Update(cfg.Policy.StateFile, func(st *state.State) { st.Record("cleanup", after, now) }); e != nil {
 		fmt.Fprintf(errw, "oos: save state: %v\n", e)
 	}
 	_ = json.NewEncoder(out).Encode(doc)
 	if err != nil {
-		return status.ExitCritical
+		return code
 	}
-	_, code := status.Of(cfg.Policy, after)
+	_, code = status.Of(cfg.Policy, after)
 	return code
+}
+
+// refusedRows lists every planned item a guard refused, with its reason.
+func refusedRows(items []plan.Item) []map[string]any {
+	rows := []map[string]any{}
+	for _, it := range items {
+		if it.Refused != nil {
+			rows = append(rows, setPath(map[string]any{"reason": it.Refused.Error()}, it.Path))
+		}
+	}
+	return rows
 }

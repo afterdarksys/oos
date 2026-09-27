@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -53,26 +54,118 @@ func (e Env) References() ([]string, error) {
 	return refs, nil
 }
 
+// Referenced folds for darwin: its /var, /tmp and /etc are links into
+// /private, and its default volumes ignore case. Folding only adds matches.
+var (
+	refFoldPrivate = runtime.GOOS == "darwin"
+	refFoldCase    = runtime.GOOS == "darwin"
+)
+
 // Referenced reports whether child appears in any reference as a whole path
-// component: "/a/b" matches "/a/b", "/a/b/x" and "... /a/b ...", not "/a/bc".
+// component: "/a/b" matches "/a/b", "/a/b/x", "... /a/b ..." and "x=/a/b,y",
+// not "/a/bc". Both sides are compared in every form that can name the same
+// file (cleaned, lsof-unescaped, and on darwin /private-folded and
+// case-folded); a match in any form counts, so a doubtful reference keeps
+// the path.
 func Referenced(child string, refs []string) bool {
+	if child == "" {
+		return false
+	}
+	children := refForms(filepath.Clean(child))
 	for _, r := range refs {
-		off := 0
-		for {
-			i := strings.Index(r[off:], child)
-			if i < 0 {
-				break
+		for _, rf := range refForms(r) {
+			for _, c := range children {
+				if containsPath(rf, c) {
+					return true
+				}
 			}
-			end := off + i + len(child)
-			if end == len(r) {
-				return true
-			}
-			switch r[end] {
-			case '/', ' ', '"', '\'', ':', '=':
-				return true
-			}
-			off = off + i + 1
 		}
+	}
+	return false
+}
+
+// refForms is s plus each alternative spelling of it.
+func refForms(s string) []string {
+	forms := []string{s}
+	add := func(v string) {
+		for _, f := range forms {
+			if f == v {
+				return
+			}
+		}
+		forms = append(forms, v)
+	}
+	if strings.Contains(s, `\`) {
+		add(decodeLsofName(s))
+	}
+	for _, f := range forms {
+		if strings.HasPrefix(f, "/") {
+			add(filepath.Clean(f))
+		}
+	}
+	if refFoldPrivate {
+		for _, f := range forms {
+			add(unprivate(f))
+		}
+	}
+	if refFoldCase {
+		for _, f := range forms {
+			add(strings.ToLower(f))
+		}
+	}
+	return forms
+}
+
+// unprivate rewrites darwin's /private/var, /private/tmp and /private/etc to
+// the short names wherever they end at a path boundary.
+func unprivate(s string) string {
+	if !strings.Contains(s, "/private/") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if strings.HasPrefix(s[i:], "/private/") {
+			rest := s[i+len("/private"):]
+			matched := false
+			for _, a := range []string{"/var", "/tmp", "/etc"} {
+				if strings.HasPrefix(rest, a) && (len(rest) == len(a) || refBoundary(rest[len(a)])) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				i += len("/private")
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// containsPath reports whether child occurs in r followed by a boundary.
+func containsPath(r, child string) bool {
+	off := 0
+	for {
+		i := strings.Index(r[off:], child)
+		if i < 0 {
+			return false
+		}
+		end := off + i + len(child)
+		if end == len(r) || refBoundary(r[end]) {
+			return true
+		}
+		off = off + i + 1
+	}
+}
+
+// refBoundary is a byte that can end a path inside a command line or an
+// lsof name.
+func refBoundary(c byte) bool {
+	switch c {
+	case '/', ' ', '"', '\'', ':', '=', ',', ';', '\t', ')', ']', '}', '>', '|', '&', '`', '\n', '\r', 0:
+		return true
 	}
 	return false
 }

@@ -9,13 +9,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/guard"
 	"github.com/afterdarksys/oos/internal/protect"
+	"github.com/afterdarksys/oos/internal/reserve"
 	"github.com/afterdarksys/oos/internal/safefs"
 	"github.com/afterdarksys/oos/internal/size"
 )
@@ -48,7 +52,6 @@ func Build(cfg *config.Config, env guard.Env, types []string, now time.Time) []I
 func BuildTagged(cfg *config.Config, env guard.Env, types []string, tag string, now time.Time) []Item {
 	ctx, cancel := context.WithTimeout(env.Context(), cfg.Policy.OperationTimeout())
 	defer cancel()
-	ctx = worklimit.With(ctx, cfg.Policy.EntryBudget(), cfg.Policy.VerificationBudget())
 	env.Ctx = ctx
 	ents := cfg.EntriesTagged(types, tag)
 	items := make([]Item, len(ents))
@@ -65,6 +68,17 @@ func BuildTagged(cfg *config.Config, env guard.Env, types []string, tag string, 
 		wg.Add(1)
 		go func(i int, e config.Entry) {
 			defer wg.Done()
+			// A panic in one entry's walk refuses that entry instead of
+			// killing the daemon or CLI mid-plan.
+			defer func() {
+				if r := recover(); r != nil {
+					stack := debug.Stack()
+					if len(stack) > 2048 {
+						stack = stack[:2048]
+					}
+					items[i] = Item{Entry: e, Refused: guard.Refuse("panic", "planning %s panicked: %v\n%s", e.Path, r, stack)}
+				}
+			}()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -86,13 +100,20 @@ func BuildTagged(cfg *config.Config, env guard.Env, types []string, tag string, 
 				return
 			}
 			defer func() { <-slot }()
-			items[i] = planItem(cfg, env, e, now)
+			// Each entry has its own work budget, so concurrent entries
+			// cannot starve each other into nondeterministic refusals.
+			ienv := env
+			ienv.Ctx = worklimit.With(ctx, cfg.Policy.EntryBudget(), cfg.Policy.VerificationBudget())
+			items[i] = planEntry(cfg, ienv, e, now)
 		}(i, e)
 	}
 	wg.Wait()
 	sort.SliceStable(items, func(a, b int) bool { return items[a].Bytes > items[b].Bytes })
 	return items
 }
+
+// planEntry is planItem; replaced in package tests only.
+var planEntry = planItem
 
 func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) Item {
 	it := Item{Entry: e}
@@ -107,6 +128,10 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 	}
 	it.Info = fi
 	it.Refused = env.CheckDeletable(cfg.Policy, e)
+	// Say so in the plan (dry-run and JSON), not only when a live run skips it.
+	if it.Refused == nil && e.Action == config.ActionCommand && !cfg.Policy.AllowCommands {
+		it.Refused = guard.Refuse("commands", "allow_commands is false")
+	}
 	if it.Refused == nil && config.IsDestructive(e.Action) {
 		for _, other := range cfg.Entries(nil) {
 			if other.Action == config.ActionNever && config.IsUnder(other.Path, e.Path) {
@@ -124,7 +149,7 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 		}
 		refs, err := env.References()
 		if err != nil {
-			it.Refused = guard.Refuse("references", "%v", err)
+			it.Refused = guard.Refuse("references", "%v", referencesHint(err))
 			it.Bytes, _ = size.PathSize(e.Path)
 			return it
 		}
@@ -181,6 +206,8 @@ func planItem(cfg *config.Config, env guard.Env, e config.Entry, now time.Time) 
 	if it.Refused == nil && cfg.Policy.Quarantine && config.IsDestructive(e.Action) {
 		if err := sameDevice(e.Path, cfg.Policy.QuarantineFor(e.Path)); err != nil {
 			it.Refused = guard.Refuse("quarantine", "%v", err)
+		} else if !utf8.ValidString(e.Path) {
+			it.Refused = guard.Refuse("quarantine", "path %q is not valid UTF-8; the quarantine manifest cannot record it for restore (rename it, or use --permanent)", e.Path)
 		}
 	}
 	return it
@@ -248,15 +275,50 @@ type Executor struct {
 	logErr     error
 	Env        *guard.Env // live guard rechecks; optional for injected executors
 	Home       string     // expands ~/.ssh and the other home-relative always_disallowed entries
+	Stderr     io.Writer  // audit fallback when the log hits ENOSPC; nil is os.Stderr
+	audit      *auditLog
 }
 
+// logf writes an audit line. Paths must be formatted with %q so a name with
+// a newline cannot forge a line.
 func (x *Executor) logf(f string, a ...any) {
-	if x.Log != nil {
-		_, err := fmt.Fprintf(x.Log, "%s %s\n", x.Now().UTC().Format(time.RFC3339), fmt.Sprintf(f, a...))
-		if err != nil {
-			x.logErr = err
-		}
+	if x.Log == nil {
+		return
 	}
+	if x.audit == nil {
+		x.audit = &auditLog{w: x.Log, reserve: reserve.Path(x.Policy.StateFile), stderr: x.Stderr}
+	}
+	// Only a quarantine move needs its journal; a permanent delete may
+	// proceed with the audit on stderr when the disk is full.
+	x.audit.permanent = x.Q == nil && x.Stores == nil
+	if err := x.audit.line(x.Now().UTC().Format(time.RFC3339)+" "+fmt.Sprintf(f, a...), false); err != nil {
+		x.logErr = sentinelErr{err, ErrAudit}
+	}
+}
+
+// ErrAudit matches a run stopped because the audit log could not be
+// written (exit 6). ErrRefused matches a run that did nothing because what
+// it would have done was refused (exit 2). Both keep the wrapped message.
+var (
+	ErrAudit   = errors.New("audit log unwritable")
+	ErrRefused = errors.New("refused; nothing was done")
+)
+
+// sentinelErr tags err with a sentinel without changing its message.
+type sentinelErr struct {
+	error
+	tag error
+}
+
+func (e sentinelErr) Unwrap() error        { return e.error }
+func (e sentinelErr) Is(target error) bool { return target == e.tag }
+
+// entryBudget gives one entry (or one verification walk) its own work budget.
+func (x *Executor) entryBudget(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return worklimit.With(ctx, x.Policy.EntryBudget(), x.Policy.VerificationBudget())
 }
 
 func (x *Executor) outf(f string, a ...any) {
@@ -277,12 +339,15 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, x.Policy.OperationTimeout())
 	defer cancel()
-	ctx = worklimit.With(ctx, x.Policy.EntryBudget(), x.Policy.VerificationBudget())
 	x.Ctx = ctx
 	if x.Now == nil {
 		x.Now = time.Now
 	}
 	x.budgetUsed = 0
+	if x.Log != nil {
+		// Best effort: refill the ENOSPC reserve while there is room.
+		_ = reserve.Ensure(reserve.Path(x.Policy.StateFile))
+	}
 	var budget int64
 	for _, it := range items {
 		if it.Refused == nil && config.IsDestructive(it.Action) {
@@ -292,9 +357,9 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 			if err := unchangedItem(it); err != nil {
 				return 0, err
 			}
-			actual, err := removalSizeContext(ctx, it)
+			actual, err := removalSizeContext(x.entryBudget(ctx), it)
 			if err != nil {
-				return 0, err
+				return 0, fmt.Errorf("measure %q: %w", it.Path, err)
 			}
 			if actual < it.Deletable {
 				actual = it.Deletable
@@ -322,75 +387,82 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 	}
 	var runErr error
 	var freed int64
+	done := 0 // items completed; with a later failure the run is partial
 	for _, it := range items {
 		if err := ctx.Err(); err != nil {
-			return freed, err
+			return freed, partial(done > 0 || freed > 0, err)
 		}
 		if it.Refused != nil {
 			continue
 		}
 		if err := unchangedItem(it); err != nil {
-			return freed, err
+			return freed, partial(done > 0 || freed > 0, err)
 		}
 		if x.Env != nil {
 			if err := x.Env.CheckDeletable(x.Policy, it.Entry); err != nil {
-				return freed, err
+				return freed, partial(done > 0 || freed > 0, err)
 			}
 		}
+		// Each entry gets its own work budget: removal walks count once
+		// per entry, and verification measures use budgets of their own.
+		x.Ctx = x.entryBudget(ctx)
 		switch it.Action {
 		case config.ActionRmContents:
 			n, err := x.rmContents(it.Path)
 			freed += n
 			if err != nil {
 				runErr = errors.Join(runErr, err)
-				x.logf("rm-contents %s partial freed=%d err=%v", it.Path, n, err)
+				x.logf("rm-contents %q partial freed=%d err=%q", it.Path, n, err.Error())
 				x.outf("  %s: partial, %s, error: %v\n", it.Path, size.Human(n), err)
 				continue
 			}
-			x.logf("rm-contents %s freed=%d", it.Path, n)
+			done++
+			x.logf("rm-contents %q freed=%d%s", it.Path, n, uninspected())
 			x.outf("  %s: %s %s\n", it.Path, size.Human(n), x.verb())
 		case config.ActionRmStaleChilds:
 			n, kept, err := x.rmStale(it)
 			freed += n
 			if err != nil {
 				runErr = errors.Join(runErr, err)
-				x.logf("rm-stale-children %s partial freed=%d kept=%d err=%v", it.Path, n, kept, err)
+				x.logf("rm-stale-children %q partial freed=%d kept=%d err=%q", it.Path, n, kept, err.Error())
 				x.outf("  %s: partial, %s, %d kept, error: %v\n", it.Path, size.Human(n), kept, err)
 				continue
 			}
-			x.logf("rm-stale-children %s freed=%d kept=%d", it.Path, n, kept)
+			done++
+			x.logf("rm-stale-children %q freed=%d kept=%d%s", it.Path, n, kept, uninspected())
 			x.outf("  %s: %s %s, %d children kept\n", it.Path, size.Human(n), x.verb(), kept)
 		case config.ActionRm:
 			n, err := x.dispose(it.Path)
 			if err != nil {
 				runErr = errors.Join(runErr, err)
-				x.logf("rm %s err=%v", it.Path, err)
+				x.logf("rm %q err=%q", it.Path, err.Error())
 				x.outf("  %s: error: %v\n", it.Path, err)
 				continue
 			}
+			done++
 			freed += n
-			x.logf("rm %s freed=%d", it.Path, n)
+			x.logf("rm %q freed=%d", it.Path, n)
 			x.outf("  %s: %s %s\n", it.Path, size.Human(n), x.verb())
 		case config.ActionCommand:
 			if prefix, ok := protect.Hit(it.Path, x.Home, x.Policy.AlwaysDisallowed); ok {
-				x.logf("command %s refused always_disallowed %s", it.Path, prefix)
+				x.logf("command %q refused always_disallowed %q", it.Path, prefix)
 				x.outf("  %s: refused, %s is always disallowed\n", it.Path, prefix)
 				continue
 			}
 			if prefix, ok := protect.CommandHits(it.Command, x.Home, guard.CommandProtected(x.Policy)); ok {
-				x.logf("command %s refused mentions %s", it.Path, prefix)
+				x.logf("command %q refused mentions %q", it.Path, prefix)
 				x.outf("  %s: refused, command mentions %s\n", it.Path, prefix)
 				continue
 			}
 			if !x.Policy.AllowCommands {
-				x.logf("command %s skipped allow_commands=false", it.Path)
+				x.logf("command %q skipped allow_commands=false", it.Path)
 				x.outf("  %s: skipped, allow_commands is false\n", it.Path)
 				continue
 			}
-			x.logf("command %s run=%q", it.Path, it.Command)
+			x.logf("command %q run=%q", it.Path, it.Command)
 			x.outf("  %s: running %q\n", it.Path, it.Command)
 			if x.logErr != nil {
-				return freed, x.logErr
+				return freed, partial(done > 0 || freed > 0, x.logErr)
 			}
 			run := x.Run
 			if run == nil {
@@ -398,14 +470,15 @@ func (x *Executor) Execute(items []Item) (int64, error) {
 			}
 			if err := run(it.Command); err != nil {
 				runErr = errors.Join(runErr, err)
-				x.logf("command %s err=%v", it.Path, err)
+				x.logf("command %q err=%q", it.Path, err.Error())
 				x.outf("  %s: command failed: %v\n", it.Path, err)
 				continue
 			}
+			done++
 		}
 	}
 	x.logf("run end freed=%d", freed)
-	return freed, errors.Join(runErr, x.logErr)
+	return freed, partial(done > 0 || freed > 0, errors.Join(runErr, x.logErr))
 }
 
 func (x *Executor) verb() string {
@@ -425,12 +498,14 @@ func (x *Executor) disposeChecked(path string, check func() error) (int64, error
 	if err := guard.CheckRemovalPath(x.Policy, path, x.Home); err != nil {
 		return 0, err
 	}
-	bytes, err := safefs.MeasureContext(x.Ctx, path)
+	// The measure is verification, not removal: its own work budget, so a
+	// tree is not charged twice against the entry's budget.
+	bytes, err := safefs.MeasureContext(x.entryBudget(x.Ctx), path)
 	if err != nil {
 		return 0, err
 	}
 	if bytes > x.remaining {
-		return 0, guard.Refuse("budget", "remaining budget exceeded by %s", path)
+		return 0, guard.Refuse("budget", "remaining budget exceeded by %q", path)
 	}
 	// Check active use after the potentially long measurement, just before acting.
 	if check != nil {
@@ -438,7 +513,7 @@ func (x *Executor) disposeChecked(path string, check func() error) (int64, error
 			return 0, err
 		}
 	}
-	x.logf("dispose intent path=%s bytes=%d", path, bytes)
+	x.logf("dispose intent path=%q bytes=%d", path, bytes)
 	if x.logErr != nil {
 		return 0, x.logErr
 	}
@@ -446,8 +521,6 @@ func (x *Executor) disposeChecked(path string, check func() error) (int64, error
 		if err := x.Ctx.Err(); err != nil {
 			return 0, err
 		}
-		// Reserve before the move: a journal/sync failure may occur after rename.
-		x.remaining -= bytes
 		q := x.Q
 		if x.Stores != nil {
 			var err error
@@ -455,17 +528,32 @@ func (x *Executor) disposeChecked(path string, check func() error) (int64, error
 			if err != nil {
 				return 0, err
 			}
+		} else if q.full() {
+			next, err := OpenQuarantine(q.Dir, x.Now(), q.move)
+			if err != nil {
+				return 0, err
+			}
+			next.Hash, next.checkpoint = q.Hash, q.checkpoint
+			q.unlock()
+			x.Q, q = next, next
+			x.logf("quarantine batch full; continuing in %q", next.Batch)
 		}
+		// Reserve before the move: a journal/sync failure may occur after rename.
+		x.remaining -= bytes
 		q.Ctx = x.Ctx
 		dst, err := q.take(path, bytes, x.Now())
 		if err != nil {
 			return 0, err
 		}
-		x.logf("quarantine %s -> %s bytes=%d", path, dst, bytes)
+		x.logf("quarantine %q -> %q bytes=%d", path, dst, bytes)
 		return bytes, nil
 	}
 	n, err := safefs.RemoveContext(x.Ctx, path, &x.remaining)
-	x.logf("remove %s bytes=%d err=%v", path, n, err)
+	if err != nil {
+		x.logf("remove %q bytes=%d err=%q", path, n, err.Error())
+	} else {
+		x.logf("remove %q bytes=%d err=<nil>", path, n)
+	}
 	return n, err
 }
 
@@ -504,7 +592,7 @@ func (x *Executor) rmContents(dir string) (int64, error) {
 	}
 	refs, err := x.Refs()
 	if err != nil {
-		return 0, guard.Refuse("references", "cannot list process references for %s: %v", dir, err)
+		return 0, guard.Refuse("references", "cannot list process references for %q: %v", dir, referencesHint(err))
 	}
 	entries, err := safefs.ReadDir(dir)
 	if err != nil {
@@ -512,10 +600,17 @@ func (x *Executor) rmContents(dir string) (int64, error) {
 	}
 	var freed int64
 	var firstErr error
+	var notUTF8 int
 	for _, de := range entries {
 		child := filepath.Join(dir, de.Name())
 		if guard.Referenced(child, refs) {
-			x.logf("rm-contents %s child=%s kept referenced by a running process", dir, child)
+			x.logf("rm-contents %q child=%q kept referenced by a running process", dir, child)
+			continue
+		}
+		if x.Q != nil && !utf8.ValidString(child) {
+			notUTF8++
+			x.logf("rm-contents %q child=%q kept: not valid UTF-8, cannot be quarantined", dir, child)
+			x.outf("  %q: kept, not valid UTF-8 (cannot be recorded for restore)\n", child)
 			continue
 		}
 		n, err := x.dispose(child)
@@ -524,14 +619,39 @@ func (x *Executor) rmContents(dir string) (int64, error) {
 			if firstErr == nil {
 				firstErr = err
 			}
-			x.logf("rm-contents %s child=%s err=%v", dir, child, err)
+			x.logf("rm-contents %q child=%q err=%q", dir, child, err.Error())
 			return freed, firstErr
 		}
+	}
+	if notUTF8 > 0 {
+		firstErr = guard.Refuse("quarantine", "%d paths under %q are not valid UTF-8 and were left in place (rename them, or use --permanent)", notUTF8, dir)
 	}
 	return freed, firstErr
 }
 
 var errKeepChild = errors.New("stale child must be kept")
+
+// referencesHint says what to do when the process listing cannot be trusted.
+// The refusal itself stands: a path whose users cannot be seen is kept.
+func referencesHint(err error) error {
+	var u *guard.UnreadableProcessesError
+	switch {
+	case errors.Is(err, guard.ErrPIDNamespace):
+		return fmt.Errorf("cannot verify processes using this path: running in a container PID namespace; run oos on the host: %w", err)
+	case errors.As(err, &u):
+		return fmt.Errorf("cannot verify processes using this path; run oos as root so every process can be inspected: %w", err)
+	}
+	return err
+}
+
+// uninspected annotates an audit line with processes of other users that a
+// non-root listing could not read.
+func uninspected() string {
+	if n := guard.OtherUserProcessesNotInspected(); n > 0 {
+		return fmt.Sprintf(" other_user_processes_not_inspected=%d", n)
+	}
+	return ""
+}
 
 // rmStale disposes of the children the plan marked for deletion, re-checking
 // process references immediately before each one. A child that became
@@ -549,7 +669,7 @@ func (x *Executor) rmStale(it Item) (freed int64, kept int, err error) {
 		n, derr := x.disposeChecked(c.Path, func() error {
 			refs, refErr := x.Refs()
 			if refErr != nil {
-				return fmt.Errorf("re-check references: %w", refErr)
+				return fmt.Errorf("re-check references: %w", referencesHint(refErr))
 			}
 			fi, statErr := os.Lstat(c.Path)
 			if os.IsNotExist(statErr) {
@@ -563,7 +683,7 @@ func (x *Executor) rmStale(it Item) (freed int64, kept int, err error) {
 			}
 			// Same rule as the plan: newest change anywhere in the subtree,
 			// and a walk that cannot finish keeps the child.
-			newest, walkErr := guard.NewestChange(x.Ctx, c.Path)
+			newest, walkErr := guard.NewestChange(x.entryBudget(x.Ctx), c.Path)
 			if walkErr != nil || x.Now().Sub(newest) < time.Duration(it.StaleAfterHours)*time.Hour {
 				return errKeepChild
 			}
@@ -578,7 +698,7 @@ func (x *Executor) rmStale(it Item) (freed int64, kept int, err error) {
 			if firstErr == nil {
 				firstErr = derr
 			}
-			x.logf("rm-stale-children %s child=%s err=%v", it.Path, c.Path, derr)
+			x.logf("rm-stale-children %q child=%q err=%q", it.Path, c.Path, derr.Error())
 			return freed, kept, firstErr
 		}
 	}
@@ -588,10 +708,24 @@ func (x *Executor) rmStale(it Item) (freed int64, kept int, err error) {
 func ShellRun(cmd string) error {
 	return ShellRunContext(context.Background(), cmd)
 }
+
+// shellWaitDelay bounds the wait for output after the group is killed.
+var shellWaitDelay = 5 * time.Second
+
+// ShellRunContext runs cmd in its own process group; cancelling ctx kills
+// the whole group, so a command's children cannot outlive the run.
 func ShellRunContext(ctx context.Context, cmd string) error {
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error {
+		if c.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	}
+	c.WaitDelay = shellWaitDelay
 	return c.Run()
 }
 

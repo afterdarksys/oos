@@ -17,7 +17,11 @@ import (
 func doHistory(cfg *config.Config, o *opts, out io.Writer) int {
 	st, err := state.Load(cfg.Policy.StateFile)
 	if err != nil || len(st.History) == 0 {
-		fmt.Fprintln(out, "no readings yet")
+		if o.jsonOut {
+			fmt.Fprintln(out, "[]") // an empty list, never text, in -j mode
+		} else {
+			fmt.Fprintln(out, "no readings yet")
+		}
 		return status.ExitOK
 	}
 	h := st.History

@@ -34,8 +34,12 @@ func TestAgentFilesAndInstall(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent file not written: %s", p)
 		}
-		if string(b) != want || !strings.Contains(string(b), "/usr/local/bin/oos") {
+		if string(b) != want {
 			t.Errorf("agent file content mismatch for %s", p)
+		}
+		// A systemd timer names its service, not the binary.
+		if !strings.HasSuffix(p, ".timer") && !strings.Contains(string(b), "/usr/local/bin/oos") {
+			t.Errorf("agent file %s does not run the binary", p)
 		}
 		if !config.IsUnder(p, home) {
 			t.Errorf("agent file %s must live under home", p)

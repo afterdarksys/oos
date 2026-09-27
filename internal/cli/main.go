@@ -25,6 +25,7 @@ import (
 	"github.com/afterdarksys/oos/internal/audit"
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/docker"
+	"github.com/afterdarksys/oos/internal/fleet"
 	"github.com/afterdarksys/oos/internal/guard"
 	"github.com/afterdarksys/oos/internal/media"
 	"github.com/afterdarksys/oos/internal/plan"
@@ -63,8 +64,14 @@ type opts struct {
 	depth      int
 
 	// --fleet
-	fleet bool
-	hosts string
+	fleet         bool
+	hosts         string
+	fleetParallel int
+
+	// how many modes were asked for, and the config error a degraded
+	// --status or --daemon runs with
+	modes     int
+	configErr string
 
 	// --dupes DIR, --downloads [DIR]
 	dupes, downloads string
@@ -163,6 +170,7 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 	fs.IntVar(&o.depth, "depth", 0, "with --scan-builds: how many levels down to look for repos (default 4)")
 	fs.BoolVar(&o.fleet, "fleet", false, "ask every host in policy.fleet (or --hosts) for its quick check over ssh and print one table")
 	fs.StringVar(&o.hosts, "hosts", "", "with --fleet: comma-separated ssh targets instead of policy.fleet")
+	fs.IntVar(&o.fleetParallel, "fleet-parallel", fleet.DefaultParallel, fmt.Sprintf("with --fleet: ssh sessions at once (1-%d)", fleet.MaxParallel))
 	fs.StringVar(&o.dupes, "dupes", "", "list identical files under DIR (size, then head/tail hash, then SHA-256); --min-mb floor, default 10")
 	fs.StringVar(&o.downloads, "downloads", "", "judge a downloads folder (DIR, or 'default' for ~/Downloads): installed installers, extracted archives, copies, partials, apps, stale")
 	fs.BoolVar(&o.daemonRun, "daemon", false, "run the resident watcher in the foreground: a tick every policy.daemon.interval_minutes, status socket, writer sampling, rate-limited alerts, auto-act only if policy says so")
@@ -204,6 +212,10 @@ func parseFlags(args []string, stderr io.Writer) (*opts, error) {
 		if m {
 			modes++
 		}
+	}
+	o.modes = modes
+	if o.fleetParallel < 1 || o.fleetParallel > fleet.MaxParallel {
+		return nil, fmt.Errorf("--fleet-parallel must be between 1 and %d", fleet.MaxParallel)
 	}
 	if (o.verifyQuarantine || o.recoverBatch != "" || o.filesystem != "") && modes != 1 {
 		return nil, fmt.Errorf("integrity and filesystem modes cannot be combined with other modes")
@@ -259,8 +271,25 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	cfg, src, err := config.Load(o.config, env.Home)
 	if err != nil {
-		fmt.Fprintln(stderr, "oos:", err)
-		return status.ExitUsage
+		switch {
+		case o.agentTick:
+			// the scheduled tick cannot judge a disk on a policy it cannot
+			// read: say so (rate-limited) and fail, never silently
+			return agent.ConfigRejected(err, configRejectedMarker(env.Home), o.jsonOut, time.Now(), stdout, stderr)
+		case o.daemonRun || (o.statusQ && o.modes == 1):
+			// a config pushed ahead of (or behind) this binary must not kill
+			// the daemon: watch on the default thresholds, alert-only
+			dcfg, derr := config.Degraded(env.Home)
+			if derr != nil {
+				fmt.Fprintln(stderr, "oos:", err)
+				return status.ExitUsage
+			}
+			fmt.Fprintf(stderr, "oos: config rejected: %v; using the embedded default thresholds, alert-only\n", err)
+			cfg, src, o.configErr = dcfg, "embedded default (config rejected)", err.Error()
+		default:
+			fmt.Fprintln(stderr, "oos:", err)
+			return status.ExitUsage
+		}
 	}
 	if err := applyOverrides(cfg, o); err != nil {
 		fmt.Fprintln(stderr, "oos:", err)
@@ -289,13 +318,19 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	// Ensure and scheduled operations acquire the same lock internally.
 	live := !o.no && (o.yes || !cfg.Policy.RequireYes)
+	liveRun := o.ensure > 0 && o.yes && !o.no
 	if !o.agentTick && !o.daemonRun && ((live && (o.cleanup || o.emptyTrash)) || (o.yes && !o.no && (o.purge || o.purgeNow)) || o.restore != "") {
 		lock, err := plan.Mutation(cfg)
 		if err != nil {
-			fmt.Fprintln(stderr, "oos:", err)
-			return status.ExitCritical
+			// busy is 4 (retry later, nothing was tried); anything else is I/O
+			return failf(o, stdout, stderr, mutationKind(o), exitFor(err, status.ExitIO), "%v", err)
 		}
 		defer lock.Close()
+		liveRun = true
+	}
+	if liveRun {
+		sweepLeftovers(cfg, time.Now(), stderr, o.verbose)
+		warnSkippedCommands(cfg, src, stderr)
 	}
 	if o.quiet {
 		stdout = io.Discard
@@ -331,7 +366,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		worst(doShow(cfg, src, o, stdout, stderr))
 	}
 	if o.agentTick {
-		return agent.Tick(cfg, o.jsonOut, now, stdout, stderr)
+		// launchd cannot randomize StartInterval; the plist asks for a
+		// bounded random delay here, and SIGTERM during it ends the run
+		if !agentJitter(ctx) {
+			return status.ExitOK
+		}
+		return agent.Tick(cfg, o.jsonOut, time.Now(), stdout, stderr)
 	}
 	if o.daemonRun {
 		return doDaemon(cfg, src, env, o, stdout, stderr)
@@ -456,7 +496,7 @@ func doShow(cfg *config.Config, src string, o *opts, out, errw io.Writer) int {
 	}
 	batches, _ := plan.ListStoreBatches(cfg.Policy)
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{"config_source": src, "config": cfg, "state": st, "quarantine": batches})
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "show", "config_source": src, "config": cfg, "state": st, "quarantine": batches})
 		return status.ExitOK
 	}
 	fmt.Fprintf(out, "config: %s\n", src)
@@ -515,7 +555,10 @@ func doShow(cfg *config.Config, src string, o *opts, out, errw io.Writer) int {
 				if age >= time.Duration(p.QuarantineDays)*24*time.Hour {
 					expiry = "EXPIRED, --purge --yes removes it"
 				}
-				if b.Count < 0 {
+				switch {
+				case b.Tombstone:
+					expiry = "purge incomplete (retried by every purge): " + strings.TrimPrefix(b.Held, "purge incomplete: ")
+				case b.Count < 0:
 					expiry = "no manifest, never auto-purged"
 				}
 				fmt.Fprintf(out, "  %s  %9s  %3d paths  %s\n", b.Name, size.Human(b.Bytes), b.Count, expiry)
@@ -603,7 +646,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 	}
 	if o.jsonOut {
 		j := map[string]any{
-			"volume": cfg.Volume, "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
+			"kind": "check", "volume": cfg.Volume, "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
 			"status": label, "quarantine_bytes": qBytes, "known": planJSON(items), "by_use_case": checkUseCases(cfg, items),
 			"version": Version, "forecast": fc,
 		}
@@ -691,7 +734,7 @@ func doCheck(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, err
 func planJSON(items []plan.Item) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
 	for _, it := range items {
-		m := map[string]any{"accounting": it.Accounting, "path": it.Path, "type": it.Type, "action": it.Action, "bytes": it.Bytes, "deletable": it.Deletable, "reclaimable": it.Reclaimable}
+		m := setPath(map[string]any{"accounting": it.Accounting, "type": it.Type, "action": it.Action, "bytes": it.Bytes, "deletable": it.Deletable, "reclaimable": it.Reclaimable}, it.Path)
 		if it.Refused != nil {
 			m["refused"] = it.Refused.Error()
 		}
@@ -845,13 +888,16 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 		fmt.Fprintf(out, "  reclaimable upper estimate %s after hardlinks; clones/snapshots may retain more\n", size.Human(r))
 	}
 	if !live {
+		if note := uninspectedNote(); note != "" {
+			fmt.Fprintln(out, note)
+		}
 		fmt.Fprintln(out, "dry-run: nothing touched. Add --yes to execute.")
 		return status.ExitOK
 	}
 	logf, err := state.OpenLog(cfg.Policy.LogFile)
 	if err != nil {
-		fmt.Fprintf(errw, "oos: cannot open log %s: %v; refusing to act without an audit log\n", cfg.Policy.LogFile, err)
-		return status.ExitCritical
+		fmt.Fprintf(errw, "oos: cannot open log %q: %v; refusing to act without an audit log\n", cfg.Policy.LogFile, err)
+		return status.ExitIO
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
@@ -859,8 +905,8 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 	if cfg.Policy.Quarantine && !o.permanent {
 		stores, err := plan.OpenStores(cfg, now)
 		if err != nil {
-			fmt.Fprintf(errw, "oos: cannot open quarantine %s: %v; refusing to act\n", cfg.Policy.QuarantineDir, err)
-			return status.ExitCritical
+			fmt.Fprintf(errw, "oos: cannot open quarantine %q: %v; refusing to act\n", cfg.Policy.QuarantineDir, err)
+			return exitFor(err, status.ExitIO) // a busy store lock is 4
 		}
 		x.Stores = stores
 		x.Q = stores.Primary()
@@ -873,9 +919,13 @@ func doCleanup(cfg *config.Config, env guard.Env, o *opts, now time.Time, out, e
 			fmt.Fprintf(out, "  quarantine batch %s in %s; undo with --restore %s --quarantine-store %s\n", b.Batch, b.Directory, b.Batch, b.Directory)
 		}
 	}
+	if note := uninspectedNote(); note != "" {
+		fmt.Fprintln(out, note)
+	}
 	if err != nil {
 		fmt.Fprintf(errw, "oos: refused: %v\n", err)
-		return status.ExitCritical
+		code, _ := ranExit(err, status.ExitCritical) // 5 only when some items were done
+		return code
 	}
 	if x.Q == nil {
 		_ = size.SyncAt(cfg.Volume)
@@ -929,94 +979,195 @@ func deletableSum(items []plan.Item) int64 {
 }
 
 func doRestore(cfg *config.Config, o *opts, out, errw io.Writer) int {
+	const kind = "restore"
 	if !cfg.Policy.Quarantine {
-		fmt.Fprintln(errw, "oos: quarantine is not enabled in policy")
-		return status.ExitUsage
+		return failf(o, out, errw, kind, status.ExitUsage, "quarantine is not enabled in policy")
 	}
 	logf, err := state.OpenLog(cfg.Policy.LogFile)
 	if err != nil {
-		fmt.Fprintf(errw, "oos: cannot open log: %v\n", err)
-		return status.ExitCritical
+		return failf(o, out, errw, kind, status.ExitIO, "cannot open log: %v", err)
 	}
 	defer logf.Close()
 	dir, err := plan.FindBatch(cfg.Policy, o.restore)
 	if err != nil {
-		fmt.Fprintln(errw, err)
-		return status.ExitCritical
+		return failf(o, out, errw, kind, status.ExitCritical, "%v", err)
 	}
 	if o.no {
 		v, err := plan.VerifyBatch(dir, o.restore, o.deep)
 		if err != nil {
-			fmt.Fprintln(errw, err)
-			return status.ExitCritical
+			return failf(o, out, errw, kind, status.ExitCritical, "%v", err)
 		}
-		json.NewEncoder(out).Encode(v)
+		if o.jsonOut {
+			_ = json.NewEncoder(out).Encode(withKind(kind, v))
+		} else {
+			_ = json.NewEncoder(out).Encode(v)
+		}
 		return status.ExitOK
 	}
 	restoreCtx, cancel := context.WithTimeout(o.Context(), cfg.Policy.OperationTimeout())
 	defer cancel()
 	restoreCtx = worklimit.With(restoreCtx, cfg.Policy.EntryBudget(), cfg.Policy.VerificationBudget())
 	n, skipped, err := plan.RestoreBatchPolicyContext(restoreCtx, cfg.Policy, cfg.Home, dir, o.restore, nil)
-	fmt.Fprintf(logf, "%s restore batch=%s restored=%d skipped=%d err=%v\n", time.Now().UTC().Format(time.RFC3339), o.restore, n, len(skipped), err)
+	fmt.Fprintf(logf, "%s restore batch=%q restored=%d skipped=%d err=%v\n", time.Now().UTC().Format(time.RFC3339), o.restore, n, len(skipped), err)
+	code, errKind := restoreExit(n, len(skipped), err)
+	if o.jsonOut {
+		rows := make([]map[string]any, 0, len(skipped))
+		for _, p := range skipped {
+			rows = append(rows, setPath(map[string]any{}, p))
+		}
+		doc := map[string]any{"kind": kind, "batch": o.restore, "store": dir, "restored": n, "skipped": rows}
+		if err != nil {
+			doc["error"] = err.Error()
+		}
+		if code != status.ExitOK {
+			doc["error_kind"] = errKind
+		}
+		_ = json.NewEncoder(out).Encode(doc)
+		if err != nil {
+			fmt.Fprintf(errw, "oos: restore %s: %v\n", o.restore, err)
+		}
+		return code
+	}
 	if err != nil {
 		fmt.Fprintf(errw, "oos: restore %s: %v\n", o.restore, err)
-		return status.ExitCritical
+		return code
+	}
+	if code == status.ExitCritical {
+		fmt.Fprintf(errw, "oos: restore %s: nothing restored; every path was skipped\n", o.restore)
 	}
 	fmt.Fprintf(out, "restored %d paths from batch %s\n", n, o.restore)
 	for _, s := range skipped {
 		fmt.Fprintf(out, "  left in quarantine: %s\n", s)
 	}
-	return status.ExitOK
+	return code
+}
+
+// restoreExit maps a restore's outcome: some restored and others skipped
+// or failed is partial (5); nothing restored is a refusal (2 "refused").
+func restoreExit(restored, skipped int, err error) (int, string) {
+	switch {
+	case err != nil:
+		code, kind := ranExit(err, status.ExitCritical)
+		if restored > 0 && code == status.ExitCritical {
+			code, kind = status.ExitPartial, status.Kind(status.ExitPartial)
+		}
+		return code, kind
+	case skipped > 0 && restored > 0:
+		return status.ExitPartial, status.Kind(status.ExitPartial)
+	case skipped > 0:
+		return status.ExitCritical, kindRefused
+	}
+	return status.ExitOK, ""
+}
+
+// purgeExit maps a live purge's outcome: some batches removed and others
+// held or failed is partial (5); nothing removed is a refusal (2
+// "refused").
+func purgeExit(purged int, err error) (int, string) {
+	if err == nil {
+		return status.ExitOK, ""
+	}
+	code, kind := ranExit(err, status.ExitCritical)
+	if purged > 0 && code == status.ExitCritical {
+		code, kind = status.ExitPartial, status.Kind(status.ExitPartial)
+	}
+	return code, kind
 }
 
 func doPurge(cfg *config.Config, o *opts, now time.Time, out, errw io.Writer) int {
+	const kind = "purge"
 	if !cfg.Policy.Quarantine {
-		fmt.Fprintln(errw, "oos: quarantine is not enabled in policy")
-		return status.ExitUsage
+		return failf(o, out, errw, kind, status.ExitUsage, "quarantine is not enabled in policy")
 	}
 	live := o.yes && !o.no
 	olderThan := time.Duration(cfg.Policy.QuarantineDays) * 24 * time.Hour
 	batches, err := plan.ListStoreBatches(cfg.Policy)
 	if err != nil {
-		fmt.Fprintf(errw, "oos: list quarantine: %v\n", err)
-		return status.ExitUsage
+		return failf(o, out, errw, kind, status.ExitUsage, "list quarantine: %v", err)
+	}
+	text := io.Writer(out)
+	if o.jsonOut {
+		text = io.Discard
 	}
 	var planned int64
+	rows := make([]map[string]any, 0, len(batches))
 	for _, b := range batches {
 		aged := o.purgeNow || now.Sub(b.Created) >= olderThan
-		if b.Count < 0 && !o.includeHeld {
-			fmt.Fprintf(out, "  held   %9s  %s  (%s; kept, --include-held deletes it)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Held)
-			continue
-		}
-		if aged {
+		row := map[string]any{"store": b.Store, "batch": b.Name, "bytes": b.Bytes, "paths": b.Count, "age_hours": now.Sub(b.Created).Hours()}
+		switch {
+		case b.Tombstone:
+			// --include-held does not help: every purge already retries it
+			row["action"], row["held"], row["tombstone"] = "held", b.Held, true
+			fmt.Fprintf(text, "  held   %9s  %s  (tombstone could not be deleted: %s; likely permissions or an immutable flag; fix that and the next purge finishes it)\n",
+				size.Human(b.Bytes), b.Store+"/"+b.Name, strings.TrimPrefix(b.Held, "purge incomplete: "))
+		case b.Count < 0 && !o.includeHeld:
+			row["action"], row["held"] = "held", b.Held
+			fmt.Fprintf(text, "  held   %9s  %s  (%s; kept, --include-held deletes it)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Held)
+		case aged:
+			row["action"] = "purge"
 			planned += b.Bytes
-			fmt.Fprintf(out, "  purge  %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
-		} else {
-			fmt.Fprintf(out, "  keep   %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
+			fmt.Fprintf(text, "  purge  %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
+		default:
+			row["action"] = "keep"
+			fmt.Fprintf(text, "  keep   %9s  %s  (%d paths, %s old)\n", size.Human(b.Bytes), b.Store+"/"+b.Name, b.Count, now.Sub(b.Created).Round(time.Hour))
 		}
+		rows = append(rows, row)
 	}
-	fmt.Fprintf(out, "  would free up to %s permanently (recorded; blocks shared with files that stay return nothing)\n", size.Human(planned))
+	fmt.Fprintf(text, "  would free up to %s permanently (recorded; blocks shared with files that stay return nothing)\n", size.Human(planned))
+	doc := map[string]any{"kind": kind, "live": live, "all": o.purgeNow, "include_held": o.includeHeld, "batches": rows, "planned_bytes": planned}
 	if !live {
-		fmt.Fprintln(out, "dry-run: nothing purged. Add --yes to execute.")
+		if o.jsonOut {
+			_ = json.NewEncoder(out).Encode(doc)
+		}
+		fmt.Fprintln(text, "dry-run: nothing purged. Add --yes to execute.")
 		return status.ExitOK
 	}
 	logf, err := state.OpenLog(cfg.Policy.LogFile)
 	if err != nil {
-		fmt.Fprintf(errw, "oos: cannot open log: %v; refusing to purge without an audit log\n", err)
-		return status.ExitCritical
+		return failf(o, out, errw, kind, status.ExitIO, "cannot open log: %v; refusing to purge without an audit log", err)
 	}
 	defer logf.Close()
 	before, _ := size.Disk(cfg.Volume)
 	freed, names, err := plan.PurgeStores(o.Context(), cfg.Policy, olderThan, now, o.purgeNow, o.includeHeld)
 	_ = size.SyncAt(cfg.Volume)
 	after, _ := size.Disk(cfg.Volume)
-	fmt.Fprintf(logf, "%s purge all=%v include_held=%v recorded=%d free_before=%d free_after=%d batches=%s err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, o.includeHeld, freed, before.Free, after.Free, strings.Join(names, ","), err)
+	fmt.Fprintf(logf, "%s purge all=%v include_held=%v recorded=%d free_before=%d free_after=%d batches=%q err=%v\n", now.UTC().Format(time.RFC3339), o.purgeNow, o.includeHeld, freed, before.Free, after.Free, names, err)
+	code, errKind := purgeExit(len(names), err)
 	if err != nil {
 		fmt.Fprintf(errw, "oos: purge: %v\n", err)
-		return status.ExitCritical
+	}
+	if o.jsonOut {
+		if names == nil {
+			names = []string{}
+		}
+		doc["purged"], doc["recorded_bytes"] = names, freed
+		doc["free_gb_before"], doc["free_gb_after"] = before.FreeGB(), after.FreeGB()
+		if err != nil {
+			doc["error"], doc["error_kind"] = err.Error(), errKind
+		}
+		_ = json.NewEncoder(out).Encode(doc)
+		return code
+	}
+	if err != nil {
+		return code
 	}
 	fmt.Fprintf(out, "purged %d batches: recorded %s; volume free %.1f GB -> %.1f GB\n", len(names), size.Human(freed), before.FreeGB(), after.FreeGB())
 	return status.ExitOK
+}
+
+// mutationKind names the JSON "kind" of the mutation a lock failure stops.
+func mutationKind(o *opts) string {
+	switch {
+	case o.cleanup:
+		return "cleanup"
+	case o.purge || o.purgeNow:
+		return "purge"
+	case o.restore != "":
+		return "restore"
+	case o.emptyTrash:
+		return "empty-trash"
+	}
+	return "error"
 }
 
 // snapshotsWanted mirrors docker.Wanted: policy.snapshots true forces the

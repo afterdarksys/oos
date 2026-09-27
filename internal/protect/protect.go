@@ -81,8 +81,18 @@ var darwin = []string{
 	"~/Pictures/Photos Library.photoslibrary",
 }
 
-// linux protects the FHS system trees and per-user secret stores. /var/lib
-// holds package databases and service state (databases, containers).
+// linux protects the FHS system trees and per-user secret stores.
+//
+// /var/lib and /root are protected whole: every service keeps state there
+// (Proxmox /var/lib/vz, tailscale, vault, consul, ceph, /root/backups) and an
+// enumerated list fails open on the next unlisted one. The few cache anchors
+// that are safe to clean are carved out in exceptions, the way /usr/local is
+// carved out of /usr. /var/lib/docker is excepted as that exact path only, the
+// anchor for "docker builder prune"; everything below it stays protected, and
+// its image, layer, container and volume stores are also listed by name so
+// that removal, which refuses an ancestor of a protected path, keeps refusing
+// rm-contents of /var/lib/docker itself. The /var/lib and /root children
+// below are covered by the whole-tree entries and stay listed as a record.
 var linux = []string{
 	"/efi",
 	"/lib32",
@@ -91,11 +101,64 @@ var linux = []string{
 	"/sys",
 	"/dev",
 	"/run",
-	"/root",
 	"/snap",
 	"/nix",
 	"/opt",
 	"/var/lib",
+	"/root",
+	"/var/lib/pacman",
+	"/var/lib/dnf",
+	"/var/lib/yum",
+	"/var/lib/ucf",
+	"/var/lib/containerd",
+	"/var/lib/containers",
+	"/var/lib/docker/volumes",
+	"/var/lib/docker/image",
+	"/var/lib/docker/overlay2",
+	"/var/lib/docker/containers",
+	"/var/lib/docker/swarm",
+	"/var/lib/docker/network",
+	"/var/lib/docker/plugins",
+	"/var/lib/docker/buildkit",
+	"/var/lib/mysql",
+	"/var/lib/mariadb",
+	"/var/lib/postgresql",
+	"/var/lib/pgsql",
+	"/var/lib/mongodb",
+	"/var/lib/redis",
+	"/var/lib/etcd",
+	"/var/lib/elasticsearch",
+	"/var/lib/rabbitmq",
+	"/var/lib/cassandra",
+	"/var/lib/influxdb",
+	"/var/lib/kubelet",
+	"/var/lib/rancher",
+	"/var/lib/snapd",
+	"/var/lib/flatpak",
+	"/var/lib/systemd",
+	"/var/lib/private",
+	"/var/lib/NetworkManager",
+	"/var/lib/sss",
+	"/var/lib/polkit-1",
+	"/var/lib/AccountsService",
+	"/var/lib/libvirt",
+	"/var/lib/lxc",
+	"/var/lib/lxd",
+	"/var/lib/incus",
+	"/var/lib/machines",
+	"/root/.ssh",
+	"/root/.gnupg",
+	"/root/.aws",
+	"/root/.kube",
+	"/root/.docker",
+	"/root/.config/gcloud",
+	"/root/.azure",
+	"/root/.config/gh",
+	"/root/.netrc",
+	"/root/.git-credentials",
+	"/root/.password-store",
+	"/root/.pki",
+	"/root/.local/share/keyrings",
 	"~/.local/share/keyrings",
 	"~/.local/share/kwalletd",
 	"~/.pki",
@@ -112,6 +175,43 @@ func BuiltinFor(goos string) []string {
 		out = append(out, linux...)
 	}
 	return out
+}
+
+// exception carves path out of the built-in entry base. subtree allows
+// everything below path too; otherwise only path itself.
+type exception struct {
+	base, path string
+	subtree    bool
+}
+
+// exceptions are the cache anchors below a whole-tree entry that oos may
+// clean. They apply on every platform but only matter where base is listed
+// (Linux). Matching is on path boundaries: /root/.cache-evil is not
+// /root/.cache. A config's always_disallowed still wins over them.
+var exceptions = []exception{
+	{"/var/lib", "/var/lib/docker", false},
+	{"/root", "/root/.cache", true},
+	{"/root", "/root/.npm", true},
+	{"/root", "/root/.cargo/registry", true},
+	{"/root", "/root/go/pkg/mod", true},
+	{"/root", "/root/.gradle/caches", true},
+	{"/root", "/root/.m2/repository", true},
+	// oos's own state, log and quarantine store when root runs it with
+	// HOME=/root; removal refuses them separately as own_data.
+	{"/root", "/root/.local/state/oos", true},
+}
+
+// Excepted reports whether path is carved out of the built-in entry base,
+// so that entry alone does not protect it. Removal checks that walk the
+// built-in list themselves call it for each entry.
+func Excepted(path, base string) bool {
+	path, base = filepath.Clean(path), filepath.Clean(base)
+	for _, e := range exceptions {
+		if e.base == base && (path == e.path || (e.subtree && under(path, e.path))) {
+			return true
+		}
+	}
+	return false
 }
 
 // PhotosLibrary is the bundle suffix Photos uses. A library can live
@@ -150,7 +250,7 @@ func Hit(path, home string, extra []string) (string, bool) {
 		return "", false
 	}
 	for _, raw := range Builtin {
-		if match(path, raw, home) {
+		if match(path, raw, home) && !Excepted(path, raw) {
 			return raw, true
 		}
 	}

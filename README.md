@@ -93,8 +93,28 @@ Long forms: `--check --known --cleanup --diff --show --scan DIR --audit DIR
 --add PATH --type T --action A --command C --note N --stale-hours H
 --use-case U --forget PATH --log-tail N --who PATH --agent-tick --system`.
 
-Exit codes: 0 ok, 1 free space below warn, 2 below critical or a refusal, 3
-usage or config error.
+Exit codes:
+
+| code | meaning | JSON `error_kind` |
+|---|---|---|
+| 0 | ok | |
+| 1 | free space below warn (check modes) | |
+| 2 | below critical, or `--ensure` did not reach its target, or nothing was done because every item was refused | `critical`, `refused` |
+| 3 | usage error or rejected config | `usage` |
+| 4 | busy: another oos mutation holds the lock; nothing was tried; safe to retry | `busy` |
+| 5 | partial: some items were done, others refused or failed | `partial` |
+| 6 | I/O: the audit log, quarantine or a record could not be written | `io` |
+
+Before this release a busy lock and a refusal also exited 2. With `-j` every
+mode prints one JSON document per line with a top-level `kind` (`check`,
+`cleanup`, `ensure`, `purge`, `restore`, `status`, `agent-tick`, `fleet`, ...);
+combining modes prints one line per mode. `--scan`, `--log-tail` and
+`--history` keep their bare arrays. Errors never go to stdout under `-j`.
+Cleanup and ensure JSON carry `refused` as a list of `{path, reason}`; a path
+that is not valid UTF-8 also carries `path_b64`. Cleanup JSON carries
+`other_user_processes_not_inspected` when a non-root run could not read
+other users' processes. `--verify-quarantine -j` lists stuck tombstones
+under `held`, and `--purge -j` marks them `tombstone: true`.
 
 ## Config
 
@@ -126,7 +146,7 @@ an error so a typo cannot silently weaken the policy.
 | `require_yes` | without `--yes`, `--cleanup` and `--purge` only print the plan |
 | `max_delete_gb_per_run` | the whole run is refused before anything is touched if the plan exceeds this |
 | `allow_outside_home` | default false: paths outside `$HOME` are refused |
-| `allow_commands` | `action: command` entries are skipped when false (the shipped default). A command entry's path must still pass the home, `never_touch` and protected-path rules, and its text is scanned for protected paths (a command naming `/` or the home itself, as in `rm -rf ~/*`, is refused), but that scan is advisory: a shell command can reach a path without naming it |
+| `allow_commands` | `action: command` entries are skipped when false (the shipped default); the plan and JSON show them as refused with `allow_commands is false`, and a live run warns once per host when it skips any. Commands run in their own process group, which is killed whole on timeout. A command entry's path must still pass the home, `never_touch` and protected-path rules, and its text is scanned for protected paths (a command naming `/` or the home itself, as in `rm -rf ~/*`, is refused), but that scan is advisory: a shell command can reach a path without naming it |
 | `never_touch` | any path equal to or under these is refused, regardless of entry; a bare `/` protects only `/` |
 | `always_disallowed` | extra paths with the same force as the hard-coded list (`--show` prints that list). Entries here are added. They do not replace `~/.ssh`, the operating system, or the other built-in paths, and deleting a built-in path from this file does not lift it |
 | `min_path_depth` | refuse shallow paths like `/Users/x` |
@@ -195,6 +215,41 @@ second receive distinct names. Each move is journaled and synced before the
 rename. Restore recovers pending moves and preserves unrecorded data for manual
 inspection rather than deleting it. Rename cannot cross filesystems, so an entry
 on a different device from the quarantine dir is refused in the plan.
+
+A batch holds at most 500 entries or an 8 MiB manifest; a larger run rolls
+over into further batches, so a manifest never outgrows the 16 MiB read
+cap. A batch dated more than an hour in the future or before 2020 (a bad
+clock at creation or since) is held as "batch time implausible" rather than
+expired. Before a purge renames a batch it checks that the tree can be
+deleted (immutable or append-only flags, foreign-owned directories); one
+that cannot is held with the reason instead. A tombstone that still could
+not be deleted is listed as held ("purge incomplete") and never blocks
+`--ensure` or later purges. A path that is not valid UTF-8 cannot be
+quarantined (JSON would not round-trip it for restore); permanent removal is
+unaffected. A filesystem without no-replace rename (NFS, SMB, exFAT, older
+ZFS) makes quarantine unavailable on that volume, with that message. Each
+store holds `.oos-store.lock`, which take, restore, recover and purge hold,
+so a root daemon and a user's CLI sharing a store cannot purge a batch that
+is being restored. Rolling back to 0.7.x while batches are held is not
+safe: older releases do not know the newer hold reasons and may purge them.
+
+## Full disk
+
+oos keeps an 8 MiB reserve file, `.oos-reserve`, beside the state file,
+created at the start of a live run when more than 1 GiB is free. When the
+audit log cannot be written because the disk is full, oos deletes the
+reserve and retries. If that still fails, a permanent removal (`--ensure`,
+`--purge`, `--cleanup --permanent`, daemon auto-act) goes ahead and writes
+its audit lines to stderr, starting with "audit log unavailable: ENOSPC;
+audit to stderr". A quarantine move still refuses, because its journal is
+what makes it reversible; the message names `oos --ensure N -y`,
+`--purge --yes` and how much to free by hand. `--ensure` gives plan building
+and execution separate time budgets; a run that runs out of time reports
+which phase did, returns what it freed, and exits 5 if the target was
+missed. The scan budget (`policy.scan_max_entries`) applies per entry, and
+every entry `--ensure` skips or refuses appears as a step with the reason.
+On btrfs and ZFS an entry on another subvolume or dataset of the same pool
+counts toward the target.
 
 ## Trash
 
@@ -356,7 +411,23 @@ it runs the same path as `--ensure` toward `auto_act_target_gb` (default
 inside the per-run budget, every guard re-checked, everything logged and
 announced. Auto-act deletions are permanent, exactly as under `--ensure`:
 they never go to quarantine and there is no `--restore`. Each knob has a
-default, so an empty `daemon` block is a daemon that only watches. SIGHUP reloads the config; SIGTERM stops it, and an ensure in progress stops at a safe point. A second daemon that finds one already answering on the socket exits cleanly. An unreadable state file is reported, never overwritten, and does not crash the daemon; the auto-act cooldown survives a restart. `--install-daemon` and `--install-agent` record the stable `oos` path (not the Homebrew Cellar version), so `brew upgrade` does not break them.
+default, so an empty `daemon` block is a daemon that only watches.
+
+Ticks are randomised: the first waits a random part of one interval and
+each later tick (and the sized walk) varies by ±10%, so a fleet restarted
+together does not act together. The scheduled quarantine purge runs at most
+hourly and is skipped when there are no batches. A config the binary
+rejects at startup (for example a key added by a newer release) does not
+stop the daemon: it keeps watching with the embedded default thresholds,
+auto-act off, reports `config_error` and `degraded` in `--status`, notifies
+once, and retries on SIGHUP and every 10 minutes. The hourly agent notifies
+at most once a day in the same case and exits 3. A busy lock, a stop
+request, or a filesystem that cannot do no-replace renames does not count
+toward the auto-act brake; a run that timed out is judged by what it
+recovered. The daemon holds `<socket>.lock` for its lifetime, so two
+daemons started together cannot both run. Daemon log lines are RFC3339 UTC
+with quoted paths; `oos.log` and `daemon.log` rotate at 50 MiB, keeping
+three old files. SIGHUP reloads the config; SIGTERM stops it, and an ensure in progress stops at a safe point. A second daemon that finds one already answering on the socket exits cleanly. An unreadable state file is reported, never overwritten, and does not crash the daemon; the auto-act cooldown survives a restart. `--install-daemon` and `--install-agent` record the stable `oos` path (not the Homebrew Cellar version), so `brew upgrade` does not break them.
 
 ## Duplicates, Downloads and snapshots
 
@@ -443,7 +514,13 @@ the ssh error. The remote command is `oos -c -q -j`, which sizes nothing.
 Exit code is the worst host: 3 when one did not answer, else the worst
 disk status. `fleet_timeout_seconds` bounds each host (default 20).
 
-`deploy/deploy.sh [--yes] host...` builds linux/amd64, ships the binary,
+`--fleet-parallel N` (default 8, at most 256) sets how many hosts are asked
+at once; each host has a hard deadline, so one hung host cannot hold the
+table.
+
+`deploy/deploy.sh [--yes] host...` probes each host's `uname -m`, builds a
+static binary per architecture (amd64, arm64, armv7/armv6, 386; anything
+else stops the run before shipping), ships it,
 seeds `~/.config/oos/oos.json` from `deploy/oos.server.json` only when the
 host has none (a differing config is left beside it as `oos.json.new`),
 installs the system timer and runs a quick check. Dry-run without `--yes`,
@@ -452,7 +529,12 @@ host read-only (kernel, free space, installed version, config, timer,
 whether `docker` and `logger` exist), and a host that cannot be probed stops
 the run before anything is shipped anywhere. The server config never
 touches `/opt`, `/var/lib/docker/volumes`, database directories or
-`/var/log`; Docker is limited to `docker builder prune`. `.vpscfgfarm.map`
+`/var/log`; Docker is limited to `docker builder prune`. The systemd timer
+fires `OnCalendar=hourly` with `RandomizedDelaySec=15m` and catches up
+after downtime; the first tick after install can be up to about 75 minutes
+away. System units run under `ProtectSystem=strict` with `/root`, `/var`,
+`/tmp` and `/home` writable (a missing one is tolerated); an entry outside
+those is read-only to the unit. `.vpscfgfarm.map`
 routes the repo to that script.
 
 On a headless Linux host there is no desktop to notify: when `notify-send`
@@ -514,8 +596,16 @@ and Recovery volumes, and in the home `Library/Mobile Documents`,
 `Accounts`, `Cookies` and any `*.photoslibrary`. `/Library` as a whole is
 not listed because `/Library/Developer/CoreSimulator` is a default entry.
 On Linux also `/efi`, `/lib32`, `/libx32`, `/proc`, `/sys`, `/dev`, `/run`,
-`/root`, `/snap`, `/nix`, `/opt`, `/var/lib`, and in the home
-`.local/share/keyrings`, `.local/share/kwalletd`, `.pki` and `.mozilla`. `policy.always_disallowed` only
+`/snap`, `/nix`, `/opt`, all of `/root` and all of `/var/lib` (with the
+package, container and database stores also listed by name), and in the home
+`.local/share/keyrings`, `.local/share/kwalletd`, `.pki` and `.mozilla`. A few cache anchors are carved out of those
+built-in parents, matched on path boundaries: `/root/.cache`, `/root/.npm`,
+`/root/.cargo/registry`, `/root/go/pkg/mod`, `/root/.gradle/caches`,
+`/root/.m2/repository`, oos's own `/root/.local/state/oos`, and
+`/var/lib/docker` as that exact path (so a `docker builder prune` command
+can anchor there; emptying it is still refused because Docker's volumes,
+images and overlay2 inside it are protected). A path added through
+`policy.always_disallowed` is never lifted by these. `policy.always_disallowed` only
 adds paths. Deleting a hard-coded path from `oos.json`, clearing
 `never_touch`, or setting `allow_outside_home` does not lift it. A
 `command` entry is refused when its path or its command text names one of
@@ -524,7 +614,21 @@ which stay up on an idle machine, are not treated as installs;
 `osinstallersetupd`, `InstallAssistant`, `startosinstall`, `installer`,
 `softwareupdate`, `apt`, `apt-get`, `dpkg`, `dnf`, `yum`, `rpm`, `pacman`,
 `zypper`, `unattended-upgrade` and `flatpak` are, as is a process list that
-cannot be read. `--empty-trash` applies the same check. Then the run as a whole must fit the byte budget. Symlinks
+cannot be read (on Linux the list comes from `/proc`, so busybox and
+images without `ps` work). `--empty-trash` applies the same check.
+
+Before `rm-stale-children` or `rm-contents` removes a child, oos asks which
+processes use it (their command lines, open files and working directories).
+That answer refuses the entry when it cannot be trusted: `/proc` missing or
+hidden (`hidepid`), a process of the same user (or, as root, any process)
+that cannot be read, or a container PID namespace (a non-init PID 1,
+`/.dockerenv`, `/run/.containerenv` or a container cgroup), where other
+containers sharing a volume are invisible. A non-root run cannot read other
+users' processes; those are counted and logged as
+`other_user_processes_not_inspected=N` rather than refusing, so a root
+process holding a file in a user's cache does not block that user's
+cleanup. `lsof` runs with `-b -w`, and every `ps`/`lsof` call has a 30 s
+limit. Then the run as a whole must fit the byte budget. Symlinks
 inside a directory are moved or unlinked as links, never followed. Symlink
 ancestors are refused, except macOS's standard `/var`, `/tmp`, and `/etc`
 aliases. Removal uses directory handles and refuses nested mount boundaries;

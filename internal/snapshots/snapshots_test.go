@@ -31,7 +31,7 @@ func TestParseAndCollect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Count != 3 || r.Oldest.Day() != 6 || r.Newest.Day() != 8 || !strings.HasPrefix(r.Thin, "tmutil thinlocalsnapshots / ") {
+	if r.Count != 3 || r.Oldest.Day() != 6 || r.Newest.Day() != 8 || r.Thin != "tmutil thinlocalsnapshots / 10000000000 4" {
 		t.Errorf("report: %+v", r)
 	}
 	var out bytes.Buffer

@@ -36,8 +36,11 @@ func TestCleanupCommandOnlyLeavesNoBatch(t *testing.T) {
 	if bs, _ := plan.ListBatches(p.QuarantineDir); len(bs) != 0 {
 		t.Errorf("command-only run left a batch: %+v", bs)
 	}
-	if ents, _ := os.ReadDir(p.QuarantineDir); len(ents) != 0 {
-		t.Errorf("quarantine dir should hold no batch directory: %v", ents)
+	ents, _ := os.ReadDir(p.QuarantineDir)
+	for _, e := range ents {
+		if e.IsDir() { // the store's own lock file may stay; no batch directory may
+			t.Errorf("quarantine dir should hold no batch directory: %v", ents)
+		}
 	}
 	if !strings.Contains(out.String(), "nothing quarantined") {
 		t.Errorf("output should say nothing was quarantined:\n%s", out.String())

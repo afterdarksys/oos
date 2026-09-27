@@ -156,11 +156,14 @@ func TestQuarantineIntentSurvivesInterruptedMove(t *testing.T) {
 	if _, err = q.take(src, 4096, now); err == nil {
 		t.Fatal("injected interruption ignored")
 	}
-	if bs, _ := ListBatches(dir); len(bs) != 1 || bs[0].Count != -1 {
-		t.Fatalf("pending batch eligible for purge: %+v", bs)
+	// RecoverBatch's rule applies to expiry: the source is gone and the
+	// destination is the recorded object, so the move is proven complete and
+	// the batch ages like any other instead of being pinned forever.
+	if bs, _ := ListBatches(dir); len(bs) != 1 || bs[0].Count != 1 || bs[0].Held != "" {
+		t.Fatalf("proven move still pins the batch: %+v", bs)
 	}
-	if _, names, err := PurgeBatches(dir, 0, now.Add(time.Hour), false, false); err != nil || len(names) != 0 {
-		t.Fatalf("pending batch purged: %v %v", names, err)
+	if _, names, err := PurgeBatches(dir, 24*time.Hour, now.Add(time.Hour), false, false); err != nil || len(names) != 0 {
+		t.Fatalf("young batch purged: %v %v", names, err)
 	}
 	n, _, err := RestoreBatch(dir, q.Batch, nil)
 	if err != nil || n != 1 {

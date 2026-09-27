@@ -24,11 +24,12 @@ import (
 
 // doDaemon runs the resident watcher in the foreground until SIGINT or
 // SIGTERM; SIGHUP reloads the config. launchd or systemd keep it alive.
+// A rejected config (o.configErr) does not stop it: it runs alert-only on
+// the embedded default and retries the load.
 func doDaemon(cfg *config.Config, src string, env guard.Env, o *opts, stdout, stderr io.Writer) int {
-	logw := io.Writer(stdout)
-	if lf, err := state.OpenLog(filepath.Join(filepath.Dir(cfg.Policy.LogFile), "daemon.log")); err == nil {
-		defer lf.Close()
-		logw = io.MultiWriter(stdout, lf)
+	logw := daemonLog(filepath.Join(filepath.Dir(cfg.Policy.LogFile), "daemon.log"), stdout)
+	if c, ok := logw.(io.Closer); ok {
+		defer c.Close()
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -37,6 +38,7 @@ func doDaemon(cfg *config.Config, src string, env guard.Env, o *opts, stdout, st
 	env.Ctx = ctx
 	d := daemon.New(cfg, src, env, Version, daemon.Deps{
 		Disk: size.Disk, Now: time.Now, Notify: agent.Notify, OpenFiles: guard.OpenFilesByProcess, Log: logw,
+		LoadConfig: func() (*config.Config, string, error) { return config.Load(o.config, env.Home) },
 	})
 	// claim the socket before ticking: a second daemon must exit, not act as a duplicate
 	sock := cfg.Policy.Daemon.SocketPath(env.Home)
@@ -50,16 +52,23 @@ func doDaemon(cfg *config.Config, src string, env guard.Env, o *opts, stdout, st
 		fmt.Fprintln(stderr, "oos: daemon:", err)
 		return status.ExitUsage
 	}
+	// crash leftovers from an earlier run; only after the socket is ours,
+	// so a duplicate daemon never touches the running one's files
+	state.SweepLeftovers(stateFiles(cfg), time.Now())
+	if o.configErr != "" {
+		d.SetDegraded(errors.New(o.configErr))
+	}
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
 	go func() {
-		for range hup {
-			ncfg, nsrc, err := config.Load(o.config, env.Home)
-			if err != nil {
-				fmt.Fprintf(logw, "reload failed, keeping the running config: %v\n", err)
-				continue
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				d.RequestReload() // applied between ticks by Run
 			}
-			d.Reload(ncfg, nsrc)
 		}
 	}()
 	errc := make(chan error, 1)
@@ -78,6 +87,41 @@ func doDaemon(cfg *config.Config, src string, env guard.Env, o *opts, stdout, st
 	return status.ExitOK
 }
 
+// daemonLog is where the daemon writes its log: daemon.log, rotated by
+// size. When stdout already is that file (launchd's StandardOutPath points
+// there), writing to both would log every line twice, so only the rotating
+// file is written. If the file cannot be opened, stdout alone.
+func daemonLog(path string, stdout io.Writer) io.Writer {
+	lf, err := state.OpenRotatingLog(path)
+	if err != nil {
+		return stdout
+	}
+	if sameFile(stdout, lf.File()) {
+		return lf
+	}
+	return struct {
+		io.Writer
+		io.Closer
+	}{io.MultiWriter(stdout, lf), lf}
+}
+
+// sameFile reports whether w is an *os.File for the same file as f.
+func sameFile(w io.Writer, f *os.File) bool {
+	wf, ok := w.(*os.File)
+	if !ok || f == nil {
+		return false
+	}
+	a, err := wf.Stat()
+	if err != nil {
+		return false
+	}
+	b, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return os.SameFile(a, b)
+}
+
 // doStatus asks the daemon; without one it reads the last tick from the
 // state file and says so. Exit code is the disk status.
 func doStatus(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) int {
@@ -90,19 +134,25 @@ func doStatus(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) i
 		}
 		du, derr := size.Disk(cfg.Volume)
 		if derr != nil {
-			fmt.Fprintf(errw, "oos: statfs %s: %v\n", cfg.Volume, derr)
-			return status.ExitUsage
+			return failf(o, out, errw, "status", status.ExitUsage, "statfs %q: %v", cfg.Volume, derr)
 		}
 		label, code := status.Of(cfg.Policy, du)
 		fc := st.Forecast(time.Now(), cfg.Policy.ForecastWindow(), cfg.Policy.WarnFreeGB, cfg.Policy.MinFreeGB)
 		if o.jsonOut {
-			_ = json.NewEncoder(out).Encode(map[string]any{
-				"daemon": false, "socket": sock, "error": err.Error(), "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
+			doc := map[string]any{
+				"kind": "status", "daemon": false, "socket": sock, "error": err.Error(), "free_gb": du.FreeGB(), "total_gb": du.TotalGB(),
 				"status": label, "forecast": fc, "last_state_update": st.UpdatedAt,
-			})
+			}
+			if o.configErr != "" {
+				doc["config_error"] = o.configErr
+			}
+			_ = json.NewEncoder(out).Encode(doc)
 			return code
 		}
 		fmt.Fprintf(out, "daemon: not running (%s: %v)\n", sock, err)
+		if o.configErr != "" {
+			fmt.Fprintf(out, "  CONFIG REJECTED: %s\n", o.configErr)
+		}
 		fmt.Fprintf(out, "  now: %.1f GB free of %.1f GB (%s); %s\n", du.FreeGB(), du.TotalGB(), label, fc.String())
 		if !st.UpdatedAt.IsZero() {
 			fmt.Fprintf(out, "  last recorded reading: %s\n", st.UpdatedAt.Local().Format("2006-01-02 15:04"))
@@ -117,14 +167,30 @@ func doStatus(cfg *config.Config, env guard.Env, o *opts, out, errw io.Writer) i
 	case "CRITICAL":
 		code = status.ExitCritical
 	}
+	if s.ConfigError == "" && o.configErr != "" {
+		s.ConfigError = o.configErr
+	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(s)
+		_ = json.NewEncoder(out).Encode(struct {
+			Kind string `json:"kind"`
+			daemon.Status
+		}{"status", s})
 		return code
 	}
 	fmt.Fprintf(out, "daemon: oos %s pid %d, up %s, %d ticks every %s, config %s\n", s.Version, s.PID, time.Since(s.Started).Round(time.Minute), s.Ticks, s.Interval, s.Config)
 	fmt.Fprintf(out, "  %s: %.1f GB free of %.1f GB on %s; last tick %s, next %s\n", strings.ToLower(s.Label), s.FreeGB, s.TotalGB, s.Volume,
 		s.LastTick.Local().Format("15:04:05"), s.NextTick.Local().Format("15:04:05"))
 	fmt.Fprintf(out, "  %s\n", s.Forecast.String())
+	if s.ConfigError != "" {
+		mode := ""
+		if s.Degraded {
+			mode = "; running ALERT-ONLY on the default thresholds"
+		}
+		fmt.Fprintf(out, "  CONFIG REJECTED: %s%s\n", s.ConfigError, mode)
+	}
+	if s.AutoAct.PersistError != "" {
+		fmt.Fprintf(out, "  cannot persist auto-act state: %s\n", s.AutoAct.PersistError)
+	}
 	if s.AutoAct.Paused {
 		fmt.Fprintf(out, "  automatic cleanup PAUSED: %s\n", s.AutoAct.Reason)
 	}

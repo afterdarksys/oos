@@ -22,7 +22,7 @@ const (
 	timeout = 15 * time.Second
 	// Thin releases snapshots until this many bytes are free, at urgency 4
 	// (the highest): the command the report prints.
-	thinBytes = 10_000_000_000
+	thinBytes int64 = 10_000_000_000
 )
 
 // Snapshot is one local snapshot.

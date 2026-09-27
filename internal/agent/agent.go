@@ -29,7 +29,7 @@ const defaultAlertDropGB = 10
 func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) int {
 	du, err := size.Disk(cfg.Volume)
 	if err != nil {
-		fmt.Fprintf(errw, "oos: statfs %s: %v\n", cfg.Volume, err)
+		fmt.Fprintf(errw, "oos: statfs %q: %v\n", cfg.Volume, err)
 		return status.ExitUsage
 	}
 	label, code := status.Of(cfg.Policy, du)
@@ -61,9 +61,10 @@ func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) 
 	}
 	var purgedNames []string
 	var purgedBytes int64
+	var purgeErr error
 	if cfg.Policy.Quarantine && cfg.Policy.AgentPurgeExpired {
 		freed, names, perr := plan.PurgeConfigured(cfg, now)
-		purgedNames, purgedBytes = names, freed
+		purgedNames, purgedBytes, purgeErr = names, freed, perr
 		if len(names) > 0 || perr != nil {
 			if logf, lerr := state.OpenLog(cfg.Policy.LogFile); lerr == nil {
 				fmt.Fprintf(logf, "%s agent purge freed=%d batches=%s err=%v\n", now.UTC().Format(time.RFC3339), freed, strings.Join(names, ","), perr)
@@ -104,13 +105,17 @@ func Tick(cfg *config.Config, jsonOut bool, now time.Time, out, errw io.Writer) 
 		}
 	}
 	if jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{
-			"free_gb": du.FreeGB(), "status": label, "drop_gb": drop, "notified": notified,
+		doc := map[string]any{
+			"kind": "agent-tick", "free_gb": du.FreeGB(), "status": label, "drop_gb": drop, "notified": notified,
 			"alerts": msgs, "purged_batches": purgedNames, "purged_bytes": purgedBytes, "forecast": fc,
-		})
+		}
+		if purgeErr != nil {
+			doc["purge_error"] = purgeErr.Error()
+		}
+		_ = json.NewEncoder(out).Encode(doc)
 		return code
 	}
-	fmt.Fprintf(out, "%s agent %s free=%.1fGB", now.Format("2006-01-02 15:04"), strings.ToLower(label), du.FreeGB())
+	fmt.Fprintf(out, "%s agent %s free=%.1fGB", now.UTC().Format(time.RFC3339), strings.ToLower(label), du.FreeGB())
 	if fc.Falling() {
 		fmt.Fprintf(out, " rate=%+.2fGB/h", fc.RateGBPerHour)
 		if fc.HoursToCritical > 0 {

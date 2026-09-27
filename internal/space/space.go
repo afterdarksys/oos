@@ -89,9 +89,10 @@ func Collect(volume, tmpdir string) *Report {
 	return r
 }
 
-// Measure sizes each candidate. Missing paths are skipped. Two paths that
-// are the same file (the install-data firmlink) are reported once. An
-// unreadable path is reported with its error and no byte count.
+// Measure sizes each candidate. Missing paths and empty directories are
+// skipped; a directory's size is its contents, not its own blocks. Two
+// paths that are the same file (the install-data firmlink) are reported
+// once. An unreadable path is reported with its error and no byte count.
 func Measure(cands []Cand) []Place {
 	var out []Place
 	var seen []os.FileInfo
@@ -128,7 +129,13 @@ func Measure(cands []Cand) []Place {
 			var b int64
 			var sizeErr error
 			if fi.IsDir() {
+				// The directory itself is never removed, and its own
+				// blocks (4096 bytes on ext4, none on APFS) are not
+				// space a report should point at. Count what is below it.
 				b, sizeErr = size.PathSize(p)
+				if own := size.Allocated(fi); b >= own {
+					b -= own
+				}
 			} else {
 				b = size.Allocated(fi)
 			}

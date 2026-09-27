@@ -2,8 +2,10 @@ package guard
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ func TestCommandEntriesObeyPathRules(t *testing.T) {
 	home := t.TempDir()
 	p := testutil.PolicyFor(home)
 	p.QuarantineDir = filepath.Join(home, ".local", "state", "oos", "quarantine")
+	testutil.Write(t, filepath.Join(p.QuarantineDir, "b1", "x"), 1)
 	env := Env{Home: home, Procs: testutil.NoProcs}
 	keep := filepath.Join(home, "keep", "cache")
 	cache := filepath.Join(home, "a", "cache")
@@ -28,7 +31,9 @@ func TestCommandEntriesObeyPathRules(t *testing.T) {
 	}{
 		{"never_touch path", keep, "go clean -cache", "never_touch"},
 		{"outside home", t.TempDir(), "go clean -cache", "home"},
-		{"contains own data", filepath.Join(home, ".local"), "go clean -cache", "own_data"},
+		// ~/.local/state holds the quarantine but no built-in protected path
+		// (~/.local itself also contains ~/.local/share/keyrings on Linux).
+		{"contains own data", filepath.Join(home, ".local", "state"), "go clean -cache", "own_data"},
 		{"protected home path", filepath.Join(home, ".ssh"), "true", "always_disallowed"},
 		{"names never_touch", cache, "rm -rf ~/keep", "always_disallowed"},
 		{"names never_touch via $HOME", cache, "rm -rf $HOME/KEEP/cache", "always_disallowed"},
@@ -200,11 +205,16 @@ func TestRemovalRefusesOwnData(t *testing.T) {
 		p.StateFile + ".quarantine-index.json",
 		filepath.Join(home, "logs"),
 		filepath.Join(state, "mutation.lock"),
-		filepath.Join(home, ".local"),
+		filepath.Join(home, ".local", "state"),
 	} {
 		if err := CheckRemovalPath(p, path, home); err == nil || !strings.HasPrefix(err.Error(), "own_data:") {
 			t.Errorf("%s: want own_data refusal, got %v", path, err)
 		}
+	}
+	// ~/.local also contains protected paths on some platforms; the point
+	// is only that it is refused.
+	if err := CheckRemovalPath(p, filepath.Join(home, ".local"), home); err == nil {
+		t.Error("~/.local contains oos's own data and must be refused")
 	}
 	// A case alias of the quarantine store (case-insensitive volumes).
 	alias := filepath.Join(home, ".local", "state", "OOS", "Quarantine")
@@ -228,5 +238,47 @@ func TestInstallCheckFailsClosed(t *testing.T) {
 	broken := Env{Procs: func() ([]string, error) { return nil, os.ErrPermission }}
 	if err := broken.CheckInstall(); err == nil {
 		t.Fatal("an unreadable process list must freeze")
+	}
+}
+
+func TestRemovalHonoursBuiltinExceptions(t *testing.T) {
+	// CheckRemovalPath checks real ancestors before the rules, so this needs
+	// a Linux host where /root and /var/lib are there and readable.
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("needs linux as root")
+	}
+	for _, d := range []string{"/root/.cache", "/root/.npm", "/root/backups", "/var/lib/docker"} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Skip(err)
+		}
+	}
+	old := protect.Builtin
+	t.Cleanup(func() { protect.Builtin = old })
+	protect.Builtin = protect.BuiltinFor("linux")
+	for path, allowed := range map[string]bool{
+		"/root/.cache/pip":        true,
+		"/root/.npm/_cacache":     true,
+		"/root/.cache-evil":       false,
+		"/root/backups/x":         false,
+		"/root":                   false,
+		"/var/lib/docker":         false, // excepted itself, but contains protected volumes/overlay2
+		"/var/lib/docker/volumes": false,
+		"/var/lib/vz":             false,
+		"/var/lib/tailscale":      false,
+	} {
+		err := CheckRemovalPath(config.Policy{}, path, "/root")
+		var r *Refusal
+		protected := errors.As(err, &r) && r.Rule == "always_disallowed"
+		if allowed && protected {
+			t.Errorf("%s should not be protected: %v", path, err)
+		}
+		if !allowed && !protected {
+			t.Errorf("%s must be refused as protected, got %v", path, err)
+		}
+	}
+	// A config-added entry is never lifted by a built-in exception.
+	var r *Refusal
+	if err := CheckRemovalPath(config.Policy{AlwaysDisallowed: []string{"/root/.cache"}}, "/root/.cache/pip", "/root"); !errors.As(err, &r) || r.Rule != "always_disallowed" {
+		t.Error("policy.always_disallowed must win over a built-in exception")
 	}
 }

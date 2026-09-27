@@ -137,8 +137,8 @@ func Update(path string, fn func(*State)) (*State, error) {
 		return &State{Known: map[string]int64{}}, err
 	}
 	defer lf.Close()
-	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
-		return &State{Known: map[string]int64{}}, err
+	if err := lockWithDeadline(lf, LockWait); err != nil {
+		return &State{Known: map[string]int64{}}, fmt.Errorf("state lock %s: %w", path+".lock", err)
 	}
 	defer unix.Flock(int(lf.Fd()), unix.LOCK_UN)
 	s, err := Load(path)
@@ -149,6 +149,36 @@ func Update(path string, fn func(*State)) (*State, error) {
 	return s, Save(path, s)
 }
 
+// LockWait bounds how long Update waits for the state lock. A holder that
+// was SIGSTOPped (or hung on a dead mount) must not stall the daemon forever.
+var LockWait = 10 * time.Second
+
+// ErrLockTimeout is returned when the state lock stays held past LockWait.
+var ErrLockTimeout = errors.New("timed out waiting for the lock; another oos process holds it")
+
+// lockWithDeadline polls a non-blocking exclusive flock until it succeeds or
+// wait elapses.
+func lockWithDeadline(f *os.File, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	backoff := time.Millisecond
+	for {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return ErrLockTimeout
+		}
+		time.Sleep(backoff)
+		if backoff < 50*time.Millisecond {
+			backoff *= 2
+		}
+	}
+}
+
 func (s *State) Record(event string, du size.DiskUsage, now time.Time) {
 	s.UpdatedAt = now
 	s.FreeGB = du.FreeGB()
@@ -156,9 +186,15 @@ func (s *State) Record(event string, du size.DiskUsage, now time.Time) {
 	s.History = append(s.History, HistoryPoint{At: now, FreeGB: du.FreeGB(), Event: event})
 }
 
+// OpenLog opens an append-only log, rotating it first when it has reached
+// LogRotateBytes. See rotate for the crash-safety argument.
 func OpenLog(path string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
+	}
+	if fi, err := os.Stat(path); err == nil && LogRotateBytes > 0 && fi.Size() >= LogRotateBytes {
+		// a failed rotation never blocks the audit line: append to the big file
+		_ = rotate(path)
 	}
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 }

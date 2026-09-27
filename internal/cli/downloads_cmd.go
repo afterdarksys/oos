@@ -33,7 +33,7 @@ func doDownloads(cfg *config.Config, env guard.Env, o *opts, now time.Time, out,
 		return status.ExitUsage
 	}
 	if o.jsonOut {
-		_ = json.NewEncoder(out).Encode(map[string]any{
+		_ = json.NewEncoder(out).Encode(map[string]any{"kind": "downloads",
 			"root": root, "rows": res.Rows, "total_bytes": res.Total, "bytes_by_verdict": res.ByVerdict, "elapsed_ms": res.Elapsed.Milliseconds(),
 		})
 		return status.ExitOK

@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/afterdarksys/oos/internal/config"
@@ -28,32 +26,6 @@ func Real() (Env, error) {
 		return Env{}, err
 	}
 	return Env{Home: filepath.Clean(home), Procs: ListProcesses, Cwds: ListProcessCwds, Open: ListOpenFiles}, nil
-}
-
-// ListProcesses returns every other process's command line, untruncated (-ww:
-// without it macOS ps clips long lines and a path deep in an argument list is
-// silently missed). Our own is dropped:
-// an oos invocation names the paths it is judging, and must never count as
-// a process that uses them.
-func ListProcesses() ([]string, error) {
-	out, err := exec.Command("ps", "-axww", "-o", "pid=,command=").Output()
-	if err != nil {
-		return nil, err
-	}
-	self := strconv.Itoa(os.Getpid())
-	var procs []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		pid, cmd, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
-		if pid == self {
-			continue
-		}
-		procs = append(procs, strings.TrimSpace(cmd))
-	}
-	return procs, nil
 }
 
 // Refusal is a guard failure. The path is never touched when one is returned.

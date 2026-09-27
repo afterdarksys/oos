@@ -14,7 +14,9 @@ const agentLabel = "com.afterdarksys.oos"
 // SystemFiles: --system is a Linux idea; launchd agents are per user.
 func SystemFiles(exe string) map[string]string { return nil }
 
-// Files returns the launchd plist that runs an hourly agent tick.
+// Files returns the launchd plist that runs an hourly agent tick. launchd
+// cannot randomize StartInterval, so the plist sets JitterEnv and the tick
+// itself sleeps a random 0-10 minutes before acting.
 func Files(home, exe string) map[string]string {
 	plist := filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
 	logDir := filepath.Join(home, ".local", "state", "oos")
@@ -29,12 +31,16 @@ func Files(home, exe string) map[string]string {
     <string>--agent-tick</string>
   </array>
   <key>StartInterval</key><integer>3600</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>%s</key><string>600</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>%s/agent.log</string>
   <key>StandardErrorPath</key><string>%s/agent.log</string>
 </dict>
 </plist>
-`, agentLabel, XMLText(exe), XMLText(logDir), XMLText(logDir))
+`, agentLabel, XMLText(exe), JitterEnv, XMLText(logDir), XMLText(logDir))
 	return map[string]string{plist: content}
 }
 

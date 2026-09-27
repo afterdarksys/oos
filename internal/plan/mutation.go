@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/afterdarksys/oos/internal/config"
 	"github.com/afterdarksys/oos/internal/mutation"
+	"github.com/afterdarksys/oos/internal/reserve"
 	"github.com/afterdarksys/oos/internal/state"
 	"path/filepath"
 	"time"
@@ -19,6 +20,8 @@ func Mutation(cfg *config.Config) (*mutation.Lock, error) {
 }
 
 // PurgeConfigured is the scheduled purge entrypoint; it shares the CLI lock.
+// A purge is a permanent delete, so on a full disk its audit may fall back
+// to the space reserve and then to stderr.
 func PurgeConfigured(cfg *config.Config, now time.Time) (int64, []string, error) {
 	l, err := Mutation(cfg)
 	if err != nil {
@@ -30,15 +33,17 @@ func PurgeConfigured(cfg *config.Config, now time.Time) (int64, []string, error)
 		return 0, nil, err
 	}
 	defer log.Close()
-	if _, err = fmt.Fprintf(log, "%s scheduled purge intent\n", now.UTC().Format(time.RFC3339)); err != nil {
-		return 0, nil, err
-	}
-	if err = log.Sync(); err != nil {
+	audit := &auditLog{w: log, reserve: reserve.Path(cfg.Policy.StateFile), permanent: true}
+	if err = audit.line(fmt.Sprintf("%s scheduled purge intent", now.UTC().Format(time.RFC3339)), true); err != nil {
 		return 0, nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Policy.OperationTimeout())
 	defer cancel()
 	n, names, err := PurgeStores(ctx, cfg.Policy, time.Duration(cfg.Policy.QuarantineDays)*24*time.Hour, now, false, false)
-	fmt.Fprintf(log, "%s scheduled purge recorded=%d batches=%v err=%v\n", now.UTC().Format(time.RFC3339), n, names, err)
+	errText := "<nil>"
+	if err != nil {
+		errText = err.Error()
+	}
+	_ = audit.line(fmt.Sprintf("%s scheduled purge recorded=%d batches=%q err=%q", now.UTC().Format(time.RFC3339), n, names, errText), true)
 	return n, names, err
 }

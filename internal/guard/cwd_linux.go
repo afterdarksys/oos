@@ -7,19 +7,22 @@ import (
 	"path/filepath"
 )
 
-// ListProcessCwds reads /proc/<pid>/cwd for every process we may inspect.
-// Processes owned by other users are unreadable and skipped; that is fine
-// because they cannot be using this user's cache directories.
+// ListProcessCwds reads /proc/<pid>/cwd for every process. It fails with
+// ErrPIDNamespace when other processes may be outside its view, and with
+// *UnreadableProcessesError when any live process cannot be read: a process
+// owned by another user can still be working inside this user's files.
 func ListProcessCwds() ([]string, error) {
-	links, err := filepath.Glob("/proc/[0-9]*/cwd")
+	var cwds []string
+	err := walkProcs("working directories", true, func(_ int, dir string) error {
+		target, err := os.Readlink(filepath.Join(dir, "cwd"))
+		if err != nil {
+			return err
+		}
+		cwds = append(cwds, target)
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	var cwds []string
-	for _, l := range links {
-		if target, err := os.Readlink(l); err == nil {
-			cwds = append(cwds, target)
-		}
 	}
 	return cwds, nil
 }

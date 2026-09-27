@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"sync"
@@ -29,8 +30,23 @@ type Deps struct {
 	Notify    func(title, msg string) error
 	OpenFiles func() ([]guard.OpenFile, error)
 	Ensure    func(cfg *config.Config, env guard.Env, target float64, live bool, now time.Time) (plan.EnsureResult, error)
-	Log       io.Writer
+	// Purge releases expired quarantine batches; ctx is the daemon's, so
+	// SIGTERM interrupts it. Batches reports whether there is anything to purge.
+	Purge   func(ctx context.Context, cfg *config.Config, now time.Time) (int64, []string, error)
+	Batches func(cfg *config.Config) (int, error)
+	// LoadConfig re-reads the config (SIGHUP, and the retry while the config
+	// on disk is rejected). Nil means there is nothing to reload from.
+	LoadConfig func() (*config.Config, string, error)
+	// Jitter returns a random duration in [0, max); tests pin it.
+	Jitter func(max time.Duration) time.Duration
+	Log    io.Writer
 }
+
+// configRetry is how often a rejected config is re-read without a SIGHUP.
+const configRetry = 10 * time.Minute
+
+// purgeEvery bounds the scheduled quarantine purge to once an hour.
+const purgeEvery = time.Hour
 
 // Status is what the socket answers and what --status prints.
 type Status struct {
@@ -56,7 +72,12 @@ type Status struct {
 	LastAlertAt time.Time      `json:"last_alert_at,omitempty"`
 	Sized       *SizedSummary  `json:"sized,omitempty"`
 	AutoAct     AutoActStatus  `json:"auto_act"`
-	Errors      []string       `json:"errors,omitempty"`
+	// ConfigError is set when the config on disk was rejected. With Degraded
+	// the daemon runs alert-only on the embedded default thresholds.
+	ConfigError string    `json:"config_error,omitempty"`
+	Degraded    bool      `json:"degraded,omitempty"`
+	LastPurge   time.Time `json:"last_purge,omitempty"`
+	Errors      []string  `json:"errors,omitempty"`
 }
 
 // SizedSummary is the periodic sized check's answer.
@@ -77,6 +98,9 @@ type AutoActStatus struct {
 	TargetGB float64            `json:"target_gb"`
 	LastAt   time.Time          `json:"last_at,omitempty"`
 	Last     *plan.EnsureResult `json:"last,omitempty"`
+	// PersistError is the last failure writing .auto-act.json; the brake and
+	// cooldown are kept in memory meanwhile and the write is retried.
+	PersistError string `json:"persist_error,omitempty"`
 }
 
 // Daemon holds the loop's state. Only Tick mutates the tick-private fields
@@ -93,12 +117,21 @@ type Daemon struct {
 	version  string
 	st       Status
 
-	sampler   *Sampler
-	lastLabel string
-	lastAlert map[string]time.Time
-	lastSized time.Time
-	prevFree  float64
-	havePrev  bool
+	sampler       *Sampler
+	lastLabel     string
+	lastAlert     map[string]time.Time
+	nextSized     time.Time
+	reload        chan struct{}
+	prevFree      float64
+	havePrev      bool
+	recoveryDirty bool // .auto-act.json is behind memory; retry the write
+	refusedOnce   bool // a filesystem refusal was already alerted
+
+	// under mu: config rejection state
+	degraded    bool
+	cfgErr      string
+	cfgTried    time.Time
+	cfgNotified bool
 }
 
 // New wires a daemon; nothing runs until Tick or Run.
@@ -117,11 +150,148 @@ func New(cfg *config.Config, cfgSrc string, env guard.Env, version string, deps 
 	if deps.Log == nil {
 		deps.Log = io.Discard
 	}
-	d := &Daemon{cfg: cfg, cfgSrc: cfgSrc, env: env, deps: deps, version: version, sampler: NewSampler(), lastAlert: map[string]time.Time{}}
+	if deps.Purge == nil {
+		deps.Purge = purgeExpired
+	}
+	if deps.Batches == nil {
+		deps.Batches = func(cfg *config.Config) (int, error) {
+			bs, err := plan.ListStoreBatches(cfg.Policy)
+			return len(bs), err
+		}
+	}
+	if deps.Jitter == nil {
+		deps.Jitter = func(max time.Duration) time.Duration {
+			if max <= 0 {
+				return 0
+			}
+			return rand.N(max)
+		}
+	}
+	d := &Daemon{cfg: cfg, cfgSrc: cfgSrc, env: env, deps: deps, version: version, sampler: NewSampler(), lastAlert: map[string]time.Time{}, reload: make(chan struct{}, 1)}
 	d.st = Status{Version: version, PID: os.Getpid(), Started: deps.Now(), Volume: cfg.Volume, Config: cfgSrc, Interval: cfg.Policy.Daemon.Interval().String()}
 	d.st.AutoAct = AutoActStatus{Enabled: cfg.Policy.Daemon.AutoAct, TargetGB: cfg.Policy.Daemon.Target(cfg.Policy)}
 	d.loadRecovery()
 	return d
+}
+
+// SetDegraded records that the config on disk was rejected and the daemon
+// runs on cfg (the embedded default, auto_act off) until a load succeeds.
+// It notifies once; the load is retried on SIGHUP and every configRetry.
+func (d *Daemon) SetDegraded(err error) {
+	now := d.deps.Now()
+	d.mu.Lock()
+	d.degraded = true
+	d.cfgErr = err.Error()
+	d.cfgTried = now
+	d.cfg.Policy.Daemon.AutoAct = false
+	d.st.ConfigError, d.st.Degraded = d.cfgErr, true
+	d.st.AutoAct.Enabled = false
+	first := !d.cfgNotified
+	d.cfgNotified = true
+	d.mu.Unlock()
+	msg := "oos: config rejected: " + err.Error() + "; running alert-only"
+	d.logf("%s", msg)
+	if first && d.deps.Notify != nil {
+		if nerr := d.deps.Notify("oos: config rejected", msg); nerr != nil {
+			d.note("notify: " + nerr.Error())
+		}
+	}
+}
+
+// TryReload re-reads the config through Deps.LoadConfig. Success swaps it
+// in and clears any rejection. Failure keeps the running config (a valid one
+// stays in force; a degraded daemon stays alert-only) and records why.
+func (d *Daemon) TryReload() error {
+	if d.deps.LoadConfig == nil {
+		return nil
+	}
+	now := d.deps.Now()
+	d.mu.Lock()
+	d.cfgTried = now
+	d.mu.Unlock()
+	cfg, src, err := d.deps.LoadConfig()
+	if err != nil {
+		d.mu.Lock()
+		d.cfgErr = err.Error()
+		d.st.ConfigError = d.cfgErr
+		degraded := d.degraded
+		d.mu.Unlock()
+		if degraded {
+			d.logf("config still rejected, staying alert-only: %v", err)
+		} else {
+			d.logf("reload failed, keeping the running config: %v", err)
+		}
+		return err
+	}
+	d.mu.Lock()
+	wasDegraded := d.degraded
+	d.degraded, d.cfgErr = false, ""
+	d.st.ConfigError, d.st.Degraded = "", false
+	d.mu.Unlock()
+	if wasDegraded {
+		// the brake file lives beside the real state file, which may differ
+		// from the default's; read it before auto-act can run
+		d.mu.Lock()
+		d.cfg = cfg
+		d.mu.Unlock()
+		d.loadRecoveryLocked()
+	}
+	d.Reload(cfg, src)
+	return nil
+}
+
+// retryConfig re-reads a rejected config at most every configRetry.
+func (d *Daemon) retryConfig(now time.Time) {
+	d.mu.Lock()
+	due := d.cfgErr != "" && (d.cfgTried.IsZero() || now.Sub(d.cfgTried) >= configRetry || now.Before(d.cfgTried))
+	d.mu.Unlock()
+	if due {
+		_ = d.TryReload()
+	}
+}
+
+// Degraded reports whether the daemon is running alert-only.
+func (d *Daemon) Degraded() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.degraded
+}
+
+// loadRecoveryLocked is loadRecovery with the shared status under the lock.
+func (d *Daemon) loadRecoveryLocked() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.recovery = RecoveryBrake{}
+	d.loadRecovery()
+}
+
+// purgeExpired is the daemon's scheduled purge: the plan's scheduled purge,
+// but with the daemon's context so SIGTERM interrupts it at a safe point.
+func purgeExpired(ctx context.Context, cfg *config.Config, now time.Time) (int64, []string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	l, err := plan.Mutation(cfg)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer l.Close()
+	log, err := state.OpenLog(cfg.Policy.LogFile)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer log.Close()
+	if _, err = fmt.Fprintf(log, "%s scheduled purge intent source=daemon\n", now.UTC().Format(time.RFC3339)); err != nil {
+		return 0, nil, err
+	}
+	if err = log.Sync(); err != nil {
+		return 0, nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, cfg.Policy.OperationTimeout())
+	defer cancel()
+	n, names, err := plan.PurgeStores(ctx, cfg.Policy, time.Duration(cfg.Policy.QuarantineDays)*24*time.Hour, now, false, false)
+	fmt.Fprintf(log, "%s scheduled purge source=daemon recorded=%d batches=%q err=%v\n", now.UTC().Format(time.RFC3339), n, names, err)
+	return n, names, err
 }
 
 // config returns the current config under the lock (SIGHUP may swap it).
@@ -145,10 +315,10 @@ func (d *Daemon) Reload(cfg *config.Config, src string) {
 	d.st.Config = src
 	d.st.Volume = cfg.Volume
 	d.st.Interval = cfg.Policy.Daemon.Interval().String()
-	d.st.AutoAct.Enabled = cfg.Policy.Daemon.AutoAct
+	d.st.AutoAct.Enabled = cfg.Policy.Daemon.AutoAct && !d.degraded
 	d.st.AutoAct.TargetGB = cfg.Policy.Daemon.Target(cfg.Policy)
 	d.mu.Unlock()
-	d.logf("config reloaded from %s", src)
+	d.logf("config reloaded from %q", src)
 }
 
 // Snapshot is the status as of the last tick. It never waits on a walk.
@@ -162,7 +332,7 @@ func (d *Daemon) Snapshot() Status {
 }
 
 func (d *Daemon) logf(format string, a ...any) {
-	fmt.Fprintf(d.deps.Log, "%s %s\n", d.deps.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, a...))
+	fmt.Fprintf(d.deps.Log, "%s %s\n", d.deps.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, a...))
 }
 
 // alert sends a rate-limited notification: one per kind per alert_repeat
@@ -201,9 +371,17 @@ func (d *Daemon) busy(what string) { d.set(func(s *Status) { s.Busy = what }) }
 // Slow work (open-file sampling, the sized walk, acting) runs without the
 // lock so --status answers during it.
 func (d *Daemon) Tick(now time.Time) Status {
+	d.retryConfig(now)
 	cfg := d.config()
 	p := cfg.Policy
 	dp := p.Daemon
+	degraded := d.Degraded()
+	if degraded {
+		dp.AutoAct = false // alert-only, whatever the default says
+	}
+	if d.recoveryDirty {
+		_ = d.saveRecovery()
+	}
 	d.set(func(s *Status) {
 		s.Ticks++
 		s.LastTick = now
@@ -212,7 +390,7 @@ func (d *Daemon) Tick(now time.Time) Status {
 
 	du, err := d.deps.Disk(cfg.Volume)
 	if err != nil {
-		d.note("statfs " + cfg.Volume + ": " + err.Error())
+		d.note(fmt.Sprintf("statfs %q: %v", cfg.Volume, err))
 		return d.Snapshot()
 	}
 	label, _ := status.Of(p, du)
@@ -282,37 +460,49 @@ func (d *Daemon) Tick(now time.Time) Status {
 		d.alert(dp, "forecast", "oos: disk "+label, msg, now, false)
 	}
 
-	// expired quarantine, as the hourly tick does
-	if p.Quarantine && p.AgentPurgeExpired && !d.recovery.Paused {
-		if freed, names, perr := plan.PurgeConfigured(cfg, now); len(names) > 0 || perr != nil {
-			d.logf("purge expired quarantine: freed=%s batches=%s err=%v", size.Human(freed), strings.Join(names, ","), perr)
-		}
+	// expired quarantine, as the hourly tick does, at most hourly
+	stopping := d.env.Ctx != nil && d.env.Ctx.Err() != nil
+	if !degraded && !stopping {
+		d.purge(cfg, now)
 	}
 
 	// act only when told to, only under critical, only after the cooldown,
 	// and never once shutdown has begun
-	stopping := d.env.Ctx != nil && d.env.Ctx.Err() != nil
 	last := d.recovery.LastAct
 	// A last_act in the future (the clock moved back) does not block.
 	if dp.AutoAct && !stopping && !d.recovery.Paused && label == "CRITICAL" && (last.IsZero() || last.After(now) || now.Sub(last) >= dp.Cooldown()) && d.startAct(now) {
 		target := dp.Target(p)
 		d.busy("acting: ensure " + fmt.Sprintf("%.0f GB", target))
 		res, err := d.deps.Ensure(cfg, d.env, target, true, now)
-		if lockBusy(err) {
+		busyLock := lockBusy(err)
+		if busyLock {
 			// another oos held the mutation lock: nothing was tried, so the
 			// cooldown does not start and the brake does not count it
 			d.recovery.LastAct = last
 		}
 		d.recovery.Observe(res, err, dp.RecoveryFailureLimit)
-		d.saveRecovery()
+		_ = d.saveRecovery()
 		d.busy("")
-		d.set(func(s *Status) { s.AutoAct.LastAt = now; s.AutoAct.Last = &res })
-		if err != nil {
-			d.note("auto-act: " + err.Error())
-			if !lockBusy(err) {
-				d.alert(dp, "auto-act", "oos: could not act", err.Error(), now, true)
+		if !busyLock {
+			// a busy lock did nothing: keep the last real result in status
+			d.set(func(s *Status) { s.AutoAct.LastAt = now; s.AutoAct.Last = &res })
+		}
+		switch {
+		case busyLock:
+			d.logf("auto-act skipped: %v", err)
+		case refusedRun(err):
+			d.note("auto-act refused: " + err.Error())
+			if !d.refusedOnce {
+				d.refusedOnce = true
+				d.alert(dp, "auto-act-refused", "oos: cleanup refused by the filesystem", err.Error(), now, true)
 			}
-		} else {
+		case err != nil && !partialRun(err):
+			d.note("auto-act: " + err.Error())
+			d.alert(dp, "auto-act", "oos: could not act", err.Error(), now, true)
+		default:
+			if err != nil {
+				d.note("auto-act partial: " + err.Error())
+			}
 			verb := "reached"
 			if !res.Reached {
 				verb = "did not reach"
@@ -328,9 +518,10 @@ func (d *Daemon) Tick(now time.Time) Status {
 		}
 	}
 
-	// periodic sized refresh: known entries and docker, into the state file
-	if every := dp.SizedEvery(); every > 0 && (d.lastSized.IsZero() || now.Sub(d.lastSized) >= every) {
-		d.lastSized = now
+	// periodic sized refresh: known entries and docker, into the state file;
+	// the interval is jittered so a fleet restarted together spreads out
+	if every := dp.SizedEvery(); every > 0 && !now.Before(d.nextSized) {
+		d.nextSized = now.Add(d.jittered(every))
 		d.busy("sizing known entries")
 		d.sized(cfg, now)
 		d.busy("")
@@ -338,12 +529,49 @@ func (d *Daemon) Tick(now time.Time) Status {
 	return d.Snapshot()
 }
 
-// startAct persists the action time before acting, so a crash or restart
-// mid-act still waits out the cooldown. If that cannot be persisted the brake
-// pauses and there is no action.
+// jittered spreads a period by +/-10%.
+func (d *Daemon) jittered(every time.Duration) time.Duration {
+	spread := every / 5
+	return every - every/10 + d.deps.Jitter(spread)
+}
+
+// purge runs the scheduled quarantine purge: only when the policy asks, at
+// most once per purgeEvery (the time is persisted, so restarts do not bring
+// it back every tick), and not at all when no store holds a batch.
+func (d *Daemon) purge(cfg *config.Config, now time.Time) {
+	p := cfg.Policy
+	if !p.Quarantine || !p.AgentPurgeExpired || d.recovery.Paused {
+		return
+	}
+	lp := d.recovery.LastPurge
+	if !lp.IsZero() && !lp.After(now) && now.Sub(lp) < purgeEvery {
+		return
+	}
+	n, err := d.deps.Batches(cfg)
+	if err == nil && n == 0 {
+		return
+	}
+	d.recovery.LastPurge = now
+	d.set(func(s *Status) { s.LastPurge = now })
+	_ = d.saveRecovery()
+	d.busy("purging expired quarantine")
+	freed, names, perr := d.deps.Purge(d.env.Ctx, cfg, now)
+	d.busy("")
+	if len(names) > 0 || perr != nil {
+		d.logf("purge expired quarantine: freed=%s batches=%q err=%v", size.Human(freed), names, perr)
+	}
+	if perr != nil && !lockBusy(perr) {
+		d.note("purge: " + perr.Error())
+	}
+}
+
+// startAct records the action time before acting so the cooldown holds.
+// A failed write does not stop the action or pause the brake: the cooldown
+// is kept in memory, the error is reported, and the write is retried next
+// tick. (The usual cause is a full disk, which is when acting matters.)
 func (d *Daemon) startAct(now time.Time) bool {
 	d.recovery.LastAct = now
-	d.saveRecovery()
+	_ = d.saveRecovery()
 	if d.recovery.Paused {
 		d.note("auto-act: " + d.recovery.Reason)
 		return false
@@ -393,23 +621,41 @@ func describeWriters(ws []Writer, n int) string {
 	return strings.Join(parts, ", ")
 }
 
-// Run ticks until ctx ends. The first tick is immediate. ctx also reaches
-// the ensure path through env.Ctx, so a SIGTERM stops a running cleanup at
-// its next safe point instead of being SIGKILLed mid-delete.
+// Run ticks until ctx ends. The first tick comes after a random offset in
+// [0, interval) and each later wait is jittered by +/-10%, so a fleet
+// restarted together by a rolling upgrade does not tick in lockstep. ctx
+// also reaches the ensure path through env.Ctx, so a SIGTERM stops a
+// running cleanup at its next safe point instead of being SIGKILLed.
 func (d *Daemon) Run(ctx context.Context) {
 	d.env.Ctx = ctx
 	cfg := d.config()
-	d.logf("oos daemon %s started on %s, interval %s, socket %q, auto_act=%v", d.version, cfg.Volume, cfg.Policy.Daemon.Interval(), cfg.Policy.Daemon.SocketPath(d.env.Home), cfg.Policy.Daemon.AutoAct)
-	d.safeTick()
+	d.logf("oos daemon %s started on %q, interval %s, socket %q, auto_act=%v, degraded=%v", d.version, cfg.Volume, cfg.Policy.Daemon.Interval(), cfg.Policy.Daemon.SocketPath(d.env.Home), cfg.Policy.Daemon.AutoAct, d.Degraded())
+	first := d.deps.Jitter(cfg.Policy.Daemon.Interval())
+	d.set(func(s *Status) { s.NextTick = d.deps.Now().Add(first) })
+	timer := time.NewTimer(first)
+	defer timer.Stop()
 	for {
-		wait := d.config().Policy.Daemon.Interval()
 		select {
 		case <-ctx.Done():
 			d.logf("stopping: %v", ctx.Err())
 			return
-		case <-time.After(wait):
+		case <-d.reload:
+			// reloads run here, between ticks, so they never race a tick
+			_ = d.TryReload()
+		case <-timer.C:
 			d.safeTick()
+			wait := d.jittered(d.config().Policy.Daemon.Interval())
+			d.set(func(s *Status) { s.NextTick = d.deps.Now().Add(wait) })
+			timer.Reset(wait)
 		}
+	}
+}
+
+// RequestReload asks Run to re-read the config between ticks (SIGHUP).
+func (d *Daemon) RequestReload() {
+	select {
+	case d.reload <- struct{}{}:
+	default: // one is already pending
 	}
 }
 

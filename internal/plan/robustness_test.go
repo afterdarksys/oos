@@ -473,7 +473,9 @@ func TestShellCancelKillsProcessGroup(t *testing.T) {
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
 	for deadline := time.Now().Add(5 * time.Second); ; {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		// A killed child reparented to a PID 1 that never reaps (CI
+		// containers) lingers as a zombie; that is dead too.
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) || zombie(pid) {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -540,4 +542,15 @@ func TestExecutePartialWrapsErrPartial(t *testing.T) {
 	if _, err := x.Execute(items[1:]); err == nil || errors.Is(err, ErrPartial) {
 		t.Fatalf("a run that did nothing is not partial: %v", err)
 	}
+}
+
+// zombie reports a process in state Z. Only Linux exposes /proc; elsewhere
+// the init process reaps promptly, so false is the right answer.
+func zombie(pid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	i := bytes.LastIndexByte(b, ')')
+	return i >= 0 && i+2 < len(b) && b[i+2] == 'Z'
 }

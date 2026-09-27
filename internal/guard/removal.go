@@ -13,6 +13,11 @@ import (
 // CheckRemovalPath rejects both protected paths and ancestors containing them.
 // It is shared by planning and execution, including individual child removals.
 func CheckRemovalPath(p config.Policy, path, home string) error {
+	// The lexical check first: a protected path is refused as protected
+	// without touching the filesystem, even where its parent is unreadable.
+	if prefix, ok := protect.Hit(filepath.Clean(path), home, p.AlwaysDisallowed); ok {
+		return Refuse("always_disallowed", "%s is protected by %s", path, prefix)
+	}
 	if err := safefs.CheckAncestors(path); err != nil {
 		return Refuse("symlink", "%v", err)
 	}

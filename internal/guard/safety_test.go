@@ -282,3 +282,67 @@ func TestRemovalHonoursBuiltinExceptions(t *testing.T) {
 		t.Error("policy.always_disallowed must win over a built-in exception")
 	}
 }
+
+func TestCommandPathJudgesOnlyThePathItself(t *testing.T) {
+	home := t.TempDir()
+	anchor := filepath.Join(home, "svc")
+	protected := filepath.Join(anchor, "volumes")
+	nt := filepath.Join(anchor, "db")
+	for _, d := range []string{protected, nt} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := config.Policy{AlwaysDisallowed: []string{protected}, NeverTouch: []string{nt}}
+	// A removal of the anchor would take the protected children with it.
+	if err := CheckRemovalPath(p, anchor, home); err == nil {
+		t.Fatal("removing a directory that holds a protected path must be refused")
+	}
+	// A command filed under the anchor does not remove it: a protected path
+	// below is no reason to refuse, but never_touch still counts both ways.
+	if err := CheckCommandPath(config.Policy{AlwaysDisallowed: []string{protected}}, anchor, home); err != nil {
+		t.Fatalf("a command anchored above protected paths must pass: %v", err)
+	}
+	if err := CheckCommandPath(p, anchor, home); err == nil {
+		t.Fatal("a command anchored above a never_touch path must still be refused")
+	}
+	// A command filed at or under a protected or never_touch path is refused.
+	for _, path := range []string{protected, filepath.Join(protected, "x"), nt, filepath.Join(nt, "x")} {
+		if err := CheckCommandPath(p, path, home); err == nil {
+			t.Errorf("command under %s must be refused", path)
+		}
+	}
+	// And under oos's own data.
+	own := config.Policy{StateFile: filepath.Join(home, "state", "bigfile.json")}
+	if err := CheckCommandPath(own, filepath.Join(home, "state", "bigfile.json"), home); err == nil {
+		t.Error("a command filed on oos's own state must be refused")
+	}
+}
+
+func TestDockerBuilderPruneAnchorIsAllowedOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("needs linux as root")
+	}
+	old := protect.Builtin
+	t.Cleanup(func() { protect.Builtin = old })
+	protect.Builtin = protect.BuiltinFor("linux")
+	if err := os.MkdirAll("/var/lib/docker/volumes", 0o710); err != nil {
+		t.Skip(err)
+	}
+	p := config.Policy{AllowOutsideHome: true, AllowCommands: true}
+	env := Env{Home: "/root", Procs: testutil.NoProcs}
+	ent := config.Entry{Path: "/var/lib/docker", Action: config.ActionCommand, Command: "docker builder prune -f"}
+	if err := env.CheckDeletable(p, ent); err != nil {
+		t.Fatalf("docker builder prune anchored at /var/lib/docker must be allowed: %v", err)
+	}
+	// Emptying it is still refused.
+	ent = config.Entry{Path: "/var/lib/docker", Action: config.ActionRmContents}
+	if err := env.CheckDeletable(p, ent); err == nil {
+		t.Fatal("rm-contents /var/lib/docker must stay refused")
+	}
+	// A command that names the volumes is refused by the text scan.
+	ent = config.Entry{Path: "/var/lib/docker", Action: config.ActionCommand, Command: "rm -rf /var/lib/docker/volumes/x"}
+	if err := env.CheckDeletable(p, ent); err == nil {
+		t.Fatal("a command naming /var/lib/docker/volumes must be refused")
+	}
+}

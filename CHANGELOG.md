@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## [0.8.0] - release date set when tagged, after the dr1 canary
+
+Two review rounds for system protection and fleet reliability, CI, and a
+canary on dr1. The exit codes, JSON output and Linux systemd timer changed;
+read "Read before upgrading" below.
+
+### Since the second round
+- CI on every push and PR: gofmt and vet for linux amd64/386/arm/arm64 and darwin; the suite on an Ubuntu VM as a user with -race, as root in Debian and Alpine containers, and on macOS with -race. It found three things the Mac and Docker runs had not: a protected path refused as "permission denied" instead of protected (the lexical check now runs first), a data race in `--fleet`, and a test mistaking a reaped-late zombie for a live process.
+- A command entry is judged by its own path, not by protected paths below it. The shipped server config's `docker builder prune` entry at `/var/lib/docker` was refused from 782631b on because `/var/lib/docker` holds Docker's protected volumes; it runs again. A never_touch path below a command's anchor is not a refusal either (the server config lists `/var/lib/docker/volumes` in never_touch); the anchor itself under never_touch still is, and the command text scan covers never_touch. `rm-contents /var/lib/docker` and a command naming the volumes stay refused; oos's own data still refuses both ways.
 
 ### Robustness for fleets (second review round)
 

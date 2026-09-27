@@ -69,7 +69,7 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 		if prefix, ok := protect.CommandHits(ent.Command, e.Home, CommandProtected(p)); ok {
 			return Refuse("always_disallowed", "command mentions %s, which cannot be removed", prefix)
 		}
-		if err := e.checkPlace(p, path); err != nil {
+		if err := e.checkPlace(p, path, false); err != nil {
 			return err
 		}
 		if err := e.installRunning(); err != nil {
@@ -80,7 +80,7 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 	if config.PathDepth(path) < p.MinPathDepth {
 		return Refuse("depth", "%s has depth %d, policy requires >= %d", path, config.PathDepth(path), p.MinPathDepth)
 	}
-	if err := e.checkPlace(p, path); err != nil {
+	if err := e.checkPlace(p, path, true); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)
@@ -130,7 +130,8 @@ func (e Env) CheckDeletable(p config.Policy, ent config.Entry) error {
 }
 
 // checkPlace applies the home, never_touch and removal-path rules to path.
-func (e Env) checkPlace(p config.Policy, path string) error {
+// removal is false for a command entry, which does not remove path itself.
+func (e Env) checkPlace(p config.Policy, path string, removal bool) error {
 	if !p.AllowOutsideHome && !config.IsUnder(path, e.Home) {
 		return Refuse("home", "%s is outside %s and allow_outside_home is false", path, e.Home)
 	}
@@ -138,6 +139,9 @@ func (e Env) checkPlace(p config.Policy, path string) error {
 		if config.IsUnder(path, nt) {
 			return Refuse("never_touch", "%s is under protected %s", path, nt)
 		}
+	}
+	if !removal {
+		return CheckCommandPath(p, path, e.Home)
 	}
 	return CheckRemovalPath(p, path, e.Home)
 }

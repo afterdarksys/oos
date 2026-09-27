@@ -17,19 +17,20 @@ func CheckRemovalPath(p config.Policy, path, home string) error {
 }
 
 // CheckCommandPath is the path rule for a command entry. A command does not
-// remove the directory it is filed under, so a built-in or always_disallowed
-// path below it is not a reason to refuse (/var/lib/docker anchors docker
-// builder prune although it holds the protected volumes); what the command
-// touches is the text scan's business (protect.CommandHits). The path itself
-// being protected is refused, and never_touch and oos's own data are judged
-// both ways exactly as for a removal.
+// remove the directory it is filed under, so a protected or never_touch path
+// below it is not a reason to refuse (/var/lib/docker anchors docker builder
+// prune although it holds Docker's volumes, which are built-in protected and
+// in the server config's never_touch); what the command touches is the text
+// scan's business, and that scan covers never_touch (CommandProtected). The
+// path itself being protected or under never_touch is refused, and oos's own
+// data is judged both ways exactly as for a removal.
 func CheckCommandPath(p config.Policy, path, home string) error {
 	return checkPath(p, path, home, false)
 }
 
 // checkPath judges path against the protected, never_touch and own-data
-// lists. contains also refuses a path with a protected path below it, which
-// a removal of path would take with it.
+// lists. contains also refuses a path with a protected or never_touch path
+// below it, which a removal of path would take with it.
 func checkPath(p config.Policy, path, home string, contains bool) error {
 	// The lexical check first: a protected path is refused as protected
 	// without touching the filesystem, even where its parent is unreadable.
@@ -73,7 +74,10 @@ func checkPath(p config.Policy, path, home string, contains bool) error {
 	}
 	for _, raw := range p.NeverTouch {
 		base := safefs.CanonicalAlias(raw)
-		if config.IsUnder(path, base) || (base != "/" && (config.IsUnder(base, path) || physicalUnder(path, base) || physicalUnder(base, path))) {
+		if config.IsUnder(path, base) || (base != "/" && physicalUnder(path, base)) {
+			return Refuse("never_touch", "%s overlaps protected %s", path, base)
+		}
+		if contains && base != "/" && (config.IsUnder(base, path) || physicalUnder(base, path)) {
 			return Refuse("never_touch", "%s overlaps protected %s", path, base)
 		}
 	}

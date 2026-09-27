@@ -298,13 +298,10 @@ func TestCommandPathJudgesOnlyThePathItself(t *testing.T) {
 	if err := CheckRemovalPath(p, anchor, home); err == nil {
 		t.Fatal("removing a directory that holds a protected path must be refused")
 	}
-	// A command filed under the anchor does not remove it: a protected path
-	// below is no reason to refuse, but never_touch still counts both ways.
-	if err := CheckCommandPath(config.Policy{AlwaysDisallowed: []string{protected}}, anchor, home); err != nil {
-		t.Fatalf("a command anchored above protected paths must pass: %v", err)
-	}
-	if err := CheckCommandPath(p, anchor, home); err == nil {
-		t.Fatal("a command anchored above a never_touch path must still be refused")
+	// A command filed under the anchor does not remove it: protected and
+	// never_touch paths below are no reason to refuse.
+	if err := CheckCommandPath(p, anchor, home); err != nil {
+		t.Fatalf("a command anchored above protected and never_touch paths must pass: %v", err)
 	}
 	// A command filed at or under a protected or never_touch path is refused.
 	for _, path := range []string{protected, filepath.Join(protected, "x"), nt, filepath.Join(nt, "x")} {
@@ -329,7 +326,8 @@ func TestDockerBuilderPruneAnchorIsAllowedOnLinux(t *testing.T) {
 	if err := os.MkdirAll("/var/lib/docker/volumes", 0o710); err != nil {
 		t.Skip(err)
 	}
-	p := config.Policy{AllowOutsideHome: true, AllowCommands: true}
+	// The shipped server config also lists the volumes in never_touch.
+	p := config.Policy{AllowOutsideHome: true, AllowCommands: true, NeverTouch: []string{"/var/lib/docker/volumes"}}
 	env := Env{Home: "/root", Procs: testutil.NoProcs}
 	ent := config.Entry{Path: "/var/lib/docker", Action: config.ActionCommand, Command: "docker builder prune -f"}
 	if err := env.CheckDeletable(p, ent); err != nil {

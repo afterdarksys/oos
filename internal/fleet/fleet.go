@@ -155,6 +155,7 @@ func CollectN(targets []string, timeout time.Duration, parallel int) []Host {
 		parallel = MaxParallel
 	}
 	hard := timeout + hardSlack
+	ssh := SSH // read once: a call abandoned past its deadline may still be running after we return
 	hosts := make([]Host, len(targets))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, parallel)
@@ -175,7 +176,7 @@ func CollectN(targets []string, timeout time.Duration, parallel int) []Host {
 			}
 			ch := make(chan answer, 1) // buffered: an abandoned SSH call never blocks
 			go func() {
-				out, err := SSH(t, timeout, "-c", "-q", "-j")
+				out, err := ssh(t, timeout, "-c", "-q", "-j")
 				ch <- answer{out, err}
 			}()
 			var h Host

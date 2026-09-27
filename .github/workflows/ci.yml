@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -buildvcs=false
+
+jobs:
+  # gofmt and vet for every platform the fleet runs; 32-bit catches int overflow.
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out="$(gofmt -l cmd internal)"
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+      - name: vet
+        run: |
+          set -e
+          for t in linux/amd64 linux/386 linux/arm linux/arm64 darwin/amd64 darwin/arm64; do
+            echo "== $t"
+            GOOS="${t%/*}" GOARCH="${t#*/}" go vet ./...
+          done
+
+  # Linux as an ordinary user on a real VM: systemd PID 1, other users' processes.
+  linux-user:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./...
+
+  # Linux as root inside a container: root-only tests (lock chown, protected
+  # /root paths) run, and the container PID-namespace refusal is exercised.
+  linux-root:
+    runs-on: ubuntu-latest
+    container: golang:1.24
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test -count=1 ./...
+
+  # musl and busybox: no ps, /proc-based process listing.
+  alpine-root:
+    runs-on: ubuntu-latest
+    container: golang:1.24-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test -count=1 ./...
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./...
